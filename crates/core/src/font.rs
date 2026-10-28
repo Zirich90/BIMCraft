@@ -1,5 +1,5 @@
-//! Our own single-stroke lettering for plan annotation: capitals, digits, a few marks and the
-//! accents of Latin languages, drawn on an 8 x 12 grid (y up). Lower case is drawn as capitals,
+//! Our own single-stroke lettering for plan annotation: capitals, Latin and Cyrillic, digits, a few
+//! marks and the accents of Latin languages, drawn on an 8 x 12 grid (y up). Lower case is drawn as capitals,
 //! as architectural lettering is.
 
 type Glyph = &'static [&'static [(i8, i8)]];
@@ -83,6 +83,38 @@ fn glyph(c: char) -> Glyph {
         '²' => &[&[(2, 11), (3, 12), (5, 12), (6, 11), (6, 10), (2, 7), (6, 7)]],
         '°' => &[&[(3, 12), (5, 12), (6, 11), (6, 9), (5, 8), (3, 8), (2, 9), (2, 11), (3, 12)]],
         '±' => &[&[(4, 5), (4, 11)], &[(1, 8), (7, 8)], &[(1, 2), (7, 2)]],
+        // Cyrillic: the capitals the Latin alphabet shares are its strokes.
+        'А' => glyph('A'),
+        'В' => glyph('B'),
+        'Е' => glyph('E'),
+        'К' => glyph('K'),
+        'М' => glyph('M'),
+        'Н' => glyph('H'),
+        'О' => glyph('O'),
+        'Р' => glyph('P'),
+        'С' => glyph('C'),
+        'Т' => glyph('T'),
+        'Х' => glyph('X'),
+        'З' => glyph('3'),
+        'Б' => &[&[(8, 12), (0, 12), (0, 0), (6, 0), (8, 2), (8, 5), (6, 7), (0, 7)]],
+        'Г' => &[&[(8, 12), (0, 12), (0, 0)]],
+        'Д' => &[&[(0, -2), (0, 0), (8, 0), (8, -2)], &[(1, 0), (3, 12), (7, 12), (7, 0)]],
+        'Ж' => &[&[(4, 0), (4, 12)], &[(0, 12), (4, 6), (8, 12)], &[(0, 0), (4, 6), (8, 0)]],
+        'И' => &[&[(0, 12), (0, 0), (8, 12), (8, 0)]],
+        'Л' => &[&[(0, 0), (2, 2), (3, 12), (8, 12), (8, 0)]],
+        'П' => &[&[(0, 0), (0, 12), (8, 12), (8, 0)]],
+        'У' => &[&[(0, 12), (4, 5)], &[(8, 12), (3, 0), (1, 0)]],
+        'Ф' => &[&[(4, 0), (4, 12)], &[(4, 10), (1, 10), (0, 9), (0, 5), (1, 4), (7, 4), (8, 5), (8, 9), (7, 10), (4, 10)]],
+        'Ц' => &[&[(0, 12), (0, 0), (7, 0), (7, 12)], &[(7, 0), (8, 0), (8, -2)]],
+        'Ч' => &[&[(0, 12), (0, 8), (2, 6), (8, 6)], &[(8, 12), (8, 0)]],
+        'Ш' => &[&[(0, 12), (0, 0), (8, 0), (8, 12)], &[(4, 12), (4, 0)]],
+        'Щ' => &[&[(0, 12), (0, 0), (6, 0), (6, 12)], &[(3, 12), (3, 0)], &[(6, 0), (8, 0), (8, -2)]],
+        'Ъ' => &[&[(0, 12), (2, 12), (2, 0), (6, 0), (8, 2), (8, 5), (6, 7), (2, 7)]],
+        'Ы' => &[&[(0, 12), (0, 0), (4, 0), (6, 2), (6, 5), (4, 7), (0, 7)], &[(8, 12), (8, 0)]],
+        'Ь' => &[&[(0, 12), (0, 0), (6, 0), (8, 2), (8, 5), (6, 7), (0, 7)]],
+        'Э' => &[&[(0, 10), (2, 12), (6, 12), (8, 10), (8, 2), (6, 0), (2, 0), (0, 2)], &[(3, 6), (8, 6)]],
+        'Ю' => &[&[(0, 12), (0, 0)], &[(0, 6), (3, 6)], &[(5, 12), (3, 10), (3, 2), (5, 0), (6, 0), (8, 2), (8, 10), (6, 12), (5, 12)]],
+        'Я' => &[&[(8, 0), (8, 12), (2, 12), (0, 10), (0, 8), (2, 6), (8, 6)], &[(4, 6), (0, 0)]],
         _ => QUESTION,
     }
 }
@@ -95,7 +127,10 @@ fn accent(c: char) -> Option<(char, Glyph)> {
     const TILDE: Glyph = &[&[(1, 13), (3, 15), (5, 13), (7, 15)]];
     const DIAERESIS: Glyph = &[&[(2, 14), (2, 15)], &[(6, 14), (6, 15)]];
     const CEDILLA: Glyph = &[&[(4, 0), (5, -1), (3, -3)]];
+    const BREVE: Glyph = &[&[(2, 15), (3, 13), (5, 13), (6, 15)]];
     Some(match c {
+        'Ё' => ('Е', DIAERESIS),
+        'Й' => ('И', BREVE),
         'Á' | 'É' | 'Í' | 'Ó' | 'Ú' | 'Ý' => (base(c)?, ACUTE),
         'À' | 'È' | 'Ì' | 'Ò' | 'Ù' => (base(c)?, GRAVE),
         'Â' | 'Ê' | 'Î' | 'Ô' | 'Û' => (base(c)?, CIRCUMFLEX),
@@ -162,6 +197,27 @@ mod tests {
         let acute = strokes("á", 0.0, 0.0, 12.0);
         assert_eq!(acute.len(), plain.len() + 1);
         assert_eq!(acute[..plain.len()], plain[..]);
+    }
+
+    #[test]
+    fn cyrillic_capitals_are_drawn_each_its_own_and_lower_case_as_them() {
+        let unknown = strokes("?", 0.0, 0.0, 12.0);
+        let all = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ";
+        let drawn: Vec<_> = all.chars().map(|c| strokes(&c.to_string(), 0.0, 0.0, 12.0)).collect();
+        for (c, s) in all.chars().zip(&drawn) {
+            assert!(!s.is_empty() && *s != unknown, "{c} is not drawn");
+        }
+        for (i, a) in drawn.iter().enumerate() {
+            assert!(drawn.iter().skip(i + 1).all(|b| b != a), "{} looks like another", all.chars().nth(i).unwrap_or(' '));
+        }
+        // The letters the Latin alphabet shares are the same strokes.
+        assert_eq!(strokes("АВЕКМНОРСТХ", 0.0, 0.0, 12.0), strokes("ABEKMHOPCTX", 0.0, 0.0, 12.0));
+        assert_eq!(strokes("шлейф ёж", 0.0, 0.0, 12.0), strokes("ШЛЕЙФ ЁЖ", 0.0, 0.0, 12.0));
+        // Й and Ё are И and Е with their marks over them.
+        let (i, short) = (strokes("И", 0.0, 0.0, 12.0), strokes("Й", 0.0, 0.0, 12.0));
+        assert_eq!(short[..i.len()], i[..]);
+        let (e, yo) = (strokes("Е", 0.0, 0.0, 12.0), strokes("Ё", 0.0, 0.0, 12.0));
+        assert_eq!(yo[..e.len()], e[..]);
     }
 
     #[test]
