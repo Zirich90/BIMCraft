@@ -640,6 +640,25 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
+            // A disk swept along a curve, a cable's or a pipe's: a tube of 24 sides along each of its segments; a hollow one
+            // as if solid.
+            "IFCSWEPTDISKSOLID" => {
+                let (Some(line), Some(r)) = (self.curve(reference(a(0)), depth + 1), self.len(a(1))) else { return };
+                for w in line.windows(2) {
+                    let &[p, q] = w else { continue };
+                    let along = sub(q, p);
+                    if dot(along, along) < 1e-12 || r <= 0.0 {
+                        continue;
+                    }
+                    let d = unit(along);
+                    // Square to the segment: across it level, unless it stands.
+                    let across = if d[0].hypot(d[1]) < 1e-6 { [1.0, 0.0, 0.0] } else { unit([-d[1], d[0], 0.0]) };
+                    let up = cross(d, across);
+                    let ring =
+                        (0..24).map(|i| f64::from(i) * PI / 12.0).map(|t| add(p, add(mul(across, r * t.cos()), mul(up, r * t.sin()))));
+                    prism(out, ring.collect(), along);
+                }
+            }
             // What a clipping cuts away doesn't change what the element is.
             "IFCBOOLEANCLIPPINGRESULT" | "IFCBOOLEANRESULT" => {
                 if let Some(first) = reference(a(1)) {
@@ -3016,6 +3035,41 @@ ENDSEC;END-ISO-10303-21;"
         let Some(Element::Column(c)) = only(&i.model, "column").first().copied() else { panic!("no column") };
         let t = &i.model.types.column[&c.type_name];
         assert_eq!((c.at, c.angle, t.width, t.depth, t.round, c.height), (P2(3000.0, 4000.0), 90.0, 500.0, 300.0, false, 3000.0));
+    }
+
+    #[test]
+    fn a_cable_swept_round_its_centre_line_comes_in_as_a_wire() {
+        // As Renga writes one: a disk 3.7 mm across swept along an indexed polycurve, through a mapped item.
+        let text = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCUNITASSIGNMENT((#1));
+#3=IFCPROJECT('p',$,'Cables',$,$,$,$,$,#2);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCLOCALPLACEMENT($,#5);
+#7=IFCBUILDINGSTOREY('s',$,'Level 0',$,$,#6,$,$,.ELEMENT.,0.);
+#10=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(3000.,0.,0.)));
+#11=IFCINDEXEDPOLYCURVE(#10,(IFCLINEINDEX((1,2))),$);
+#12=IFCSWEPTDISKSOLID(#11,3.7,$,$,$);
+#13=IFCSHAPEREPRESENTATION($,'Body','AdvancedSweptSolid',(#12));
+#14=IFCREPRESENTATIONMAP(#5,#13);
+#15=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#4,$,$);
+#16=IFCMAPPEDITEM(#14,#15);
+#17=IFCSHAPEREPRESENTATION($,'Body','MappedRepresentation',(#16));
+#18=IFCPRODUCTDEFINITIONSHAPE($,$,(#17));
+#19=IFCCARTESIANPOINT((1000.,2000.,2900.));
+#20=IFCAXIS2PLACEMENT3D(#19,$,$);
+#21=IFCLOCALPLACEMENT(#6,#20);
+#22=IFCCABLESEGMENT('k',$,'Cable',$,$,#21,#18,$,.CABLESEGMENT.);
+#30=IFCRELCONTAINEDINSPATIALSTRUCTURE('r',$,$,$,(#22),#7);
+ENDSEC;END-ISO-10303-21;";
+        let i = ifc(text.as_bytes(), "x").unwrap();
+        i.model.check().unwrap();
+        assert_eq!(i.skipped.len(), 0, "{:?}", i.skipped);
+        let Some(Element::Wire(w)) = only(&i.model, "wire").first().copied() else { panic!("no wire") };
+        let t = &i.model.types.runs["wire"][&w.type_name];
+        assert_eq!((w.start, w.end, w.offset, w.end_offset), (P2(1000.0, 2000.0), P2(4000.0, 2000.0), 2900.0, None));
+        assert!(t.round && (t.width - 7.4).abs() < 0.05, "{} x {}", t.width, t.depth);
     }
 
     /// An IFC4 file in mm with a 6 x 4 m slab 200 mm thick, its profile round two holes, an
