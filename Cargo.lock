@@ -459,6 +459,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiny-skia",
+ "ttf-parser",
  "zune-jpeg",
 ]
 

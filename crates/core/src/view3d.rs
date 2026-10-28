@@ -1557,7 +1557,7 @@ fn level_marks(levels: &[(Id, String, [P3; 4])], cam: &Camera, color: &dyn Fn(Id
         let (d, px) = (unit(sub(along, foot)), 1.0 / cam.scale.max(1e-9));
         let height = f64::from(HEAD_TEXT + 2.0 * HEAD_PAD);
         let to3 = |(x, y): (f32, f32)| add(add(foot, mul(d, f64::from(x) * px)), [0.0, 0.0, (height - f64::from(y)) * px]);
-        for stroke in crate::font::strokes(&head.name, HEAD_PAD, HEAD_PAD + HEAD_TEXT, HEAD_TEXT) {
+        for stroke in crate::font::letters(&head.name, HEAD_PAD, HEAD_PAD + HEAD_TEXT, HEAD_TEXT).lines() {
             for seg in stroke.windows(2) {
                 if let [a, b] = seg {
                     lines.push(([to3(*a), to3(*b)], 1));

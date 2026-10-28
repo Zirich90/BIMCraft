@@ -22,6 +22,8 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 flate2 = "1"
 # Reads the JPEGs a texture is made of; the PNGs come in through tiny-skia.
 zune-jpeg = "0.5"
+# Reads the outlines of a TrueType font the lettering may be set in; egui already builds it.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 bimcraft-ui-egui = { path = "crates/ui-egui" }
 bimcraft-update = { path = "crates/update" }
 # The Revit reader: Apache-2.0 only, so the command line and the desktop take it through an optional feature.

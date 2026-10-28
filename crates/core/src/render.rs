@@ -406,9 +406,17 @@ impl Drawing {
         let (s, c) = angle.sin_cos();
         let w = font::width(text, height);
         let part = std::mem::replace(&mut self.part, Part::Text);
-        for pts in font::strokes(text, -w / 2.0, height / 2.0, height) {
-            let pts = pts.into_iter().map(|(a, b)| (x + a * c - b * s, y + a * s + b * c)).collect();
-            self.push(Prim::Line { pts, width: (height / 10.0).max(1.0), color, dash: None, closed: false });
+        let turn = |pts: Vec<(f32, f32)>| pts.into_iter().map(|(a, b)| (x + a * c - b * s, y + a * s + b * c)).collect();
+        match font::letters(text, -w / 2.0, height / 2.0, height) {
+            font::Letters::Lines(lines) => {
+                for pts in lines {
+                    self.push(Prim::Line { pts: turn(pts), width: (height / 10.0).max(1.0), color, dash: None, closed: false });
+                }
+            }
+            font::Letters::Rings(rings) if !rings.is_empty() => {
+                self.push(Prim::Fill { rings: rings.into_iter().map(turn).collect(), color })
+            }
+            font::Letters::Rings(_) => {}
         }
         self.part = part;
     }
