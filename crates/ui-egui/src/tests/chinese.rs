@@ -98,6 +98,8 @@ fn the_language_list_offers_chinese_and_picking_it_puts_the_window_in_it() {
     h.run();
     h.get_all_by_role(Role::ComboBox).find(|n| n.value().as_deref() == Some("English")).expect("the language list").click();
     h.run();
+    h.get_by_label("Chinese (Simplified)").scroll_to_me();
+    h.run();
     h.get_by_label("Chinese (Simplified)").click();
     h.run();
     assert_eq!(h.state().lang, Lang::Chinese);

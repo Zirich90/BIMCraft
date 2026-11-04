@@ -16,7 +16,7 @@ fn action(h: &Harness<BimApp>, id: &str, label: &str) -> egui::Rect {
 fn close(h: &mut Harness<BimApp>, id: &str) {
     let r = area(h, id);
     let button = h
-        .get_all_by_role(Role::Button)
+        .get_all_by_role_and_label(Role::Button, "Close dialog")
         .find(|n| r.contains_rect(n.rect()) && n.rect().center().x > r.right() - 45.0 && n.rect().center().y < r.top() + 45.0)
         .expect("corner close button");
     assert!(button.rect().center().x > r.right() - 45.0);

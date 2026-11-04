@@ -3611,6 +3611,10 @@ impl BimApp {
             }
         });
         panel(ui, "Settings", |ui| {
+            let tip = msg!("Keyboard Shortcuts (KS): customize, edit, and load shortcut keys");
+            if big_button(ui, Icon::Keyboard, "Shortcuts", self.show_shortcuts, tip).clicked() {
+                self.show_shortcuts = true;
+            }
             let tip = msg!("Materials: the project's library, each material's colour in 3D and the patterns its cut and its surfaces show");
             if big_button(ui, Icon::Materials, "Materials", self.materials_dialog.is_some(), tip).clicked() {
                 self.materials_dialog = Some(properties::MaterialsDialog::new(&self.session.model));
@@ -3690,10 +3694,6 @@ impl BimApp {
                 });
                 self.open_units &= !opened;
             });
-            let tip = msg!("Keyboard Shortcuts (KS): customize, edit, and load shortcut keys");
-            if big_button(ui, Icon::Keyboard, "Shortcuts", self.show_shortcuts, tip).clicked() {
-                self.show_shortcuts = true;
-            }
             // Where a room's area is measured, as Revit's Room Area Computation.
             let now = self.session.model.room_area;
             let tip = tf("Room Area Computation: where room areas are measured; now {}", &[&t(now.label()).to_lowercase()]);
