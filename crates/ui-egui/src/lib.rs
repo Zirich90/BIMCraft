@@ -3593,6 +3593,23 @@ impl BimApp {
     }
 
     fn manage_tab(&mut self, ui: &mut Ui) {
+        panel(ui, msg!("Links"), |ui| {
+            if big_button(
+                ui,
+                Icon::Schedule,
+                "Equipment Catalogue",
+                self.show_catalogue,
+                msg!("Link the project's editable ODS equipment catalogue"),
+            )
+            .clicked()
+            {
+                self.show_catalogue = true;
+            }
+            let tip = "Link Model (LK): another project, a BIMCraft file or an IFC, shown in this one as a reference that can't be edited: halftone in the plans, the sections and the 3D view, and snapped to";
+            if big_button(ui, Icon::Link, "Link Model", false, tip).clicked() {
+                self.link_dialog = true;
+            }
+        });
         panel(ui, "Settings", |ui| {
             let tip = msg!("Materials: the project's library, each material's colour in 3D and the patterns its cut and its surfaces show");
             if big_button(ui, Icon::Materials, "Materials", self.materials_dialog.is_some(), tip).clicked() {
@@ -3699,23 +3716,6 @@ impl BimApp {
                     }
                 }
             });
-        });
-        panel(ui, msg!("Links"), |ui| {
-            if big_button(
-                ui,
-                Icon::Schedule,
-                "Equipment Catalogue",
-                self.show_catalogue,
-                msg!("Link the project's editable ODS equipment catalogue"),
-            )
-            .clicked()
-            {
-                self.show_catalogue = true;
-            }
-            let tip = "Link Model (LK): another project, a BIMCraft file or an IFC, shown in this one as a reference that can't be edited: halftone in the plans, the sections and the 3D view, and snapped to";
-            if big_button(ui, Icon::Link, "Link Model", false, tip).clicked() {
-                self.link_dialog = true;
-            }
         });
         panel(ui, "Family Editor", |ui| {
             let tip = msg!("New Family: start a family of your own, of a category, to edit its parameters, types and forms");
