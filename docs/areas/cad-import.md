@@ -3,8 +3,7 @@
 On the roadmap under 0.9 Interoperability, as Revit's Import CAD and Link CAD: a consultant's or a surveyor's DXF drawing
 brought into a project and drawn under the model in the plans of a level, to trace walls over and to check against. A project
 holds each drawing once, an import element places it, plans draw and snap to it, and the desktop brings one in (Insert > Import
-CAD, Link CAD). DWG isn't read yet (a later change can read it through a DWG library), so a `.dwg` is refused with a message
-that says to save it as DXF; DXF export, exploding an import into detail lines (which waits on detail lines, issue #58), and
+CAD, Link CAD). A DWG comes in as the DXF it becomes (below); DXF export, exploding an import into detail lines (which waits on detail lines, issue #58), and
 images and PDFs as underlays are still to come.
 
 ## The reader
@@ -20,11 +19,32 @@ out, aligned as the file says), SOLID and TRACE, and HATCH (its boundary loops, 
 pale fill of its colour, since its pattern isn't kept). An INSERT places its block's entities, scaled, turned and arrayed, up to
 `MAX_DEPTH` blocks deep; an entity on layer 0 of a block takes the insert's layer, and one by block its colour. DIMENSION draws
 its anonymous block. What the reader doesn't know (3DFACE, a viewport, an image, a proxy) is counted by kind in
-`Dxf::left_out`, and the command lists it.
+`Dxf::left_out`, and the command lists it. The text itself is read as UTF-8 where it is, and else by the code page the header names in
+`$DWGCODEPAGE`: the East Asian pages and the Windows ones decode through `encoding_rs`, and a page without a decoder here (the DOS
+ones) reads as Latin-1, as it always has.
 
 A file is hostile: `MAX_BYTES` caps its size, `MAX_PAIRS` its pairs, `MAX_SHAPES` the shapes, `MAX_WORK` the points the blocks
 may multiply into, and every coordinate is a finite number within `MAX_FILE_COORD` (one past that is left out as "past what a
 drawing holds"). A file that ends after a group code, a value that isn't a number, a binary DXF and a DWG each say why.
+
+## DWG
+
+The core reads no DWG of its own. `crates/dwg` (`bimcraft-dwg`) is a bridge: the acadrust crate (pure Rust, MPL-2.0, used
+unmodified as a separate library; its DWG code is ported from ACadSharp, MIT, after the Open Design Alliance's published DWG
+specification; NOTICE carries both) reads the file in failsafe mode, and its DXF writer writes what it read as ASCII DXF, which
+`dxf.rs` reads as any other. `Limits` holds a DWG to 64 MB before the decoder runs and its DXF to `dxf::MAX_BYTES` while it is
+written; a read that left object records out says how many, of which kinds, in `import_cad`'s `notes` (the desktop puts them on
+the status bar). The project holds the DXF, so a project file opens where no DWG reader is.
+
+A session reads a DWG through the `DwgReader` it is given (`Session::dwg`; `read_dxf_file` in `commands.rs` is the one place
+`import_cad`, `reload_cad` and opening a project read a drawing), and one without says to save it as DXF. The desktop and the
+command line (so MCP too) hand theirs `bimcraft_dwg::reader()` behind their default `dwg` feature: it starts the program
+itself as a child (`--dwg-to-dxf <path>`, answered by `child_main` before anything else runs) and reads the DXF from its
+output. The decoder allocates what a file declares and can't be interrupted, so a hostile file could abort the process; in
+the child it takes only the child, which is also stopped after `CHILD_TIME` or past the limits, and the reply says the file
+couldn't be read. Tests make their DWG files from DXF text with the same library (`dwg_from_dxf`, the `testing` feature),
+since Autodesk's are never committed; `BIMCRAFT_DWG_SAMPLES` names a folder of real ones for
+`real_drawings_where_a_folder_of_them_is_named`, and `apps/bimcraft-cli/tests/dwg.rs` drives the child.
 
 ## The project
 

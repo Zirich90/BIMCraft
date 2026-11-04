@@ -8,7 +8,7 @@ use bimcraft_i18n::msg;
 use std::collections::BTreeSet;
 
 use bimcraft_core::geom::{self, P2};
-use bimcraft_core::model::{Element, Id, Model, TOL};
+use bimcraft_core::model::{Element, Id, Line, Model, TOL};
 use bimcraft_core::render::View;
 use bimcraft_core::sketch::{self as solver, Problem, SketchLine};
 use bimcraft_core::units::Units;
@@ -20,7 +20,7 @@ use crate::icons::Icon;
 use crate::lang::{t, tf};
 use crate::properties::number;
 use crate::style::{canvas_pal, pal};
-use crate::{BimApp, Sheet, Status, Tool, big_button, draw, panel, ribbon};
+use crate::{BimApp, Sheet, Status, Tool, big_button, draw, panel, ribbon, small_button};
 
 /// What Finish Edit Mode makes of the lines.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,6 +99,18 @@ impl Sketch {
             .filter(|(_, d)| *d <= reach)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i)
+    }
+
+    /// The nearest actual straight segment, including one of a polyline: Align's candidate.
+    pub(crate) fn alignment_at(&self, p: P2, reach: f64) -> Option<(usize, Line, f64)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                bimcraft_core::align::curve_lines(&l.curve).into_iter().map(move |line| (i, line, geom::dist_to_segment(p, line.0, line.1)))
+            })
+            .filter(|(_, _, d)| *d <= reach)
+            .min_by(|a, b| a.2.total_cmp(&b.2))
     }
 
     /// The end of a picked line within `reach` mm of `p`: a grip.
@@ -422,9 +434,19 @@ impl BimApp {
     /// the plan it began in, which it takes the window back to.
     pub(crate) fn track_sketch(&mut self) {
         let Some(sk) = &mut self.sketch else { return };
+        // Multiple Trim keeps an unchanged boundary while successive targets change. Other edits
+        // can remove or renumber that line, so never carry an unverified index into the next frame.
+        let keep_trim = matches!(self.tool, Tool::TrimTo { many: true, .. })
+            && self.drawing.trim.is_some_and(|(i, _)| sk.lines.get(i).is_some() && sk.lines.get(i) == sk.seen.get(i));
         if sk.track() {
             self.drawing.fillet.retain(|(l, _)| matches!(l, draw::Picked::Element(_)));
-            self.drawing.trim = None;
+            if !keep_trim {
+                self.drawing.trim = None;
+            }
+            self.drawing.align_reference = None;
+            if matches!(self.tool, Tool::Align(Some(_))) {
+                self.tool = Tool::Align(None);
+            }
         }
         if let Some(plan) = self.sketch_plan()
             && self.sheet != plan
@@ -448,6 +470,10 @@ impl BimApp {
         {
             self.drawing.fillet.retain(|(l, _)| matches!(l, draw::Picked::Element(_)));
             self.drawing.trim = None;
+            self.drawing.align_reference = None;
+            if matches!(self.tool, Tool::Align(Some(_))) {
+                self.tool = Tool::Align(None);
+            }
         }
         if let Tool::SketchLine(chain) = &mut self.tool {
             chain.clear();
@@ -464,6 +490,25 @@ impl BimApp {
                 !picked.contains(&(i - 1))
             });
             sk.changed();
+        }
+    }
+
+    /// Align changes only the draft until Finish; its joined ends and local undo move with it.
+    pub(crate) fn align_sketch(&mut self, reference: Line, target: usize, line: Line) {
+        let fixed = match self.drawing.align_reference {
+            Some(draw::Picked::Sketch(i)) => Some(i),
+            _ => None,
+        };
+        let Some(sk) = &mut self.sketch else { return };
+        match bimcraft_core::align::sketch_lines(&sk.lines, target, reference, line, fixed) {
+            Ok(lines) => {
+                sk.lines = lines;
+                sk.changed();
+                self.drawing.align_reference = None;
+                self.tool = Tool::Align(None);
+                self.status = Status::default();
+            }
+            Err(text) => self.status = Status { text, error: true },
         }
     }
 
@@ -613,6 +658,51 @@ impl BimApp {
         self.draw_panel(ui, draw::Target::Sketch);
     }
 
+    /// Editing tools must remain available in the sketch's contextual ribbon.
+    pub(crate) fn sketch_modify_panel(&mut self, ui: &mut Ui) {
+        let tools = [
+            (Icon::Align, msg!("Align"), msg!("Align (AL): pick a reference line, then what to line up with it"), Tool::Align(None)),
+            (
+                Icon::Trim,
+                msg!("Trim/Extend to Corner"),
+                msg!("Trim/Extend to Corner (TR): pick two walls or two lines, on the parts to keep"),
+                Tool::Trim(None),
+            ),
+            (
+                Icon::TrimSingle,
+                msg!("Trim/Extend Single Element"),
+                msg!("Trim/Extend Single Element: pick the line to trim or extend to, then the line to change, on the part to keep"),
+                Tool::TrimTo { boundary: None, many: false },
+            ),
+            (
+                Icon::TrimMultiple,
+                msg!("Trim/Extend Multiple Elements"),
+                msg!("Trim/Extend Multiple Elements: pick the line to trim or extend to, then each line to change, on the part to keep"),
+                Tool::TrimTo { boundary: None, many: true },
+            ),
+            (Icon::Split, msg!("Split Element"), msg!("Split Element (SL): click a wall or a line where to split it"), Tool::Split),
+            (Icon::Offset, msg!("Offset"), msg!("Offset (OF): pick a wall or a line; a copy goes to the cursor's side"), Tool::Offset),
+        ];
+        panel(ui, "Modify", |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for row in tools.chunks(3) {
+                    ui.horizontal(|ui| {
+                        for (icon, label, tip, tool) in row {
+                            let active = match (&self.tool, tool) {
+                                (Tool::TrimTo { many: a, .. }, Tool::TrimTo { many: b, .. }) => a == b,
+                                (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+                            };
+                            if small_button(ui, *icon, label, active, tip).clicked() {
+                                self.set_tool(tool.clone());
+                            }
+                        }
+                    });
+                }
+            });
+        });
+    }
+
     /// The Mode panel at the ribbon's right end: Finish and Cancel while sketching, Edit Boundary when one floor, ceiling,
     /// roof or shaft is selected.
     pub(crate) fn mode_panel(&mut self, ui: &mut Ui) {
@@ -733,6 +823,12 @@ impl BimApp {
     pub(crate) fn sketch_prompt(&self) -> Option<&'static str> {
         self.sketch.as_ref()?;
         Some(match &self.tool {
+            Tool::Align(None) => msg!("Pick a highlighted model edge or sketch line as the alignment reference."),
+            Tool::Align(Some(_)) => msg!("Pick the highlighted sketch line to move and turn onto the reference; joined ends follow."),
+            Tool::Trim(_) if self.drawing.trim.is_none() => msg!("Pick the first sketch line, on the part to keep."),
+            Tool::Trim(_) => msg!("Pick the second sketch line, on the part to keep."),
+            Tool::TrimTo { .. } if self.drawing.trim.is_none() => msg!("Pick a sketch line as the trim/extend boundary."),
+            Tool::TrimTo { .. } => msg!("Pick a sketch line to trim or extend, on the part to keep. Esc clears the boundary."),
             Tool::SketchLine(_) if self.shape() != draw::Shape::Line => return self.shape_prompt(),
             Tool::SketchLine(chain) if chain.is_empty() => "Click where the line starts.",
             Tool::SketchLine(_) => msg!("Click the line's end; the next starts there. The first point again closes the loop; Esc stops."),

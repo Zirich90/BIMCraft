@@ -4,6 +4,8 @@
 //! command (`modify`, or `type` from the Type Properties dialog), so it is checked, rolled back
 //! when it breaks a rule, and undone like any other change.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::collections::BTreeSet;
@@ -17,14 +19,15 @@ use bimcraft_core::snap::Kind as Snap;
 use bimcraft_core::texture::{Kind as TextureKind, Texture};
 use bimcraft_core::units::Units;
 use egui::{
-    Align, Align2, Button, Checkbox, ComboBox, Context, FontId, Frame, Grid, Id as UiId, Key, Layout, Margin, Modal, Popup, Rect, RichText,
-    ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, TextureHandle, Ui, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Align2, Button, Checkbox, ComboBox, Context, FontId, Frame, Grid, Id as UiId, Key, Layout, Margin, Popup, Rect, RichText,
+    ScrollArea, Sense, Shape, Slider, Stroke, StrokeKind, TextEdit, TextureHandle, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
 use serde_json::{Value, json};
 
 use crate::icons::{self, Icon};
 use crate::lang::{self, t, tf};
 use crate::style::pal;
+use crate::typeprops::{self, Head, Naming};
 use crate::{BimApp, Sheet, Status, Tool};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -48,6 +51,8 @@ enum Kind {
     ViewName,
     /// A level, or none for a wall of unconnected height.
     TopLevel,
+    /// A room's Upper Limit: a level, or Not Bounded (none), its Limit Offset then its height over its own level.
+    UpperLimit,
     /// A wall's height: typed when its top is unconnected, else what its levels make it.
     Height,
     /// A length, or nothing, which its hint names when blank (a plan's top at the level above, a
@@ -124,6 +129,7 @@ fn rows(category: &str) -> &'static [Row] {
             ("Constraints", "top_level", msg!("Top Constraint"), TopLevel),
             ("Constraints", "height", msg!("Unconnected Height"), Height),
             ("Constraints", "attach_top", msg!("Top is Attached"), Attached),
+            ("Constraints", "room_bounding", msg!("Room Bounding"), Flag),
             ("Dimensions", "length", "Length", LengthShown),
             ("Dimensions", "radius", "Radius", LengthShown),
             (msg!("Other"), "start", msg!("Start"), Point),
@@ -147,11 +153,17 @@ fn rows(category: &str) -> &'static [Row] {
         ],
         "room" => &[
             ("Constraints", "level", "Level", Level),
+            ("Constraints", "top_level", msg!("Upper Limit"), UpperLimit),
+            ("Constraints", "limit_offset", msg!("Limit Offset"), Length),
+            ("Constraints", "base_offset", "Base Offset", Length),
             ("Dimensions", "area_m2", "Area", AreaShown),
             ("Dimensions", "perimeter_m", "Perimeter", MetresShown),
+            ("Dimensions", "unbounded_height", msg!("Unbounded Height"), LengthShown),
+            ("Dimensions", "volume_m3", "Volume (m³)", Shown),
             ("Identity Data", "number", "Number", Text),
             ("Identity Data", "name", "Name", Text),
             ("Other", "point", msg!("Location"), Point),
+            ("Other", "frozen", msg!("Frozen"), Flag),
         ],
         "floor" => &[
             ("Constraints", "level", "Level", Level),
@@ -186,14 +198,27 @@ fn rows(category: &str) -> &'static [Row] {
             ("Dimensions", "gross_floor_area_m2", "Gross Floor Area", AreaShown),
             ("Identity Data", "name", "Name", Text),
         ],
-        "level" => &[("Constraints", "elevation", "Elevation", Length), ("Identity Data", "name", "Name", Text)],
+        "level" => &[
+            ("Constraints", "elevation", "Elevation", Length),
+            ("Dimensions", "computation_height", msg!("Computation Height"), Length),
+            ("Identity Data", "name", "Name", Text),
+        ],
         "grid" => &[("Identity Data", "name", "Name", Text), ("Other", "start", "Start", Point), ("Other", "end", "End", Point)],
-        "dimension" => {
-            &[("Dimensions", "values", "Value", Values), ("Other", "kind", "Kind", Shown), ("Other", "at", msg!("Line Through"), Point)]
-        }
+        "dimension" => &[
+            ("Dimensions", "values", "Value", Values),
+            ("Text", "prefix", msg!("Prefix"), Text),
+            ("Text", "suffix", msg!("Suffix"), Text),
+            ("Text", "above", msg!("Above"), Text),
+            ("Text", "below", msg!("Below"), Text),
+            ("Text", "replace", msg!("Replace With Text"), Text),
+            ("Other", "equality", msg!("Equality Display"), Flag),
+            ("Other", "kind", "Kind", Shown),
+            ("Other", "orient", msg!("Orientation"), Shown),
+            ("Other", "at", msg!("Line Through"), Point),
+        ],
         "text" => &[
             ("Text", "text", "Text", Text),
-            ("Graphics", "size", msg!("Text Size (mm)"), Number),
+            ("Text", "override_format", msg!("Override Formatting"), Flag),
             ("Other", "angle", msg!("Rotation (°)"), Number),
             ("Other", "at", "Location", Point),
         ],
@@ -256,15 +281,16 @@ fn rows(category: &str) -> &'static [Row] {
             ("Other", "at", "Location", Point),
             ("Other", "angle", "Rotation (°)", Number),
         ],
-        "column" => &[
+        "column" | "structuralcolumn" => &[
             ("Constraints", "level", msg!("Base Level"), Level),
             ("Constraints", "base_offset", "Base Offset", Length),
             ("Constraints", "top_level", msg!("Top Level"), TopLevel),
             ("Constraints", "height", "Unconnected Height", Height),
+            ("Constraints", "room_bounding", msg!("Room Bounding"), Flag),
             ("Other", "at", "Location", Point),
             ("Other", "angle", "Rotation (°)", Number),
         ],
-        "structuralcolumn" | "footing" => &[
+        "footing" => &[
             ("Constraints", "level", "Base Level", Level),
             ("Constraints", "base_offset", "Base Offset", Length),
             ("Constraints", "top_level", "Top Level", TopLevel),
@@ -359,6 +385,10 @@ fn rows(category: &str) -> &'static [Row] {
     }
 }
 
+/// A 3D view's rows when it has a camera: the azimuth and elevation mean nothing to a camera (it looks from its eye at its
+/// target), so a viewport on a sheet shows just the view's name.
+const VIEW3D_CAMERA: &[Row] = &[("Identity Data", "name", "View Name", Text)];
+
 /// A floor plan's parameters, read from and written to its level.
 const PLAN: &[Row] = &[
     ("Identity Data", "name", "View Name", Text),
@@ -404,18 +434,20 @@ fn type_json<'a>(types: &'a Value, category: &str, name: &str) -> &'a Value {
     &of[name]
 }
 
-/// A type's parameters, as its Type Properties list them: its field, its label.
-fn type_rows(category: &str) -> &'static [(&'static str, &'static str)] {
+/// A type's parameters, as its Type Properties list them: the group it's under, its field, its label.
+fn type_rows(category: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    const C: &str = msg!("Construction");
+    const D: &str = msg!("Dimensions");
     match category {
-        "wall" => &[("thickness", "Width")],
-        "floor" => &[("thickness", msg!("Default Thickness"))],
-        "door" => &[("width", "Width"), ("height", "Height")],
-        "window" => &[("width", "Width"), ("height", "Height"), ("sill", msg!("Default Sill Height"))],
-        "column" | "structuralcolumn" | "footing" => &[("width", "Width"), ("depth", "Depth")],
-        run if bimcraft_core::model::RUN_CATEGORIES.contains(&run) => &[("width", "Width"), ("depth", "Depth")],
-        "roof" => &[("thickness", "Thickness")],
-        "ceiling" => &[("thickness", "Thickness"), ("grid", msg!("Tile Size"))],
-        "railing" => &[("height", "Height"), ("spacing", msg!("Baluster Spacing"))],
+        "wall" => &[(C, "thickness", msg!("Width"))],
+        "floor" => &[(C, "thickness", msg!("Default Thickness"))],
+        "door" => &[(D, "width", msg!("Width")), (D, "height", msg!("Height"))],
+        "window" => &[(D, "width", msg!("Width")), (D, "height", msg!("Height")), (C, "sill", msg!("Default Sill Height"))],
+        "column" | "structuralcolumn" | "footing" => &[(D, "width", msg!("Width")), (D, "depth", msg!("Depth"))],
+        run if bimcraft_core::model::RUN_CATEGORIES.contains(&run) => &[(D, "width", msg!("Width")), (D, "depth", msg!("Depth"))],
+        "roof" => &[(C, "thickness", msg!("Thickness"))],
+        "ceiling" => &[(C, "thickness", msg!("Thickness")), (C, "grid", msg!("Tile Size"))],
+        "railing" => &[(C, "height", msg!("Height")), (C, "spacing", msg!("Baluster Spacing"))],
         _ => &[],
     }
 }
@@ -442,6 +474,9 @@ fn icon(category: &str) -> Icon {
         "stripfooting" => Icon::WallFooting,
         "pipe" => Icon::Pipe,
         "cablecarrier" => Icon::CableTray,
+        "duct" => Icon::CableTray,
+        "conduit" => Icon::Conduit,
+        "cabletray" => Icon::CableTray,
         "wire" => Icon::Wire,
         "downconductor" => Icon::DownConductor,
         "groundconductor" => Icon::GroundConductor,
@@ -543,6 +578,11 @@ pub(crate) fn combo(ui: &mut Ui, salt: (Id, &str), label: UiId, current: &str, o
     picked
 }
 
+/// A button across a value cell, as wide as the drop-downs beside it, its text centred: Edit…, a view template's name.
+pub(crate) fn wide_button(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add_sized([ui.available_width(), ui.spacing().interact_size.y], Button::new(text).truncate())
+}
+
 /// A parameter group's header: a bar across the palette that folds the group, as Revit's do.
 /// Whether it was clicked.
 pub(crate) fn group_header(ui: &mut Ui, group: &str, open: bool) -> bool {
@@ -626,6 +666,8 @@ pub(crate) struct MaterialsDialog {
     picked: String,
     name: String,
     color: Option<[u8; 3]>,
+    /// Its transparency as set on the slider, percent (applied once the mouse lets go).
+    clear: Option<u8>,
     /// The texture's fields as typed (a tile's width and height, the angle, the offset across and up), for the material and
     /// texture they were made from.
     texture: Option<(String, Texture, [String; 5])>,
@@ -636,22 +678,25 @@ pub(crate) struct MaterialsDialog {
 impl MaterialsDialog {
     pub(crate) fn new(m: &Model) -> MaterialsDialog {
         let picked = m.materials.keys().next().cloned().unwrap_or_default();
-        MaterialsDialog { name: picked.clone(), picked, color: None, texture: None, swatch: None }
+        MaterialsDialog { name: picked.clone(), picked, color: None, clear: None, texture: None, swatch: None }
     }
 }
 
 /// What a layer does, as the layer editor names it.
 const FUNCTIONS: [(Function, &str); 5] = [
-    (Function::Structure, "Structure"),
-    (Function::Substrate, "Substrate"),
+    (Function::Structure, msg!("Structure")),
+    (Function::Substrate, msg!("Substrate")),
     (Function::Thermal, msg!("Thermal")),
-    (Function::Membrane, "Membrane"),
-    (Function::Finish, "Finish"),
+    (Function::Membrane, msg!("Membrane")),
+    (Function::Finish, msg!("Finish")),
 ];
 
 fn function_name(f: Function) -> &'static str {
     FUNCTIONS.iter().find(|(g, _)| *g == f).map_or("Structure", |(_, n)| n)
 }
+
+/// A type's parameter as typed: its group, its field, its label, the text.
+type TypeField = (&'static str, &'static str, &'static str, String);
 
 /// The Type Properties dialog: a type of a category, and its parameters as typed; a layered
 /// type's layers, too.
@@ -660,9 +705,11 @@ pub(crate) struct TypeDialog {
     name: String,
     /// The elements that were on the type when the dialog opened; OK puts them on the type shown.
     elements: Vec<Id>,
-    fields: Vec<(&'static str, &'static str, String)>,
-    /// The name being typed for a duplicate.
-    duplicate: Option<String>,
+    fields: Vec<TypeField>,
+    /// A new name being typed, for a duplicate or a rename.
+    naming: Naming,
+    /// What stopped OK, Apply, Duplicate or Rename.
+    error: Option<String>,
     /// A layered type's layers, exterior or top first, as typed, and as they were: changed, they
     /// make it.
     layers: Vec<LayerRow>,
@@ -678,7 +725,7 @@ impl TypeDialog {
             let t = m.types.runs.get(category).and_then(|t| t.get(&name));
             (t.is_some_and(|t| t.round), t.map(|t| t.material.clone()).unwrap_or_default())
         });
-        TypeDialog { category, name, elements, fields, duplicate: None, layers_were: layers.clone(), layers, shape }
+        TypeDialog { category, name, elements, fields, naming: Naming::None, error: None, layers_were: layers.clone(), layers, shape }
     }
 
     /// The dialog showing type `name` as the model has it now.
@@ -687,9 +734,9 @@ impl TypeDialog {
     }
 
     /// A type's sizes, as typed: lengths in the project's units.
-    fn fields(m: &Model, category: &str, name: &str) -> Vec<(&'static str, &'static str, String)> {
+    fn fields(m: &Model, category: &str, name: &str) -> Vec<TypeField> {
         let types = serde_json::to_value(&m.types).unwrap_or_default();
-        type_rows(category).iter().map(|(k, l)| (*k, *l, shown(Length, &type_json(&types, category, name)[k], m.units))).collect()
+        type_rows(category).iter().map(|(g, k, l)| (*g, *k, *l, shown(Length, &type_json(&types, category, name)[k], m.units))).collect()
     }
 
     /// A layered type's layers, as typed: one structure layer as thick as it, without any.
@@ -715,7 +762,9 @@ impl TypeDialog {
             p["layers"] = Value::Array(layers.collect::<Result<_, String>>()?);
         }
         let round = self.shape.as_ref().is_some_and(|(round, _)| *round);
-        for (key, label, typed) in self.fields.iter().filter(|(key, ..)| !(layered && *key == "thickness") && !(round && *key == "depth")) {
+        for (_, key, label, typed) in
+            self.fields.iter().filter(|(_, key, ..)| !(layered && *key == "thickness") && !(round && *key == "depth"))
+        {
             p[*key] = json!(units.parse(typed).ok_or_else(|| tf("{}: `{}` is not a length", &[t(label), typed]))?);
         }
         if let Some((round, material)) = &self.shape {
@@ -748,13 +797,14 @@ impl BimApp {
             ([], Tool::Room, _) => Subject::New("room"),
             ([], Tool::Level, _) => Subject::New("level"),
             ([], Tool::Grid(_), _) => Subject::New("grid"),
-            ([], Tool::Dimension(_) | Tool::Angular(_) | Tool::Radial(_), _) => Subject::New("dimension"),
+            ([], Tool::Dimension(..) | Tool::Angular(_) | Tool::Round(..), _) => Subject::New("dimension"),
             ([], Tool::Text, _) => Subject::New("text"),
             ([], Tool::DetailLine(_), _) => Subject::New("line"),
             ([], Tool::Spot, _) => Subject::New("spot"),
             ([], Tool::Tag, _) => Subject::New("tag"),
             ([], Tool::Section(_), _) => Subject::New("section"),
             ([], Tool::Elevation, _) => Subject::New("elevation"),
+            ([], Tool::Camera(_), _) => Subject::View3D,
             ([], Tool::Column, _) => Subject::New("column"),
             ([], Tool::Run(category, _) | Tool::Stand(category), _) => Subject::New(category),
             ([], Tool::Component | Tool::Fixture(_), _) => Subject::New("component"),
@@ -878,6 +928,14 @@ impl BimApp {
                 self.fill_patterns_dialog = Some(crate::fillpatterns::FillPatternsDialog::edit(&self.session.model, &name, elements));
                 return;
             }
+            if category == "text" {
+                self.text_type_dialog = Some(crate::notes::TextTypeDialog::new(&self.session.model, name, elements));
+                return;
+            }
+            if category == "dimension" {
+                self.dimension_type_dialog = Some(crate::dimtypes::DimensionTypeDialog::new(&self.session.model, name, elements));
+                return;
+            }
             let pair = if category == "component" {
                 self.component_type()
             } else {
@@ -893,10 +951,20 @@ impl BimApp {
     pub(crate) fn properties(&mut self, ui: &mut Ui) {
         let model = Arc::clone(&self.session.model);
         let subject = self.subject();
+        // A camera view picked on a plan: its Properties are its camera's, the same panel the 3D tab shows for it.
+        let camera_view = match subject {
+            Subject::Element(id) => matches!(model.elements.get(id), Some(Element::View3D(v)) if v.camera.is_some()),
+            _ => false,
+        };
+        let active_3d = self.active_3d();
         self.type_selector(ui, &model, subject);
         let (filter, ids, rows) = match subject {
             Subject::Element(id) => match model.elements.get(id) {
-                Some(e) => (format!("{} (1)", lang::category(e.category(), true)), vec![id], rows(e.category())),
+                Some(e) => (
+                    format!("{} (1)", lang::category(e.category(), true)),
+                    vec![id],
+                    if camera_view { &[][..] } else { rows(e.category()) },
+                ),
                 None => return,
             },
             Subject::Elements(category) => {
@@ -957,17 +1025,23 @@ impl BimApp {
         if subject == Subject::Schedule {
             self.schedule_parameters(ui);
         }
-        // A 3D view on a sheet: where it looks from, too.
+        // A camera view picked on a plan: its camera's properties, bound to it rather than to the 3D tab's view.
+        if camera_view && let Subject::Element(id) = subject {
+            self.camera_properties(ui, Some(id));
+        }
+        // A 3D view on a sheet: where it looks from, too; a camera view's azimuth and elevation mean nothing, so its name only.
         if let Subject::Element(id) = subject
             && let Some(bimcraft_core::model::Element::Viewport(vp)) = model.elements.get(id)
-            && let Some(bimcraft_core::model::Element::View3D(_)) = model.elements.get(vp.view)
+            && let Some(bimcraft_core::model::Element::View3D(v)) = model.elements.get(vp.view)
         {
-            self.parameters(ui, &model, &[model.elements.id(vp.view).unwrap_or_default()], self::rows("view3d"));
+            let view_rows = if v.camera.is_some() { VIEW3D_CAMERA } else { self::rows("view3d") };
+            self.parameters(ui, &model, &[model.elements.id(vp.view).unwrap_or_default()], view_rows);
         }
         // A view's graphics: the template it follows, and its overrides.
         let view_shown = matches!(subject, Subject::Plan(_) | Subject::CeilingPlan | Subject::View3D)
             || (matches!(subject, Subject::Element(_)) && self.selection.is_empty() && matches!(self.sheet, Sheet::Section(_)));
         if subject == Subject::View3D {
+            self.camera_properties(ui, active_3d);
             self.section_box_properties(ui);
         }
         if view_shown {
@@ -1152,6 +1226,8 @@ impl BimApp {
             }
         }
         let mut change: Option<(&str, Result<Value, String>)> = None;
+        // A second field the change sets with it: a room's Limit Offset, kept where its top is as its Upper Limit changes.
+        let mut also: Option<(&str, Value)> = None;
         let mut crop = None;
         let units = model.units;
         // A note on a sheet sits in paper mm.
@@ -1168,7 +1244,7 @@ impl BimApp {
                 // Half the palette each, as Revit's columns: a long label wraps rather than pushing
                 // its field past the palette's edge.
                 let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                Grid::new(("properties", id, group)).num_columns(2).striped(true).min_col_width(half).max_col_width(half).show(ui, |ui| {
+                Grid::new(("properties", id, group)).num_columns(2).min_col_width(half).max_col_width(half).show(ui, |ui| {
                     for &(_, key, label, kind) in rows.iter().filter(|r| r.0 == group) {
                         let val = &v[key];
                         // A length one element hasn't got (a straight wall's radius): no row.
@@ -1224,6 +1300,22 @@ impl BimApp {
                             Level => {
                                 if let Some(l) = combo(ui, (id, key), name.id, &level_name(val), &levels) {
                                     change = Some((key, Ok(json!(l))));
+                                }
+                            }
+                            UpperLimit => {
+                                let none = t("Not Bounded");
+                                let options: Vec<String> = std::iter::once(none.to_string()).chain(levels.iter().cloned()).collect();
+                                let now = if val.is_null() { none.to_string() } else { level_name(val) };
+                                if let Some(l) = combo(ui, (id, key), name.id, &now, &options) {
+                                    let upper =
+                                        levels.iter().position(|n| *n == l).and_then(|i| model.levels().get(i).map(|(lid, _)| *lid));
+                                    // One room: its top stays where it is, its Limit Offset now measured from the new limit.
+                                    if let ([_], Some(Element::Room(r))) = (ids, model.elements.get(id)) {
+                                        let (_, top) = model.room_span(r);
+                                        let from = upper.map_or_else(|| model.elevation(r.level), |u| model.elevation(u));
+                                        also = Some(("limit_offset", json!(top - from)));
+                                    }
+                                    change = Some((key, Ok(if l == none { Value::Null } else { json!(l) })));
                                 }
                             }
                             TopLevel => {
@@ -1312,6 +1404,9 @@ impl BimApp {
         match change {
             Some((key, Ok(val))) => {
                 let mut p = nested(key, val);
+                if let Some((k, v)) = also {
+                    p[k] = v;
+                }
                 p["ids"] = json!(ids);
                 self.run("modify", p);
             }
@@ -1378,7 +1473,7 @@ impl BimApp {
                 continue;
             }
             Frame::new().inner_margin(Margin { left: 8, right: 0, top: 2, bottom: 6 }).show(ui, |ui| {
-                Grid::new(("component", id, group)).num_columns(2).striped(true).min_col_width(124.0).show(ui, |ui| {
+                Grid::new(("component", id, group)).num_columns(2).min_col_width(124.0).show(ui, |ui| {
                     for p in params {
                         let val = shared(&p.name);
                         let name = ui.label(&p.name);
@@ -1453,7 +1548,7 @@ impl BimApp {
         let mut change: Option<(String, Result<Value, String>)> = None;
         Frame::new().inner_margin(Margin { left: 8, right: 0, top: 2, bottom: 6 }).show(ui, |ui| {
             let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-            Grid::new(("project-parameters", id)).num_columns(2).striped(true).min_col_width(half).max_col_width(half).show(ui, |ui| {
+            Grid::new(("project-parameters", id)).num_columns(2).min_col_width(half).max_col_width(half).show(ui, |ui| {
                 for (name, kind) in &params {
                     let val = value(name);
                     let label = ui.label(name.as_str());
@@ -1505,40 +1600,37 @@ impl BimApp {
             }
             Frame::new().inner_margin(Margin { left: 8, right: 0, top: 2, bottom: 6 }).show(ui, |ui| {
                 let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                Grid::new(("schedule-properties", group)).num_columns(2).striped(true).min_col_width(half).max_col_width(half).show(
-                    ui,
-                    |ui| {
-                        if group == "Identity Data" {
-                            let label = ui.label(t("View Name"));
-                            match made {
-                                Some(id) => {
-                                    if let Some(typed) = self.field(ui, id, "name", sc.name.clone(), label.id, "") {
-                                        rename = Some((id, typed));
-                                    }
-                                }
-                                // Every project's, as it is: named as the project's once it's changed.
-                                None => {
-                                    ui.label(RichText::new(&sc.name).color(pal().muted));
+                Grid::new(("schedule-properties", group)).num_columns(2).min_col_width(half).max_col_width(half).show(ui, |ui| {
+                    if group == "Identity Data" {
+                        let label = ui.label(t("View Name"));
+                        match made {
+                            Some(id) => {
+                                if let Some(typed) = self.field(ui, id, "name", sc.name.clone(), label.id, "") {
+                                    rename = Some((id, typed));
                                 }
                             }
-                            ui.end_row();
-                            return;
+                            // Every project's, as it is: named as the project's once it's changed.
+                            None => {
+                                ui.label(RichText::new(&sc.name).color(pal().muted));
+                            }
                         }
-                        ui.label(t("Category"));
-                        ui.label(RichText::new(lang::category(&sc.of, true)).color(pal().muted));
                         ui.end_row();
-                        for (tab, label) in SCHEDULE_TABS.iter().enumerate() {
-                            ui.label(t(label));
-                            let r = ui.button(t("Edit…"));
-                            // Named for what it edits, for screen readers.
-                            r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tf("Edit {}", &[t(label)])));
-                            if r.clicked() {
-                                open = Some(tab);
-                            }
-                            ui.end_row();
+                        return;
+                    }
+                    ui.label(t("Category"));
+                    ui.label(RichText::new(lang::category(&sc.of, true)).color(pal().muted));
+                    ui.end_row();
+                    for (tab, label) in SCHEDULE_TABS.iter().enumerate() {
+                        ui.label(t(label));
+                        let r = wide_button(ui, t("Edit…"));
+                        // Named for what it edits, for screen readers.
+                        r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tf("Edit {}", &[t(label)])));
+                        if r.clicked() {
+                            open = Some(tab);
                         }
-                    },
-                );
+                        ui.end_row();
+                    }
+                });
             });
         }
         // Named otherwise, one every project has is just the project's: its tab follows it.
@@ -1563,87 +1655,71 @@ impl BimApp {
         let Some(mut d) = self.type_dialog.take() else { return };
         let model = Arc::clone(&self.session.model);
         let names: Vec<String> = model.type_names(d.category).into_iter().map(String::from).collect();
-        let (mut ok, mut cancel, mut apply, mut create, mut switch) = (false, false, false, false, None);
-        let r = Modal::new(UiId::new("type-properties")).show(ctx, |ui| {
-            // Wider for a type's layers.
-            ui.set_width(if LAYERED.contains(&d.category) { 560.0 } else { 400.0 });
-            ui.label(RichText::new(t("Type Properties")).heading());
-            ui.add_space(6.0);
-            Grid::new("type-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                ui.label(t("Family:"));
-                ui.label(lang::category(d.category, false));
-                ui.end_row();
-                let l = ui.label(t("Type:"));
-                ui.horizontal(|ui| {
-                    let c = ComboBox::from_id_salt("type-name").selected_text(&d.name).width(200.0).show_ui(ui, |ui| {
-                        for n in &names {
-                            if ui.selectable_label(*n == d.name, n).clicked() {
-                                switch = Some(n.clone());
+        let (mut ok, mut cancel, mut apply, mut asked) = (false, false, false, None);
+        let r = Modal::new(UiId::new("type-properties"), t("Type Properties")).width(crate::typeprops::WIDTH).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                let family = tf("System Family: {}", &[&lang::category(d.category, true)]);
+                asked = typeprops::head(ui, "type", &family, &names, &d.name, &mut d.naming, true);
+                let below = typeprops::foot_height(ui, d.error.is_some());
+                let materials: Vec<String> = model.materials.keys().cloned().collect();
+                let layered = LAYERED.contains(&d.category);
+                let round = d.shape.as_ref().is_some_and(|(round, _)| *round);
+                // The groups in the order their first row comes; a run's roundness is a dimension, its material its own group.
+                let mut groups: Vec<&str> = Vec::new();
+                let extra =
+                    [(layered, "Construction"), (d.shape.is_some(), "Dimensions"), (d.shape.is_some(), msg!("Materials and Finishes"))];
+                for g in d.fields.iter().map(|f| f.0).chain(extra.iter().filter(|(on, _)| *on).map(|(_, g)| *g)) {
+                    if !groups.contains(&g) {
+                        groups.push(g);
+                    }
+                }
+                typeprops::table(ui, "type", below, |tb| {
+                    for g in groups {
+                        tb.group(g);
+                        for (_, key, label, typed) in d.fields.iter_mut().filter(|f| f.0 == g) {
+                            // A round section has a diameter and no depth.
+                            if round && *key == "depth" {
+                                continue;
                             }
+                            tb.text(t(if round && *key == "width" { "Diameter" } else { label }), typed, model.units.name());
                         }
-                    });
-                    c.response.labelled_by(l.id);
-                    if d.duplicate.is_none() && ui.button(t("Duplicate…")).clicked() {
-                        d.duplicate = Some(format!("{} 2", d.name));
+                        match (g, &mut d.shape) {
+                            ("Dimensions", Some((round, _))) => tb.check(t("Round"), round),
+                            ("Materials and Finishes", Some((_, material))) => tb.pick(t("Material"), material, &materials),
+                            _ => {}
+                        }
+                        if g == "Construction" && layered {
+                            let (out, inward) = if d.category == "wall" { (msg!("Out"), msg!("In")) } else { ("Up", "Down") };
+                            tb.full(|ui| layer_editor(ui, &mut d.layers, model.units, &materials, (out, inward)));
+                        }
                     }
                 });
-                ui.end_row();
-                if let Some(new) = &mut d.duplicate {
-                    let l = ui.label(t("New type"));
-                    ui.horizontal(|ui| {
-                        ui.add(TextEdit::singleline(new).desired_width(200.0)).labelled_by(l.id);
-                        create = ui.button(t("Create")).clicked();
-                    });
-                    ui.end_row();
-                }
+                typeprops::error(ui, d.error.as_deref());
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Type Parameters")).strong());
-            Grid::new("type-parameters").num_columns(2).striped(true).min_col_width(150.0).show(ui, |ui| {
-                ui.label(RichText::new(t("Parameter")).color(pal().muted));
-                ui.label(RichText::new(t("Value")).color(pal().muted));
-                ui.end_row();
-                let round = d.shape.as_ref().is_some_and(|(round, _)| *round);
-                for (key, label, typed) in &mut d.fields {
-                    // A round section has a diameter and no depth.
-                    if round && *key == "depth" {
-                        continue;
-                    }
-                    let l = ui.label(t(if round && *key == "width" { "Diameter" } else { label }));
-                    ui.add(TextEdit::singleline(typed).desired_width(160.0)).labelled_by(l.id);
-                    ui.end_row();
-                }
-                if let Some((round, material)) = &mut d.shape {
-                    ui.label("");
-                    ui.checkbox(round, t("Round"));
-                    ui.end_row();
-                    let l = ui.label(t("Material"));
-                    let names: Vec<String> = model.materials.keys().cloned().collect();
-                    if let Some(n) = combo(ui, (0, "type-material"), l.id, material, &names) {
-                        *material = n;
-                    }
-                    ui.end_row();
-                }
-            });
-            if LAYERED.contains(&d.category) {
-                ui.add_space(6.0);
-                let materials: Vec<String> = model.materials.keys().cloned().collect();
-                let (out, inward) = if d.category == "wall" { (msg!("Out"), msg!("In")) } else { ("Up", "Down") };
-                layer_editor(ui, &mut d.layers, model.units, &materials, (out, inward));
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                apply = ui.button(t("Apply")).clicked();
-                cancel = ui.button(t("Cancel")).clicked();
-                ok = ui.button(t("OK")).clicked();
+            crate::popup::footer(ui, |ui| {
+                (ok, cancel, apply) = typeprops::foot(ui);
             });
         });
+        let switch = match &asked {
+            Some(Head::Switch(n)) => Some(n.clone()),
+            _ => None,
+        };
+        let create = matches!(asked, Some(Head::Duplicate(_)));
+        if let Some(Head::Rename(to)) = &asked {
+            let p = json!({"category": d.category, "type": d.name, "name": to});
+            if self.run_for_type("rename_type", p, &mut d.error) {
+                if self.types.get(d.category) == Some(&d.name) {
+                    self.types.insert(d.category, to.clone());
+                }
+                d.show(&Arc::clone(&self.session.model), to.clone());
+            }
+        }
         if let Some(n) = switch {
             d.show(&model, n);
         }
-        if create && let Some(new) = d.duplicate.clone() {
+        if create && let Some(Head::Duplicate(new)) = asked.clone() {
             let layered = !model.type_layers(d.category, &d.name).is_empty();
-            let made = match d.params(new.trim(), model.units, layered) {
+            let made = match d.params(&new, model.units, layered) {
                 Ok(mut p) => {
                     // A duplicate is round, and made of a material, as the type it copies is.
                     let types = serde_json::to_value(&model.types).unwrap_or_default();
@@ -1655,22 +1731,22 @@ impl BimApp {
                             }
                         }
                     }
-                    self.run("type", p).is_some()
+                    self.run_for_type("type", p, &mut d.error)
                 }
                 Err(e) => {
-                    self.status = Status { text: e, error: true };
+                    d.error = Some(e);
                     false
                 }
             };
             if made {
-                d.show(&self.session.model, new.trim().to_string());
+                d.show(&self.session.model, new);
             }
         }
         if apply || ok {
             let applied = match d.params(&d.name, model.units, false) {
-                Ok(p) => self.run("type", p).is_some(),
+                Ok(p) => self.run_for_type("type", p, &mut d.error),
                 Err(e) => {
-                    self.status = Status { text: e, error: true };
+                    d.error = Some(e);
                     false
                 }
             };
@@ -1707,157 +1783,166 @@ impl BimApp {
         // The material that asked for a picture for its texture.
         let mut picture: Option<String> = None;
         let released = ctx.input(|i| !i.pointer.any_down());
-        let r = Modal::new(UiId::new("materials")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.label(RichText::new(t("Materials")).heading());
-            ui.add_space(6.0);
-            Grid::new("material-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                let l = ui.label(t("Material:"));
-                ui.horizontal(|ui| {
-                    let c = ComboBox::from_id_salt("material-name").selected_text(&d.picked).width(200.0).show_ui(ui, |ui| {
-                        for name in model.materials.keys() {
-                            if ui.selectable_label(*name == d.picked, name).clicked() {
-                                picked = Some(name.clone());
-                            }
-                        }
-                    });
-                    c.response.labelled_by(l.id);
-                    if ui.button(t("New")).clicked() {
-                        let fresh =
-                            (1..).map(|n| format!("{} {n}", t("Material"))).find(|n| !model.materials.contains_key(n)).unwrap_or_default();
-                        run = Some(json!({"name": fresh}));
-                        picked = Some(fresh);
-                    }
-                    if ui.add_enabled(model.materials.contains_key(&d.picked), Button::new(t("Delete"))).clicked() {
-                        run = Some(json!({"name": d.picked, "delete": true}));
-                        picked = model.materials.keys().find(|n| **n != d.picked).cloned();
-                    }
-                });
-                ui.end_row();
-            });
-            if let Some(m) = model.materials.get(&d.picked) {
+        let r = Modal::new(UiId::new("materials"), t("Materials")).width(440.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
                 ui.add_space(6.0);
-                Grid::new("material").num_columns(2).striped(true).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
-                    let l = ui.label(t("Name"));
-                    let r = ui.add(TextEdit::singleline(&mut d.name).desired_width(200.0)).labelled_by(l.id);
-                    if r.lost_focus() && !d.name.trim().is_empty() && d.name.trim() != d.picked {
-                        run = Some(json!({"name": d.picked, "rename": d.name.trim()}));
-                        picked = Some(d.name.trim().to_string());
-                    }
-                    ui.end_row();
-                    let l = ui.label(t("Color"));
-                    let colour = d.color.get_or_insert(m.color);
-                    ui.color_edit_button_srgb(colour).labelled_by(l.id);
-                    if released && *colour != m.color {
-                        run = Some(json!({"name": d.picked, "color": *colour}));
-                    }
-                    ui.end_row();
-                    // The patterns drawn in code, then the project's fill patterns.
-                    let cut = [
-                        ("cut", msg!("Cut Pattern"), m.cut, &m.cut_pattern),
-                        ("surface", msg!("Surface Pattern"), m.surface, &m.surface_pattern),
-                    ];
-                    for (key, label, now, fill) in cut {
-                        let l = ui.label(t(label));
-                        let shown = fill.clone().unwrap_or_else(|| t(pattern_name(now)).to_string());
-                        let c = ComboBox::from_id_salt(("material-pattern", key)).selected_text(shown).width(160.0).show_ui(ui, |ui| {
-                            for (p, name) in PATTERNS {
-                                if ui.selectable_label(fill.is_none() && p == now, t(name)).clicked() {
-                                    run = Some(json!({"name": d.picked, key: p}));
-                                }
-                            }
-                            ui.separator();
-                            for n in model.fill_patterns.keys() {
-                                if ui.selectable_label(fill.as_ref() == Some(n), n).clicked() {
-                                    run = Some(json!({"name": d.picked, key: n}));
+                Grid::new("material-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                    let l = ui.label(t("Material:"));
+                    ui.horizontal(|ui| {
+                        let c = ComboBox::from_id_salt("material-name").selected_text(&d.picked).width(200.0).show_ui(ui, |ui| {
+                            for name in model.materials.keys() {
+                                if ui.selectable_label(*name == d.picked, name).clicked() {
+                                    picked = Some(name.clone());
                                 }
                             }
                         });
                         c.response.labelled_by(l.id);
-                        ui.end_row();
-                    }
-                    // Its texture: a pattern drawn in code or a picture, over its colour in the 3D view; a tile of it this
-                    // big, turned and moved.
-                    let l = ui.label(t("Texture"));
-                    let now = m.texture.as_ref().map(|x| x.kind);
-                    let shown = now.map_or(t("None"), |k| t(texture_name(k)));
-                    let c = ComboBox::from_id_salt("material-texture").selected_text(shown).width(160.0).show_ui(ui, |ui| {
-                        if ui.selectable_label(now.is_none(), t("None")).clicked() {
-                            run = Some(json!({"name": d.picked, "texture": null}));
+                        if ui.button(t("New")).clicked() {
+                            let fresh =
+                                (1..).map(|n| format!("{} {n}", t("Material"))).find(|n| !model.materials.contains_key(n)).unwrap_or_default();
+                            run = Some(json!({"name": fresh}));
+                            picked = Some(fresh);
                         }
-                        for k in TextureKind::ALL.into_iter().filter(|k| *k != TextureKind::Image) {
-                            if ui.selectable_label(now == Some(k), t(texture_name(k))).clicked() {
-                                run = Some(json!({"name": d.picked, "texture": {"kind": k}}));
-                            }
-                        }
-                        if ui.selectable_label(now == Some(TextureKind::Image), t("Picture…")).clicked() {
-                            picture = Some(d.picked.clone());
+                        if ui.add_enabled(model.materials.contains_key(&d.picked), Button::new(t("Delete"))).clicked() {
+                            run = Some(json!({"name": d.picked, "delete": true}));
+                            picked = model.materials.keys().find(|n| **n != d.picked).cloned();
                         }
                     });
-                    c.response.labelled_by(l.id);
                     ui.end_row();
-                    if let Some(x) = &m.texture {
-                        let units = model.units;
-                        if !d.texture.as_ref().is_some_and(|(n, old, _)| *n == d.picked && old == x) {
-                            let typed = [
-                                units.length(x.size[0]),
-                                units.length(x.size[1]),
-                                format!("{}", x.angle),
-                                units.length(x.offset[0]),
-                                units.length(x.offset[1]),
-                            ];
-                            d.texture = Some((d.picked.clone(), x.clone(), typed));
+                });
+                if let Some(m) = model.materials.get(&d.picked) {
+                    ui.add_space(6.0);
+                    Grid::new("material").num_columns(2).striped(true).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
+                        let l = ui.label(t("Name"));
+                        let r = ui.add(TextEdit::singleline(&mut d.name).desired_width(200.0)).labelled_by(l.id);
+                        if r.lost_focus() && !d.name.trim().is_empty() && d.name.trim() != d.picked {
+                            run = Some(json!({"name": d.picked, "rename": d.name.trim()}));
+                            picked = Some(d.name.trim().to_string());
                         }
-                        if let Some((_, _, typed)) = &mut d.texture {
-                            let rows = [
-                                (msg!("Tile Width"), 0),
-                                (msg!("Tile Height"), 1),
-                                (msg!("Texture Angle"), 2),
-                                (msg!("Texture Offset Across"), 3),
-                                (msg!("Texture Offset Up"), 4),
-                            ];
-                            for (label, k) in rows {
-                                let l = ui.label(t(label));
-                                let hint = if k == 2 { "°" } else { units.name() };
-                                let r = ui.add(TextEdit::singleline(&mut typed[k]).desired_width(120.0).hint_text(hint)).labelled_by(l.id);
-                                if r.lost_focus() {
-                                    let length = |i: usize| units.parse(&typed[i]);
-                                    match (length(0), length(1), number(&typed[2]), length(3), length(4)) {
-                                        (Some(w), Some(h), Some(a), Some(ox), Some(oy)) => {
-                                            if [w, h, a, ox, oy] != [x.size[0], x.size[1], x.angle, x.offset[0], x.offset[1]] {
-                                                run = Some(
-                                                    json!({"name": d.picked, "texture": {"size": [w, h], "angle": a, "offset": [ox, oy]}}),
-                                                );
-                                            }
-                                        }
-                                        _ => typed_wrong = Some(tf("`{}` is not a size, an angle or an offset", &[&typed[k]])),
+                        ui.end_row();
+                        let l = ui.label(t("Color"));
+                        let colour = d.color.get_or_insert(m.color);
+                        ui.color_edit_button_srgb(colour).labelled_by(l.id);
+                        if released && *colour != m.color {
+                            run = Some(json!({"name": d.picked, "color": *colour}));
+                        }
+                        ui.end_row();
+                        // How see-through the 3D view draws what is made of it, percent.
+                        let l = ui.label(t("Transparency"));
+                        let clear = d.clear.get_or_insert(m.transparency);
+                        ui.add(Slider::new(clear, 0..=100).suffix("%")).labelled_by(l.id);
+                        if released && *clear != m.transparency {
+                            run = Some(json!({"name": d.picked, "transparency": *clear}));
+                        }
+                        ui.end_row();
+                        // The patterns drawn in code, then the project's fill patterns.
+                        let cut = [
+                            ("cut", msg!("Cut Pattern"), m.cut, &m.cut_pattern),
+                            ("surface", msg!("Surface Pattern"), m.surface, &m.surface_pattern),
+                        ];
+                        for (key, label, now, fill) in cut {
+                            let l = ui.label(t(label));
+                            let shown = fill.clone().unwrap_or_else(|| t(pattern_name(now)).to_string());
+                            let c = ComboBox::from_id_salt(("material-pattern", key)).selected_text(shown).width(160.0).show_ui(ui, |ui| {
+                                for (p, name) in PATTERNS {
+                                    if ui.selectable_label(fill.is_none() && p == now, t(name)).clicked() {
+                                        run = Some(json!({"name": d.picked, key: p}));
                                     }
                                 }
-                                ui.end_row();
+                                ui.separator();
+                                for n in model.fill_patterns.keys() {
+                                    if ui.selectable_label(fill.as_ref() == Some(n), n).clicked() {
+                                        run = Some(json!({"name": d.picked, key: n}));
+                                    }
+                                }
+                            });
+                            c.response.labelled_by(l.id);
+                            ui.end_row();
+                        }
+                        // Its texture: a pattern drawn in code or a picture, over its colour in the 3D view; a tile of it this
+                        // big, turned and moved.
+                        let l = ui.label(t("Texture"));
+                        let now = m.texture.as_ref().map(|x| x.kind);
+                        let shown = now.map_or(t("None"), |k| t(texture_name(k)));
+                        let c = ComboBox::from_id_salt("material-texture").selected_text(shown).width(160.0).show_ui(ui, |ui| {
+                            if ui.selectable_label(now.is_none(), t("None")).clicked() {
+                                run = Some(json!({"name": d.picked, "texture": null}));
+                            }
+                            for k in TextureKind::ALL.into_iter().filter(|k| *k != TextureKind::Image) {
+                                if ui.selectable_label(now == Some(k), t(texture_name(k))).clicked() {
+                                    run = Some(json!({"name": d.picked, "texture": {"kind": k}}));
+                                }
+                            }
+                            if ui.selectable_label(now == Some(TextureKind::Image), t("Picture…")).clicked() {
+                                picture = Some(d.picked.clone());
+                            }
+                        });
+                        c.response.labelled_by(l.id);
+                        ui.end_row();
+                        if let Some(x) = &m.texture {
+                            let units = model.units;
+                            if !d.texture.as_ref().is_some_and(|(n, old, _)| *n == d.picked && old == x) {
+                                let typed = [
+                                    units.length(x.size[0]),
+                                    units.length(x.size[1]),
+                                    format!("{}", x.angle),
+                                    units.length(x.offset[0]),
+                                    units.length(x.offset[1]),
+                                ];
+                                d.texture = Some((d.picked.clone(), x.clone(), typed));
+                            }
+                            if let Some((_, _, typed)) = &mut d.texture {
+                                let rows = [
+                                    (msg!("Tile Width"), 0),
+                                    (msg!("Tile Height"), 1),
+                                    (msg!("Texture Angle"), 2),
+                                    (msg!("Texture Offset Across"), 3),
+                                    (msg!("Texture Offset Up"), 4),
+                                ];
+                                for (label, k) in rows {
+                                    let l = ui.label(t(label));
+                                    let hint = if k == 2 { "°" } else { units.name() };
+                                    let r = ui.add(TextEdit::singleline(&mut typed[k]).desired_width(120.0).hint_text(hint)).labelled_by(l.id);
+                                    if r.lost_focus() {
+                                        let length = |i: usize| units.parse(&typed[i]);
+                                        match (length(0), length(1), number(&typed[2]), length(3), length(4)) {
+                                            (Some(w), Some(h), Some(a), Some(ox), Some(oy)) => {
+                                                if [w, h, a, ox, oy] != [x.size[0], x.size[1], x.angle, x.offset[0], x.offset[1]] {
+                                                    run = Some(
+                                                        json!({"name": d.picked, "texture": {"size": [w, h], "angle": a, "offset": [ox, oy]}}),
+                                                    );
+                                                }
+                                            }
+                                            _ => typed_wrong = Some(tf("`{}` is not a size, an angle or an offset", &[&typed[k]])),
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         }
-                    }
-                });
-                // A tile of its texture, or its colour; and the Favorites it can be kept in.
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let key = format!("{:?}", (m.color, &m.texture));
-                    if d.swatch.as_ref().map(|(k, _)| k) != Some(&key) {
-                        d.swatch = crate::favorites::swatch(ui.ctx(), "material-swatch", m, &model.images, 64).map(|h| (key, h));
-                    }
-                    crate::favorites::paint_swatch(ui, 64.0, m.color, d.swatch.as_ref().map(|(_, h)| h));
-                    ui.vertical(|ui| {
-                        if ui.button(t("Save to Favorites")).clicked() {
-                            favorite = Some(true);
-                        }
-                        if ui.button(t("Favorites…")).clicked() {
-                            favorite = Some(false);
-                        }
                     });
-                });
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+                    // A tile of its texture, or its colour; and the Favorites it can be kept in.
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let key = format!("{:?}", (m.color, &m.texture));
+                        if d.swatch.as_ref().map(|(k, _)| k) != Some(&key) {
+                            d.swatch = crate::favorites::swatch(ui.ctx(), "material-swatch", m, &model.images, 64).map(|h| (key, h));
+                        }
+                        crate::favorites::paint_swatch(ui, 64.0, m.color, d.swatch.as_ref().map(|(_, h)| h));
+                        ui.vertical(|ui| {
+                            if ui.button(t("Save to Favorites")).clicked() {
+                                favorite = Some(true);
+                            }
+                            if ui.button(t("Favorites…")).clicked() {
+                                favorite = Some(false);
+                            }
+                        });
+                    });
+                }
+            });
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
         });
         if let Some(text) = typed_wrong {
             self.status = Status { text, error: true };
@@ -1882,11 +1967,14 @@ impl BimApp {
             });
         }
         if let Some(n) = picked {
-            (d.name, d.picked, d.color) = (n.clone(), n, None);
+            (d.name, d.picked, d.color, d.clear) = (n.clone(), n, None, None);
         } else if !self.session.model.materials.contains_key(&d.picked) {
             d = MaterialsDialog::new(&self.session.model);
         } else if d.color.is_some_and(|c| self.session.model.materials.get(&d.picked).is_some_and(|m| m.color == c)) {
             d.color = None;
+        }
+        if d.clear.is_some_and(|c| self.session.model.materials.get(&d.picked).is_some_and(|m| m.transparency == c)) {
+            d.clear = None;
         }
         if !(close || r.should_close()) {
             self.materials_dialog = Some(d);
@@ -1967,8 +2055,10 @@ pub(crate) struct FamilyDialog {
     elements: Vec<Id>,
     /// Each type parameter: its name, what it holds, as typed, and whether a formula works it out.
     fields: Vec<(String, Holds, String, bool)>,
-    /// The name being typed for a duplicate.
-    duplicate: Option<String>,
+    /// A new name being typed, for a duplicate or a rename.
+    naming: Naming,
+    /// What stopped OK, Apply, Duplicate or Rename.
+    error: Option<String>,
 }
 
 impl FamilyDialog {
@@ -1988,7 +2078,7 @@ impl FamilyDialog {
                 f.parameters.iter().filter(|p| !p.instance).map(|p| (p.name.clone(), p.kind, typed(p), p.formula.is_some())).collect()
             })
             .unwrap_or_default();
-        FamilyDialog { family, name, elements, fields, duplicate: None }
+        FamilyDialog { family, name, elements, fields, naming: Naming::None, error: None }
     }
 
     /// The dialog showing type `name` as the model has it now.
@@ -2020,98 +2110,80 @@ impl BimApp {
         let model = Arc::clone(&self.session.model);
         let names: Vec<String> = model.families.get(&d.family).map(|f| f.types.keys().cloned().collect()).unwrap_or_default();
         let materials: Vec<String> = model.materials.keys().cloned().collect();
-        let (mut ok, mut cancel, mut apply, mut create, mut switch) = (false, false, false, false, None);
-        let r = Modal::new(UiId::new("family-type-properties")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.label(RichText::new(t("Type Properties")).heading());
-            ui.add_space(6.0);
-            Grid::new("family-type-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                ui.label(t("Family:"));
-                ui.label(&d.family);
-                ui.end_row();
-                let l = ui.label(t("Type:"));
-                ui.horizontal(|ui| {
-                    let c = ComboBox::from_id_salt("family-type-name").selected_text(&d.name).width(200.0).show_ui(ui, |ui| {
-                        for n in &names {
-                            if ui.selectable_label(*n == d.name, n).clicked() {
-                                switch = Some(n.clone());
+        let (mut ok, mut cancel, mut apply, mut asked) = (false, false, false, None);
+        let r = Modal::new(UiId::new("family-type-properties"), t("Type Properties")).width(crate::typeprops::WIDTH).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                asked = typeprops::head(ui, "family-type", &d.family, &names, &d.name, &mut d.naming, true);
+                let below = typeprops::foot_height(ui, d.error.is_some());
+                // Each parameter under the group Revit gives what it holds: lengths and angles are dimensions.
+                let group = |kind: &Holds| match kind {
+                    Holds::Length | Holds::Angle => "Dimensions",
+                    Holds::Material => msg!("Materials and Finishes"),
+                    Holds::Number | Holds::YesNo => "Other",
+                };
+                let mut groups: Vec<&str> = Vec::new();
+                for (_, kind, ..) in &d.fields {
+                    if !groups.contains(&group(kind)) {
+                        groups.push(group(kind));
+                    }
+                }
+                groups.sort_by_key(|g| ["Materials and Finishes", "Dimensions", "Other"].iter().position(|x| x == g));
+                typeprops::table(ui, "family-type", below, |tb| {
+                    for g in groups {
+                        tb.group(g);
+                        for (key, kind, typed, computed) in d.fields.iter_mut().filter(|f| group(&f.1) == g) {
+                            match kind {
+                                // What a formula works out, shown as Revit greys it.
+                                _ if *computed => tb.shown(key, typed),
+                                Holds::YesNo => {
+                                    let mut on = typed == "1";
+                                    tb.check(key, &mut on);
+                                    *typed = (if on { "1" } else { "0" }).to_string();
+                                }
+                                Holds::Material => tb.pick(key, typed, &materials),
+                                Holds::Length => tb.text(key, typed, model.units.name()),
+                                Holds::Angle => tb.text(key, typed, "°"),
+                                Holds::Number => tb.text(key, typed, ""),
                             }
                         }
-                    });
-                    c.response.labelled_by(l.id);
-                    if d.duplicate.is_none() && ui.button(t("Duplicate…")).clicked() {
-                        d.duplicate = Some(format!("{} 2", d.name));
                     }
                 });
-                ui.end_row();
-                if let Some(new) = &mut d.duplicate {
-                    let l = ui.label(t("New type"));
-                    ui.horizontal(|ui| {
-                        ui.add(TextEdit::singleline(new).desired_width(200.0)).labelled_by(l.id);
-                        create = ui.button(t("Create")).clicked();
-                    });
-                    ui.end_row();
-                }
+                typeprops::error(ui, d.error.as_deref());
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Type Parameters")).strong());
-            Grid::new("family-type-parameters").num_columns(2).striped(true).min_col_width(150.0).show(ui, |ui| {
-                ui.label(RichText::new(t("Parameter")).color(pal().muted));
-                ui.label(RichText::new(t("Value")).color(pal().muted));
-                ui.end_row();
-                for (key, kind, typed, computed) in &mut d.fields {
-                    let l = ui.label(key.as_str());
-                    match kind {
-                        _ if *computed => {
-                            ui.label(RichText::new(typed.as_str()).color(pal().muted));
-                        }
-                        Holds::YesNo => {
-                            let mut on = typed == "1";
-                            let r = ui.checkbox(&mut on, "");
-                            r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, on, key.as_str()));
-                            if r.labelled_by(l.id).changed() {
-                                *typed = (if on { "1" } else { "0" }).to_string();
-                            }
-                        }
-                        Holds::Material => {
-                            if let Some(m) = combo(ui, (0, key.as_str()), l.id, typed, &materials) {
-                                *typed = m;
-                            }
-                        }
-                        _ => {
-                            ui.add(TextEdit::singleline(typed).desired_width(160.0)).labelled_by(l.id);
-                        }
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                apply = ui.button(t("Apply")).clicked();
-                cancel = ui.button(t("Cancel")).clicked();
-                ok = ui.button(t("OK")).clicked();
+            crate::popup::footer(ui, |ui| {
+                (ok, cancel, apply) = typeprops::foot(ui);
             });
         });
-        if let Some(n) = switch {
-            d.show(&model, n);
-        }
-        if create && let Some(new) = d.duplicate.clone() {
-            let made = match d.params(new.trim(), model.units) {
-                Ok(p) => self.run("family", p).is_some(),
-                Err(e) => {
-                    self.status = Status { text: e, error: true };
-                    false
+        match asked {
+            Some(Head::Switch(n)) => d.show(&model, n),
+            Some(Head::Duplicate(new)) => {
+                let made = match d.params(&new, model.units) {
+                    Ok(p) => self.run_for_type("family", p, &mut d.error),
+                    Err(e) => {
+                        d.error = Some(e);
+                        false
+                    }
+                };
+                if made {
+                    d.show(&self.session.model, new);
                 }
-            };
-            if made {
-                d.show(&self.session.model, new.trim().to_string());
             }
+            Some(Head::Rename(to))
+                if self.run_for_type("rename_type", json!({"family": d.family, "type": d.name, "name": to}), &mut d.error) =>
+            {
+                if self.component.as_ref() == Some(&(d.family.clone(), d.name.clone())) {
+                    self.component = Some((d.family.clone(), to.clone()));
+                }
+                d.show(&Arc::clone(&self.session.model), to);
+            }
+            Some(Head::Rename(_)) => {}
+            None => {}
         }
         if apply || ok {
             let applied = match d.params(&d.name, model.units) {
-                Ok(p) => self.run("family", p).is_some(),
+                Ok(p) => self.run_for_type("family", p, &mut d.error),
                 Err(e) => {
-                    self.status = Status { text: e, error: true };
+                    d.error = Some(e);
                     false
                 }
             };
@@ -2146,42 +2218,58 @@ impl BimApp {
             return;
         }
         let mut close = false;
-        let r = Modal::new(UiId::new("snaps")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(RichText::new(t("Snaps")).heading());
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Object Snaps")).strong());
-            let s = &mut self.snaps;
-            let kinds: [(&mut bool, Snap, &str); 9] = [
-                (&mut s.endpoint, Snap::Endpoint, msg!("The ends of walls, grids and what else is drawn, and the points picked so far")),
-                (&mut s.midpoint, Snap::Midpoint, msg!("The middle of a wall, along its arc")),
-                (&mut s.intersection, Snap::Intersection, msg!("Where two walls or grids cross")),
-                (&mut s.centre, Snap::Centre, msg!("The centre of a curved wall, a column or a component")),
-                (&mut s.perpendicular, Snap::Perpendicular, msg!("The foot of the perpendicular from the last point to a wall or grid")),
-                (&mut s.quadrant, Snap::Quadrant, msg!("A circle's, an ellipse's or an arc's points along its axes: east, north, west and south")),
-                (&mut s.tangent, Snap::Tangent, msg!("Where a line from the last point touches a circle or an arc")),
-                (&mut s.nearest, Snap::Nearest, msg!("A wall's centre line, so a wall drawn on it meets it")),
-                (&mut s.cloud, Snap::Point, msg!("A scan's points where the plan's cut plane cuts it, to trace what was measured")),
-            ];
-            for (on, kind, tip) in kinds {
-                ui.checkbox(on, t(kind.name())).on_hover_text(t(tip));
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let label = ui.label(t("Angle steps"));
-                let now = if s.angle >= 1.0 { format!("{}°", s.angle) } else { t("Off").to_string() };
-                let c = ComboBox::from_id_salt("snap-angle").selected_text(now).width(110.0).show_ui(ui, |ui| {
-                    for step in ANGLE_STEPS {
-                        let name = if step >= 1.0 { format!("{step}°") } else { t("Off").to_string() };
-                        ui.selectable_value(&mut s.angle, step, name);
-                    }
+        let r = Modal::new(UiId::new("snaps"), t("Snaps")).width(380.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new(t("Object Snaps")).strong());
+                let s = &mut self.snaps;
+                let kinds: [(&mut bool, Snap, &str); 9] = [
+                    (&mut s.endpoint, Snap::Endpoint, msg!("The ends of walls, grids and what else is drawn, and the points picked so far")),
+                    (&mut s.midpoint, Snap::Midpoint, msg!("The middle of a wall, along its arc")),
+                    (&mut s.intersection, Snap::Intersection, msg!("Where two walls or grids cross")),
+                    (&mut s.centre, Snap::Centre, msg!("The centre of a curved wall, a column or a component")),
+                    (&mut s.perpendicular, Snap::Perpendicular, msg!("The foot of the perpendicular from the last point to a wall or grid")),
+                    (&mut s.quadrant, Snap::Quadrant, msg!("A circle's, an ellipse's or an arc's points along its axes: east, north, west and south")),
+                    (&mut s.tangent, Snap::Tangent, msg!("Where a line from the last point touches a circle or an arc")),
+                    (&mut s.nearest, Snap::Nearest, msg!("A wall's centre line, so a wall drawn on it meets it")),
+                    (&mut s.cloud, Snap::Point, msg!("A scan's points where the plan's cut plane cuts it, to trace what was measured")),
+                ];
+                for (on, kind, tip) in kinds {
+                    ui.checkbox(on, t(kind.name())).on_hover_text(t(tip));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = ui.label(t("Angle steps"));
+                    let now = if s.angle >= 1.0 { format!("{}°", s.angle) } else { t("Off").to_string() };
+                    let c = ComboBox::from_id_salt("snap-angle").selected_text(now).width(110.0).show_ui(ui, |ui| {
+                        for step in ANGLE_STEPS {
+                            let name = if step >= 1.0 { format!("{step}°") } else { t("Off").to_string() };
+                            ui.selectable_value(&mut s.angle, step, name);
+                        }
+                    });
+                    c.response.labelled_by(label.id).on_hover_text(t(
+                        "A direction from the last point sticks to multiples of this angle, from east and from the line before; a dashed guide shows it",
+                    ));
                 });
-                c.response.labelled_by(label.id).on_hover_text(t(
-                    "A direction from the last point sticks to multiples of this angle, from east and from the line before; a dashed guide shows it",
-                ));
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.checkbox(&mut s.alignment_guides, t("Alignment Guides")).on_hover_text(t(
+                "Show temporary alignment guides (smart snapping) when drawing",
+            ));
+            if s.alignment_guides {
+                ui.horizontal(|ui| {
+                    ui.label(t("Snap tolerance"));
+                    ui.add(egui::Slider::new(&mut s.alignment_tolerance, 2.0..=32.0).suffix(" px"));
+                });
+                }
+                ui.separator();
+                ui.checkbox(&mut self.grid_snapping, t("Grid snapping"))
+                    .on_hover_text(t("Applies to all views; snaps to the active view's enabled main grid or subgrid, even when hidden"));
             });
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
         });
         if close || r.should_close() {
             self.show_snaps = false;
@@ -2399,83 +2487,84 @@ impl BimApp {
         let Some(mut d) = self.parameters_dialog.take() else { return };
         let model = Arc::clone(&self.session.model);
         let (mut close, mut run, mut picked): (bool, Option<Value>, Option<String>) = (false, None, None);
-        let r = Modal::new(UiId::new("project-parameters")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.label(RichText::new(t("Project Parameters")).heading());
-            ui.add_space(6.0);
-            Grid::new("parameter-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                let l = ui.label(t("Parameter:"));
-                ui.horizontal(|ui| {
-                    let c = ComboBox::from_id_salt("parameter-name").selected_text(&d.picked).width(200.0).show_ui(ui, |ui| {
-                        for name in model.parameters.keys() {
-                            if ui.selectable_label(*name == d.picked, name).clicked() {
-                                picked = Some(name.clone());
-                            }
-                        }
-                    });
-                    c.response.labelled_by(l.id);
-                    if ui.button(t("New")).clicked() {
-                        let fresh = (1..)
-                            .map(|n| format!("{} {n}", t("Parameter")))
-                            .find(|n| !model.parameters.contains_key(n))
-                            .unwrap_or_default();
-                        run = Some(json!({"name": fresh, "categories": ["wall"]}));
-                        picked = Some(fresh);
-                    }
-                    if ui.add_enabled(model.parameters.contains_key(&d.picked), Button::new(t("Delete"))).clicked() {
-                        run = Some(json!({"name": d.picked, "delete": true}));
-                        picked = model.parameters.keys().find(|n| **n != d.picked).cloned().or_else(|| Some(String::new()));
-                    }
-                });
-                ui.end_row();
-            });
-            match model.parameters.get(&d.picked) {
-                Some(p) => {
-                    ui.add_space(6.0);
-                    Grid::new("parameter").num_columns(2).striped(true).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
-                        let l = ui.label(t("Name"));
-                        let r = ui.add(TextEdit::singleline(&mut d.name).desired_width(200.0)).labelled_by(l.id);
-                        if r.lost_focus() && !d.name.trim().is_empty() && d.name.trim() != d.picked {
-                            run = Some(json!({"name": d.picked, "rename": d.name.trim()}));
-                            picked = Some(d.name.trim().to_string());
-                        }
-                        ui.end_row();
-                        let l = ui.label(t("Type of Parameter"));
-                        let now = KINDS.iter().find(|(k, _)| *k == p.kind).map_or("Text", |(_, n)| n);
-                        let c = ComboBox::from_id_salt("parameter-kind").selected_text(t(now)).width(160.0).show_ui(ui, |ui| {
-                            for (k, label) in KINDS {
-                                if ui.selectable_label(k == p.kind, t(label)).clicked() && k != p.kind {
-                                    run = Some(json!({"name": d.picked, "kind": k}));
+        let r = Modal::new(UiId::new("project-parameters"), t("Project Parameters")).width(460.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                Grid::new("parameter-head").num_columns(2).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                    let l = ui.label(t("Parameter:"));
+                    ui.horizontal(|ui| {
+                        let c = ComboBox::from_id_salt("parameter-name").selected_text(&d.picked).width(200.0).show_ui(ui, |ui| {
+                            for name in model.parameters.keys() {
+                                if ui.selectable_label(*name == d.picked, name).clicked() {
+                                    picked = Some(name.clone());
                                 }
                             }
                         });
                         c.response.labelled_by(l.id);
-                        ui.end_row();
-                    });
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(t("Categories")).strong());
-                    Grid::new("parameter-categories").num_columns(3).spacing(vec2(16.0, 4.0)).show(ui, |ui| {
-                        for (i, cat) in PARAMETER_CATEGORIES.iter().enumerate() {
-                            let mut on = p.categories.iter().any(|c| c == cat);
-                            if ui.checkbox(&mut on, lang::category(cat, true)).changed() {
-                                let mut list: Vec<&str> = p.categories.iter().map(String::as_str).filter(|c| c != cat).collect();
-                                if on {
-                                    list.push(cat);
-                                }
-                                run = Some(json!({"name": d.picked, "categories": list}));
-                            }
-                            if i % 3 == 2 {
-                                ui.end_row();
-                            }
+                        if ui.button(t("New")).clicked() {
+                            let fresh = (1..)
+                                .map(|n| format!("{} {n}", t("Parameter")))
+                                .find(|n| !model.parameters.contains_key(n))
+                                .unwrap_or_default();
+                            run = Some(json!({"name": fresh, "categories": ["wall"]}));
+                            picked = Some(fresh);
+                        }
+                        if ui.add_enabled(model.parameters.contains_key(&d.picked), Button::new(t("Delete"))).clicked() {
+                            run = Some(json!({"name": d.picked, "delete": true}));
+                            picked = model.parameters.keys().find(|n| **n != d.picked).cloned().or_else(|| Some(String::new()));
                         }
                     });
+                    ui.end_row();
+                });
+                match model.parameters.get(&d.picked) {
+                    Some(p) => {
+                        ui.add_space(6.0);
+                        Grid::new("parameter").num_columns(2).striped(true).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
+                            let l = ui.label(t("Name"));
+                            let r = ui.add(TextEdit::singleline(&mut d.name).desired_width(200.0)).labelled_by(l.id);
+                            if r.lost_focus() && !d.name.trim().is_empty() && d.name.trim() != d.picked {
+                                run = Some(json!({"name": d.picked, "rename": d.name.trim()}));
+                                picked = Some(d.name.trim().to_string());
+                            }
+                            ui.end_row();
+                            let l = ui.label(t("Type of Parameter"));
+                            let now = KINDS.iter().find(|(k, _)| *k == p.kind).map_or("Text", |(_, n)| n);
+                            let c = ComboBox::from_id_salt("parameter-kind").selected_text(t(now)).width(160.0).show_ui(ui, |ui| {
+                                for (k, label) in KINDS {
+                                    if ui.selectable_label(k == p.kind, t(label)).clicked() && k != p.kind {
+                                        run = Some(json!({"name": d.picked, "kind": k}));
+                                    }
+                                }
+                            });
+                            c.response.labelled_by(l.id);
+                            ui.end_row();
+                        });
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(t("Categories")).strong());
+                        Grid::new("parameter-categories").num_columns(3).spacing(vec2(16.0, 4.0)).show(ui, |ui| {
+                            for (i, cat) in PARAMETER_CATEGORIES.iter().enumerate() {
+                                let mut on = p.categories.iter().any(|c| c == cat);
+                                if ui.checkbox(&mut on, lang::category(cat, true)).changed() {
+                                    let mut list: Vec<&str> = p.categories.iter().map(String::as_str).filter(|c| c != cat).collect();
+                                    if on {
+                                        list.push(cat);
+                                    }
+                                    run = Some(json!({"name": d.picked, "categories": list}));
+                                }
+                                if i % 3 == 2 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(RichText::new(t("No project parameters yet: New makes one.")).color(pal().muted));
+                    }
                 }
-                None => {
-                    ui.label(RichText::new(t("No project parameters yet: New makes one.")).color(pal().muted));
-                }
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
         });
         if let Some(p) = run
             && self.run("parameter", p).is_none()
@@ -2498,34 +2587,35 @@ impl BimApp {
         let Some(mut d) = self.new_schedule.take() else { return };
         let (mut ok, mut cancel) = (false, false);
         let model = Arc::clone(&self.session.model);
-        let r = Modal::new(UiId::new("new-schedule")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.label(RichText::new(t("New Schedule")).heading());
-            ui.add_space(6.0);
-            ui.label(t("Category:"));
-            ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                for cat in schedule::categories() {
-                    if ui.selectable_label(d.category == Some(cat), lang::category(cat, true)).clicked() {
-                        d.category = Some(cat);
-                        // Named after it, as one of its kind there isn't yet.
-                        let base = tf("{} Schedule", &[&lang::category(cat, false)]);
-                        d.name = std::iter::once(base.clone())
-                            .chain((2..).map(|n| format!("{base} {n}")))
-                            .find(|n| {
-                                schedule::builtin(Some(n), None).is_none()
-                                    && !model.elements.keys().any(|id| model.view_name(*id) == Some(n.as_str()))
-                            })
-                            .unwrap_or(base);
+        let r = Modal::new(UiId::new("new-schedule"), t("New Schedule")).width(340.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ui.label(t("Category:"));
+                ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for cat in schedule::categories() {
+                        if ui.selectable_label(d.category == Some(cat), lang::category(cat, true)).clicked() {
+                            d.category = Some(cat);
+                            // Named after it, as one of its kind there isn't yet.
+                            let base = tf("{} Schedule", &[&lang::category(cat, false)]);
+                            d.name = std::iter::once(base.clone())
+                                .chain((2..).map(|n| format!("{base} {n}")))
+                                .find(|n| {
+                                    schedule::builtin(Some(n), None).is_none()
+                                        && !model.elements.keys().any(|id| model.view_name(*id) == Some(n.as_str()))
+                                })
+                                .unwrap_or(base);
+                        }
                     }
-                }
+                });
+                ui.add_space(6.0);
+                let l = ui.label(t("Name:"));
+                ui.add(TextEdit::singleline(&mut d.name).desired_width(300.0)).labelled_by(l.id);
             });
-            ui.add_space(6.0);
-            let l = ui.label(t("Name:"));
-            ui.add(TextEdit::singleline(&mut d.name).desired_width(300.0)).labelled_by(l.id);
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                cancel = ui.button(t("Cancel")).clicked();
-                ok = ui.add_enabled(d.category.is_some() && !d.name.trim().is_empty(), Button::new(t("OK"))).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    cancel = ui.button(t("Cancel")).clicked();
+                    ok = ui.add_enabled(d.category.is_some() && !d.name.trim().is_empty(), Button::new(t("OK"))).clicked();
+                });
             });
         });
         if ok && let Some(cat) = d.category {
@@ -2572,230 +2662,232 @@ impl BimApp {
         let key = made.unwrap_or(0);
         let mut change: Option<Value> = None;
         let mut close = false;
-        let r = Modal::new(UiId::new("schedule-properties")).show(ctx, |ui| {
-            ui.set_width(620.0);
-            ui.label(RichText::new(tf("Schedule Properties: {}", &[&sc.name])).heading());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (i, label) in SCHEDULE_TABS.iter().enumerate() {
-                    if ui.selectable_label(d.tab == i, t(label)).clicked() {
-                        d.tab = i;
+        let r = Modal::new(UiId::new("schedule-properties"), tf("Schedule Properties: {}", &[&sc.name])).width(620.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (i, label) in SCHEDULE_TABS.iter().enumerate() {
+                        if ui.selectable_label(d.tab == i, t(label)).clicked() {
+                            d.tab = i;
+                        }
+                    }
+                });
+                ui.separator();
+                match d.tab {
+                    0 => {
+                        let shown: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+                        // Revit's three columns: the fields there are, what moves them, the fields shown.
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(220.0);
+                                ui.label(RichText::new(t("Available fields:")).strong());
+                                ui.push_id("available", |ui| {
+                                    ScrollArea::vertical().max_height(220.0).min_scrolled_height(220.0).show(ui, |ui| {
+                                        ui.set_width(210.0);
+                                        for (name, _) in available.iter().filter(|(n, _)| !shown.contains(n)) {
+                                            if ui.selectable_label(d.available.as_ref() == Some(name), t(name)).clicked() {
+                                                d.available = Some(name.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                            ui.vertical(|ui| {
+                                ui.set_width(140.0);
+                                ui.add_space(28.0);
+                                let can_add = d.available.as_ref().is_some_and(|n| !shown.contains(n));
+                                if ui.add_enabled(can_add, Button::new(t("Add")).min_size(vec2(130.0, 0.0))).clicked()
+                                    && let Some(name) = d.available.take()
+                                {
+                                    fields.push(Field { name, ..Field::default() });
+                                    d.scheduled = Some(fields.len() - 1);
+                                    change = Some(json!({"fields": fields}));
+                                }
+                                let picked = d.scheduled.filter(|i| *i < fields.len());
+                                if ui
+                                    .add_enabled(picked.is_some() && fields.len() > 1, Button::new(t("Remove")).min_size(vec2(130.0, 0.0)))
+                                    .clicked()
+                                    && let Some(i) = picked
+                                {
+                                    fields.remove(i);
+                                    d.scheduled = None;
+                                    change = Some(json!({"fields": fields}));
+                                }
+                                ui.add_space(12.0);
+                                if ui.add(Button::new(t("Calculated Value…")).min_size(vec2(130.0, 0.0))).clicked() {
+                                    d.calculated = Some((String::new(), schedule::Kind::Number, String::new()));
+                                }
+                            });
+                            ui.vertical(|ui| {
+                                ui.set_width(220.0);
+                                ui.label(RichText::new(t("Scheduled fields (in order):")).strong());
+                                ui.push_id("scheduled", |ui| {
+                                    ScrollArea::vertical().max_height(190.0).min_scrolled_height(190.0).show(ui, |ui| {
+                                        ui.set_width(210.0);
+                                        for (i, f) in fields.iter().enumerate() {
+                                            if ui.selectable_label(d.scheduled == Some(i), t(&f.name)).clicked() {
+                                                d.scheduled = Some(i);
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    let picked = d.scheduled.filter(|i| *i < fields.len());
+                                    if ui.add_enabled(picked.is_some_and(|i| i > 0), Button::new(t("Move Up"))).clicked()
+                                        && let Some(i) = picked
+                                    {
+                                        fields.swap(i, i - 1);
+                                        d.scheduled = Some(i - 1);
+                                        change = Some(json!({"fields": fields}));
+                                    }
+                                    if ui.add_enabled(picked.is_some_and(|i| i + 1 < fields.len()), Button::new(t("Move Down"))).clicked()
+                                        && let Some(i) = picked
+                                    {
+                                        fields.swap(i, i + 1);
+                                        d.scheduled = Some(i + 1);
+                                        change = Some(json!({"fields": fields}));
+                                    }
+                                });
+                            });
+                        });
+                        // The field picked: its heading, its totals; a calculated one's formula and kind.
+                        if let Some(i) = d.scheduled.filter(|i| *i < fields.len()) {
+                            ui.add_space(6.0);
+                            let kind = kind_of(&fields, &fields[i].name);
+                            Grid::new("schedule-field").num_columns(2).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
+                                let l = ui.label(t("Heading"));
+                                let now = fields[i].heading.clone().unwrap_or_else(|| t(&fields[i].name).to_string());
+                                if let Some(typed) = self.field(ui, key, &format!("heading.{i}"), now, l.id, "") {
+                                    let typed = typed.trim();
+                                    fields[i].heading = (!typed.is_empty() && typed != fields[i].name).then(|| typed.to_string());
+                                    change = Some(json!({"fields": fields}));
+                                }
+                                ui.end_row();
+                                if matches!(kind, schedule::Kind::Number | schedule::Kind::Length | schedule::Kind::Area) {
+                                    let l = ui.label(t("Calculate totals"));
+                                    let mut on = fields[i].total;
+                                    let r = ui.checkbox(&mut on, "");
+                                    r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, on, t("Calculate totals")));
+                                    if r.labelled_by(l.id).changed() {
+                                        fields[i].total = on;
+                                        change = Some(json!({"fields": fields}));
+                                    }
+                                    ui.end_row();
+                                }
+                                if let Some(formula) = fields[i].formula.clone() {
+                                    let l = ui.label(t("Formula"));
+                                    if let Some(typed) = self.field(ui, key, &format!("formula.{i}"), formula, l.id, "") {
+                                        fields[i].formula = Some(typed.trim().to_string());
+                                        change = Some(json!({"fields": fields}));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        }
+                        // A calculated value being made: its name, what it comes to, its formula.
+                        let (mut add, mut drop) = (false, false);
+                        if let Some((name, kind, formula)) = &mut d.calculated {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(t("Calculated Value")).strong());
+                            Grid::new("calculated").num_columns(2).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
+                                let l = ui.label(t("Name"));
+                                ui.add(TextEdit::singleline(name).desired_width(240.0)).labelled_by(l.id);
+                                ui.end_row();
+                                let l = ui.label(t("Type"));
+                                let now = RESULTS.iter().find(|(k, _)| k == kind).map_or("Number", |(_, n)| n);
+                                let c = ComboBox::from_id_salt("calculated-kind").selected_text(t(now)).width(160.0).show_ui(ui, |ui| {
+                                    for (k, label) in RESULTS {
+                                        ui.selectable_value(kind, k, t(label));
+                                    }
+                                });
+                                c.response.labelled_by(l.id);
+                                ui.end_row();
+                                let l = ui.label(t("Formula"));
+                                ui.add(TextEdit::singleline(formula).desired_width(240.0).hint_text("Area * 120")).labelled_by(l.id);
+                                ui.end_row();
+                            });
+                            ui.horizontal(|ui| {
+                                add = ui.add_enabled(!name.trim().is_empty() && !formula.trim().is_empty(), Button::new(t("OK"))).clicked();
+                                drop = ui.button(t("Cancel")).clicked();
+                            });
+                        }
+                        if drop {
+                            d.calculated = None;
+                        }
+                        if add && let Some((name, kind, formula)) = d.calculated.clone() {
+                            let mut with = fields.clone();
+                            with.push(Field {
+                                name: name.trim().to_string(),
+                                formula: Some(formula.trim().to_string()),
+                                kind: Some(kind),
+                                ..Field::default()
+                            });
+                            change = Some(json!({"fields": with}));
+                        }
+                    }
+                    1 => {
+                        let mut filters: Vec<Filter> = sc.filters.clone();
+                        if self.filter_rows(ui, key, &mut filters, &names, &|n| kind_of(&fields, n), units) {
+                            change = Some(json!({"filters": filters}));
+                        }
+                    }
+                    _ => {
+                        let mut sort: Vec<Sort> = sc.sort.clone();
+                        let mut edited = false;
+                        Grid::new("schedule-sort").num_columns(4).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+                            let mut gone = None;
+                            for (i, s) in sort.iter_mut().enumerate() {
+                                let caption = ui.label(t(if i == 0 { msg!("Sort by:") } else { msg!("Then by:") }));
+                                let c =
+                                    ComboBox::from_id_salt(("sort-field", i)).selected_text(t(&s.field)).width(170.0).show_ui(ui, |ui| {
+                                        for n in &names {
+                                            if ui.selectable_label(*n == s.field, t(n)).clicked() && *n != s.field {
+                                                s.field = n.clone();
+                                                edited = true;
+                                            }
+                                        }
+                                    });
+                                c.response.labelled_by(caption.id);
+                                let now = if s.descending { msg!("Descending") } else { msg!("Ascending") };
+                                let c = ComboBox::from_id_salt(("sort-way", i)).selected_text(t(now)).width(120.0).show_ui(ui, |ui| {
+                                    for (down, label) in [(false, "Ascending"), (true, "Descending")] {
+                                        if ui.selectable_label(s.descending == down, t(label)).clicked() && s.descending != down {
+                                            s.descending = down;
+                                            edited = true;
+                                        }
+                                    }
+                                });
+                                c.response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, true, t("Order")));
+                                if ui.button(t("Remove")).clicked() {
+                                    gone = Some(i);
+                                }
+                                ui.end_row();
+                            }
+                            if let Some(i) = gone {
+                                sort.remove(i);
+                                edited = true;
+                            }
+                        });
+                        if ui.button(t("Add Sort")).clicked()
+                            && let Some(first) = fields.first()
+                        {
+                            sort.push(Sort { field: first.name.clone(), descending: false });
+                            edited = true;
+                        }
+                        if edited {
+                            change = Some(json!({"sort": sort}));
+                        }
+                        ui.add_space(6.0);
+                        let mut every = !sc.grouped;
+                        if ui.checkbox(&mut every, t("Itemize every instance")).changed() {
+                            change = Some(json!({"grouped": !every}));
+                        }
                     }
                 }
             });
-            ui.separator();
-            match d.tab {
-                0 => {
-                    let shown: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
-                    // Revit's three columns: the fields there are, what moves them, the fields shown.
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(220.0);
-                            ui.label(RichText::new(t("Available fields:")).strong());
-                            ui.push_id("available", |ui| {
-                                ScrollArea::vertical().max_height(220.0).min_scrolled_height(220.0).show(ui, |ui| {
-                                    ui.set_width(210.0);
-                                    for (name, _) in available.iter().filter(|(n, _)| !shown.contains(n)) {
-                                        if ui.selectable_label(d.available.as_ref() == Some(name), t(name)).clicked() {
-                                            d.available = Some(name.clone());
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                        ui.vertical(|ui| {
-                            ui.set_width(140.0);
-                            ui.add_space(28.0);
-                            let can_add = d.available.as_ref().is_some_and(|n| !shown.contains(n));
-                            if ui.add_enabled(can_add, Button::new(t("Add")).min_size(vec2(130.0, 0.0))).clicked()
-                                && let Some(name) = d.available.take()
-                            {
-                                fields.push(Field { name, ..Field::default() });
-                                d.scheduled = Some(fields.len() - 1);
-                                change = Some(json!({"fields": fields}));
-                            }
-                            let picked = d.scheduled.filter(|i| *i < fields.len());
-                            if ui
-                                .add_enabled(picked.is_some() && fields.len() > 1, Button::new(t("Remove")).min_size(vec2(130.0, 0.0)))
-                                .clicked()
-                                && let Some(i) = picked
-                            {
-                                fields.remove(i);
-                                d.scheduled = None;
-                                change = Some(json!({"fields": fields}));
-                            }
-                            ui.add_space(12.0);
-                            if ui.add(Button::new(t("Calculated Value…")).min_size(vec2(130.0, 0.0))).clicked() {
-                                d.calculated = Some((String::new(), schedule::Kind::Number, String::new()));
-                            }
-                        });
-                        ui.vertical(|ui| {
-                            ui.set_width(220.0);
-                            ui.label(RichText::new(t("Scheduled fields (in order):")).strong());
-                            ui.push_id("scheduled", |ui| {
-                                ScrollArea::vertical().max_height(190.0).min_scrolled_height(190.0).show(ui, |ui| {
-                                    ui.set_width(210.0);
-                                    for (i, f) in fields.iter().enumerate() {
-                                        if ui.selectable_label(d.scheduled == Some(i), t(&f.name)).clicked() {
-                                            d.scheduled = Some(i);
-                                        }
-                                    }
-                                });
-                            });
-                            ui.horizontal(|ui| {
-                                let picked = d.scheduled.filter(|i| *i < fields.len());
-                                if ui.add_enabled(picked.is_some_and(|i| i > 0), Button::new(t("Move Up"))).clicked()
-                                    && let Some(i) = picked
-                                {
-                                    fields.swap(i, i - 1);
-                                    d.scheduled = Some(i - 1);
-                                    change = Some(json!({"fields": fields}));
-                                }
-                                if ui.add_enabled(picked.is_some_and(|i| i + 1 < fields.len()), Button::new(t("Move Down"))).clicked()
-                                    && let Some(i) = picked
-                                {
-                                    fields.swap(i, i + 1);
-                                    d.scheduled = Some(i + 1);
-                                    change = Some(json!({"fields": fields}));
-                                }
-                            });
-                        });
-                    });
-                    // The field picked: its heading, its totals; a calculated one's formula and kind.
-                    if let Some(i) = d.scheduled.filter(|i| *i < fields.len()) {
-                        ui.add_space(6.0);
-                        let kind = kind_of(&fields, &fields[i].name);
-                        Grid::new("schedule-field").num_columns(2).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
-                            let l = ui.label(t("Heading"));
-                            let now = fields[i].heading.clone().unwrap_or_else(|| t(&fields[i].name).to_string());
-                            if let Some(typed) = self.field(ui, key, &format!("heading.{i}"), now, l.id, "") {
-                                let typed = typed.trim();
-                                fields[i].heading = (!typed.is_empty() && typed != fields[i].name).then(|| typed.to_string());
-                                change = Some(json!({"fields": fields}));
-                            }
-                            ui.end_row();
-                            if matches!(kind, schedule::Kind::Number | schedule::Kind::Length | schedule::Kind::Area) {
-                                let l = ui.label(t("Calculate totals"));
-                                let mut on = fields[i].total;
-                                let r = ui.checkbox(&mut on, "");
-                                r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, on, t("Calculate totals")));
-                                if r.labelled_by(l.id).changed() {
-                                    fields[i].total = on;
-                                    change = Some(json!({"fields": fields}));
-                                }
-                                ui.end_row();
-                            }
-                            if let Some(formula) = fields[i].formula.clone() {
-                                let l = ui.label(t("Formula"));
-                                if let Some(typed) = self.field(ui, key, &format!("formula.{i}"), formula, l.id, "") {
-                                    fields[i].formula = Some(typed.trim().to_string());
-                                    change = Some(json!({"fields": fields}));
-                                }
-                                ui.end_row();
-                            }
-                        });
-                    }
-                    // A calculated value being made: its name, what it comes to, its formula.
-                    let (mut add, mut drop) = (false, false);
-                    if let Some((name, kind, formula)) = &mut d.calculated {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(t("Calculated Value")).strong());
-                        Grid::new("calculated").num_columns(2).spacing(vec2(12.0, 6.0)).min_col_width(130.0).show(ui, |ui| {
-                            let l = ui.label(t("Name"));
-                            ui.add(TextEdit::singleline(name).desired_width(240.0)).labelled_by(l.id);
-                            ui.end_row();
-                            let l = ui.label(t("Type"));
-                            let now = RESULTS.iter().find(|(k, _)| k == kind).map_or("Number", |(_, n)| n);
-                            let c = ComboBox::from_id_salt("calculated-kind").selected_text(t(now)).width(160.0).show_ui(ui, |ui| {
-                                for (k, label) in RESULTS {
-                                    ui.selectable_value(kind, k, t(label));
-                                }
-                            });
-                            c.response.labelled_by(l.id);
-                            ui.end_row();
-                            let l = ui.label(t("Formula"));
-                            ui.add(TextEdit::singleline(formula).desired_width(240.0).hint_text("Area * 120")).labelled_by(l.id);
-                            ui.end_row();
-                        });
-                        ui.horizontal(|ui| {
-                            add = ui.add_enabled(!name.trim().is_empty() && !formula.trim().is_empty(), Button::new(t("OK"))).clicked();
-                            drop = ui.button(t("Cancel")).clicked();
-                        });
-                    }
-                    if drop {
-                        d.calculated = None;
-                    }
-                    if add && let Some((name, kind, formula)) = d.calculated.clone() {
-                        let mut with = fields.clone();
-                        with.push(Field {
-                            name: name.trim().to_string(),
-                            formula: Some(formula.trim().to_string()),
-                            kind: Some(kind),
-                            ..Field::default()
-                        });
-                        change = Some(json!({"fields": with}));
-                    }
-                }
-                1 => {
-                    let mut filters: Vec<Filter> = sc.filters.clone();
-                    if self.filter_rows(ui, key, &mut filters, &names, &|n| kind_of(&fields, n), units) {
-                        change = Some(json!({"filters": filters}));
-                    }
-                }
-                _ => {
-                    let mut sort: Vec<Sort> = sc.sort.clone();
-                    let mut edited = false;
-                    Grid::new("schedule-sort").num_columns(4).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-                        let mut gone = None;
-                        for (i, s) in sort.iter_mut().enumerate() {
-                            let caption = ui.label(t(if i == 0 { msg!("Sort by:") } else { msg!("Then by:") }));
-                            let c = ComboBox::from_id_salt(("sort-field", i)).selected_text(t(&s.field)).width(170.0).show_ui(ui, |ui| {
-                                for n in &names {
-                                    if ui.selectable_label(*n == s.field, t(n)).clicked() && *n != s.field {
-                                        s.field = n.clone();
-                                        edited = true;
-                                    }
-                                }
-                            });
-                            c.response.labelled_by(caption.id);
-                            let now = if s.descending { msg!("Descending") } else { msg!("Ascending") };
-                            let c = ComboBox::from_id_salt(("sort-way", i)).selected_text(t(now)).width(120.0).show_ui(ui, |ui| {
-                                for (down, label) in [(false, "Ascending"), (true, "Descending")] {
-                                    if ui.selectable_label(s.descending == down, t(label)).clicked() && s.descending != down {
-                                        s.descending = down;
-                                        edited = true;
-                                    }
-                                }
-                            });
-                            c.response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, true, t("Order")));
-                            if ui.button(t("Remove")).clicked() {
-                                gone = Some(i);
-                            }
-                            ui.end_row();
-                        }
-                        if let Some(i) = gone {
-                            sort.remove(i);
-                            edited = true;
-                        }
-                    });
-                    if ui.button(t("Add Sort")).clicked()
-                        && let Some(first) = fields.first()
-                    {
-                        sort.push(Sort { field: first.name.clone(), descending: false });
-                        edited = true;
-                    }
-                    if edited {
-                        change = Some(json!({"sort": sort}));
-                    }
-                    ui.add_space(6.0);
-                    let mut every = !sc.grouped;
-                    if ui.checkbox(&mut every, t("Itemize every instance")).changed() {
-                        change = Some(json!({"grouped": !every}));
-                    }
-                }
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
         });
         if let Some(mut p) = change {
             p["name"] = json!(sc.name);

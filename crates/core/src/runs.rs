@@ -487,10 +487,13 @@ pub const IFC: &[(&str, &str, &str)] = &[
     ("beam", "IFCBEAM", ".BEAM."),
     ("stripfooting", "IFCFOOTING", ".STRIP_FOOTING."),
     ("pipe", "IFCPIPESEGMENT", ".RIGIDSEGMENT."),
+    ("duct", "IFCDUCTSEGMENT", ".RIGIDSEGMENT."),
     ("cablecarrier", "IFCCABLECARRIERSEGMENT", ".CONDUITSEGMENT."),
     ("cablecarrier", "IFCCABLECARRIERSEGMENT", ".CABLETRAYSEGMENT."),
     // A ladder is a tray to BIMCraft, written as a tray: only a file of another tool's says it.
     ("cablecarrier", "IFCCABLECARRIERSEGMENT", ".CABLELADDERSEGMENT."),
+    ("conduit", "IFCCABLECARRIERSEGMENT", ".CONDUITSEGMENT."),
+    ("cabletray", "IFCCABLECARRIERSEGMENT", ".CABLETRAYSEGMENT."),
     ("wire", "IFCCABLESEGMENT", ".CABLESEGMENT."),
     // IFC has no lightning protection: a down conductor is a conductor segment, as is an earthing conductor (BIMCraft's own
     // `Category` tells them apart).

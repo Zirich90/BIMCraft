@@ -48,6 +48,12 @@ impl Axis {
         self.arc.map(|a| a.1)
     }
 
+    /// An arc's centre, radius, the angle its start lies at from the centre and how far it sweeps (radians,
+    /// counter-clockwise positive); none when it's straight.
+    pub fn arc(&self) -> Option<(P2, f64, f64, f64)> {
+        self.arc
+    }
+
     pub fn length(&self) -> f64 {
         match self.arc {
             Some((_, r, _, sweep)) => r * sweep.abs(),

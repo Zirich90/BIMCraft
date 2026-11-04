@@ -156,6 +156,44 @@ fn a_dwg_says_to_save_it_as_dxf_and_a_file_that_isnt_one_says_why() {
     assert!(s.model.cads.is_empty());
 }
 
+/// A DWG reader as the apps hand a session one: here one that gives `plan()`'s DXF for a file that begins as a DWG does, with
+/// a note, and says why for any other.
+fn dwg_reader() -> crate::cad::DwgReader {
+    std::sync::Arc::new(|path: &std::path::Path| {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        if !bytes.starts_with(b"AC10") {
+            return Err("it isn't a DWG file".into());
+        }
+        Ok((plan().into_bytes(), vec!["2 of the DWG's object records couldn't be read and were left out".into()]))
+    })
+}
+
+#[test]
+fn a_dwg_comes_in_through_the_reader_a_session_is_given_and_is_held_as_the_dxf_it_became() {
+    let mut s = Session::new();
+    s.dwg = Some(dwg_reader());
+    let path = file("dwg-reader", "site.dwg", "AC1032 a drawing");
+    let r = run(&mut s, "import_cad", json!({"path": path, "link": true, "layers": "all"}));
+    assert_eq!((r["cad"].as_str(), r["source"].as_str(), r["unit"].as_str()), (Some("site"), Some("site.dwg"), Some("m")), "{r}");
+    assert_eq!(r["notes"], json!(["2 of the DWG's object records couldn't be read and were left out"]), "{r}");
+    assert_eq!(s.model.cads["site"].dxf().entities.len(), 6);
+    // Reloaded through it too; a file it can't read says why, and the drawing keeps what it had.
+    assert_eq!(run(&mut s, "reload_cad", json!({"cad": "site"}))["changed"], false);
+    std::fs::write(&path, "not a drawing").unwrap();
+    let e = fails(&mut s, "reload_cad", json!({"cad": "site"}));
+    assert!(e.contains("site.dwg") && e.contains("isn't a DWG"), "{e}");
+    assert_eq!(s.model.cads["site"].dxf().entities.len(), 6);
+    // A project file holds the DXF, so one opened where no DWG reader is still has the drawing; the link says why it wasn't
+    // read again.
+    let saved = dir("dwg-reader").join("p.bim");
+    run(&mut s, "save", json!({"path": saved}));
+    let mut plain = Session::new();
+    let r = run(&mut plain, "open", json!({"path": saved}));
+    assert_eq!(plain.model.cads["site"].dxf().entities.len(), 6);
+    let why = r["cads_not_reloaded"].to_string();
+    assert!(why.contains("site") && why.contains("save it as DXF"), "{r}");
+}
+
 #[test]
 fn current_view_only_is_one_plan_of_its_level() {
     let mut s = Session::new();

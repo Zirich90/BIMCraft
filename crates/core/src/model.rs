@@ -71,7 +71,15 @@ pub const CEILING_CUT: f64 = 2300.0;
 pub const CEILING_HEIGHT: f64 = 2600.0;
 /// The steepest slope a floor or a roof may have, degrees.
 pub const MAX_SLOPE: f64 = 75.0;
-/// The version of the project file this build writes, and the newest it reads. 7: a project holds CAD drawings (`cads`,
+/// The version of the project file this build writes, and the newest it reads. 12: a project's language may be German (`de`) or
+/// Dutch (`nl`), a wall may bound no rooms (`room_bounding: false`, written only then) and a family holds `connectors` (an
+/// electrical device's load, a switch); nothing in a file of 11 changes, but a build that reads up to 11 would answer one of 12
+/// with a serde error ("unknown variant") or, for such a wall, leave the setting out and bound rooms by it again, and for such a
+/// family drop the connectors and place the device as a load of zero, not "saved by a newer BIMCraft". 11: a project's language may be Swedish,
+/// Czech or French (`sv`, `cs`, `fr`); nothing in a file of 10 changes, but a build that reads up to 10 would answer one of
+/// 11 with a serde error ("unknown variant"), not "saved by a newer BIMCraft". 8: text types (`text_types`, library
+/// entries of kind `text-type`); a note names its type, which holds its size, and may override parts of its formatting
+/// (`override_format`, `runs`): a note of 7 has a `size`, which reading it gives a type of. 7: a project holds CAD drawings (`cads`,
 /// library entries of kind `Cad`) and imports place them; nothing in a file of 6 changes, but a build that reads up to 6 would
 /// answer one of 7 with a serde error, not "saved by a newer BIMCraft". 6: a project holds detailing (library kinds
 /// `line-pattern`, `line-style`, `fill-pattern`, `filled-region-type` and `detail-group`; the elements `line`, `region`,
@@ -85,7 +93,7 @@ pub const MAX_SLOPE: f64 = 75.0;
 /// 2: the library has ids and GUIDs too
 /// (`library`), and what names a library entry holds its GUID. 1: elements have GUIDs, ids six digits, and what points at
 /// an element holds its GUID. None (0): a file from before.
-pub const FORMAT: u32 = 20;
+pub const FORMAT: u32 = 21;
 /// How far past the model a level reaches without an extent of its own, mm.
 pub const LEVEL_PAST: f64 = 1000.0;
 
@@ -112,6 +120,18 @@ pub struct Level {
     /// range and its sides as its crop.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub section_box: bool,
+    /// Revit's Computation Height: how far above it (mm) its rooms find the walls that bound them. Room separation lines
+    /// bound them whatever it is.
+    #[serde(default = "computation_height", skip_serializing_if = "is_computation_height")]
+    pub computation_height: f64,
+}
+
+fn computation_height() -> f64 {
+    CUT_HEIGHT
+}
+
+fn is_computation_height(x: &f64) -> bool {
+    *x == CUT_HEIGHT
 }
 
 impl Level {
@@ -124,6 +144,7 @@ impl Level {
             extent: None,
             graphics: Graphics::default(),
             section_box: false,
+            computation_height: CUT_HEIGHT,
         }
     }
 }
@@ -174,6 +195,28 @@ pub struct RoomSeparator {
     pub end: P2,
 }
 
+/// A reinforcing bar: a round bar of `diameter` mm bent along `path` (mm: x east, y north, z over `level`), of steel `grade`. It
+/// reinforces `host`, a beam, a column, a footing or a floor, and goes with it; a hoop is a bar whose last point is its first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rebar {
+    pub level: Guid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Guid>,
+    pub path: Vec<[f64; 3]>,
+    pub diameter: f64,
+    #[serde(default = "default_grade")]
+    pub grade: String,
+    /// The part of the host's reinforcement it belongs to (`bottom`, `stirrup`, `mesh x`): what `reinforce` made it for, and
+    /// replaces when it reinforces the host again. Empty for a bar drawn by hand.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub layer: String,
+}
+
+fn default_grade() -> String {
+    crate::rebar::GRADE.into()
+}
+
 /// A wall: its location line from `start` to `end`, straight or, turning `arc` degrees, an arc;
 /// which line of the wall that is (its `location`); its exterior side to the left of start to end,
 /// as Revit's, so walls drawn clockwise face out.
@@ -206,9 +249,52 @@ pub struct Wall {
     pub attach_top: Option<Guid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach_base: Option<Guid>,
+    /// Whether it bounds rooms (Revit's Room Bounding): on unless turned off, as for a low wall or a balustrade a room
+    /// runs past.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub room_bounding: bool,
     /// Its values of the project's parameters, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_json::Value>,
+}
+
+/// A room's Limit Offset unless it says: its top 2500 mm over its own level.
+pub const ROOM_LIMIT_OFFSET: f64 = 2500.0;
+/// Where the level above bounds a new room: its top this far over it (under it, being negative).
+pub const ROOM_BELOW_ABOVE: f64 = -300.0;
+/// The side of the square an unbounded room covers round its point, mm.
+pub const UNBOUNDED_ROOM: f64 = 1000.0;
+
+/// Why a room has no boundary: no loop of walls and separation lines closes round its point, or a room placed before it
+/// (this one) has the space it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unbound {
+    NotEnclosed,
+    Shared(Id),
+}
+
+/// The square an unbounded room covers round its point `p`, [`UNBOUNDED_ROOM`] mm a side, counter-clockwise.
+pub fn unbounded_square(p: P2) -> Vec<P2> {
+    let h = UNBOUNDED_ROOM / 2.0;
+    let P2(x, y) = p;
+    vec![P2(x - h, y - h), P2(x + h, y - h), P2(x + h, y + h), P2(x - h, y + h)]
+}
+
+/// Whether `p` lies in region `g`: inside its outer ring, in none of its islands.
+pub fn region_holds(g: &Region, p: P2) -> bool {
+    geom::contains(&g.outer, p) && !g.holes.iter().any(|h| geom::contains(h, p))
+}
+
+fn room_limit_offset() -> f64 {
+    ROOM_LIMIT_OFFSET
+}
+
+fn is_room_limit_offset(x: &f64) -> bool {
+    *x == ROOM_LIMIT_OFFSET
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 fn is_zero(x: &f64) -> bool {
@@ -316,6 +402,9 @@ pub struct Layer {
 /// Layers a type may have.
 pub const MAX_LAYERS: usize = 32;
 
+/// How see-through the starter library's glass is, percent.
+pub const GLASS_TRANSPARENCY: u8 = 70;
+
 /// A material of the project's library: its colour in shaded views, the pattern its cut shows in
 /// plans and sections, and the one its surfaces show where a plan looks down on a floor or a
 /// ceiling plan up at a ceiling.
@@ -336,6 +425,13 @@ pub struct Material {
     /// What its surfaces look like in the 3D view, over its colour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub texture: Option<Texture>,
+    /// How much of what lies behind its surfaces shows through them in the 3D view, percent: 0 (opaque) to 100.
+    #[serde(default, skip_serializing_if = "is_clear")]
+    pub transparency: u8,
+}
+
+fn is_clear(x: &u8) -> bool {
+    *x == 0
 }
 
 impl Default for Material {
@@ -347,6 +443,7 @@ impl Default for Material {
             cut_pattern: None,
             surface_pattern: None,
             texture: None,
+            transparency: 0,
         }
     }
 }
@@ -555,6 +652,76 @@ pub struct Room {
     /// Its values of the project's parameters, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_json::Value>,
+    /// Revit's Base Offset: its bottom, this far above its level (mm).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base_offset: f64,
+    /// Revit's Upper Limit: the level its top is measured from; none, its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_level: Option<Guid>,
+    /// Revit's Limit Offset: its top, this far above its upper limit (mm).
+    #[serde(default = "room_limit_offset", skip_serializing_if = "is_room_limit_offset")]
+    pub limit_offset: f64,
+    /// Frozen, it keeps the boundary it had when frozen (`kept`) and the walls are never searched for it again: it keeps its
+    /// size whatever the walls do, and a project of many rooms is drawn and scheduled without finding each one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen: bool,
+    /// What a frozen room keeps, given it after the command that froze it (`Model::keep_rooms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Kept>,
+}
+
+impl Room {
+    /// A room at `point` on `level`, its height Revit's unless it says (up to [`ROOM_LIMIT_OFFSET`] over its level), not
+    /// frozen.
+    pub fn new(level: Guid, point: P2, name: impl Into<String>, number: impl Into<String>) -> Room {
+        Room {
+            level,
+            point,
+            name: name.into(),
+            number: number.into(),
+            params: BTreeMap::new(),
+            base_offset: 0.0,
+            top_level: None,
+            limit_offset: ROOM_LIMIT_OFFSET,
+            frozen: false,
+            kept: None,
+        }
+    }
+}
+
+/// A frozen room's boundary, measured both ways the project may measure rooms (`room_area`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Kept {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub centre: Option<Region>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<Region>,
+}
+
+impl Kept {
+    pub fn at(&self, at: RoomArea) -> Option<&Region> {
+        match at {
+            RoomArea::Centre => self.centre.as_ref(),
+            RoomArea::Finish => self.finish.as_ref(),
+        }
+    }
+
+    /// Each of its rings moved by `f`; a mirror image turned back counter-clockwise, its holes clockwise.
+    pub fn map(&mut self, f: impl Fn(P2) -> P2) {
+        for g in self.centre.iter_mut().chain(self.finish.iter_mut()) {
+            g.outer.iter_mut().for_each(|q| *q = f(*q));
+            if geom::area(&g.outer) < 0.0 {
+                g.outer.reverse();
+            }
+            for h in &mut g.holes {
+                h.iter_mut().for_each(|q| *q = f(*q));
+                if geom::area(h) > 0.0 {
+                    h.reverse();
+                }
+            }
+        }
+    }
 }
 
 /// Which of an element's lines a dimension measures to: a wall's centre line, its face on the
@@ -604,13 +771,47 @@ impl Face {
     }
 }
 
-/// A line a dimension measures to.
+/// A line a dimension measures to, or with `point`, the point at one end of it: a wall's centre line's end, a face's
+/// corner, a detail line's or a grid's end, a jamb's end at either face of its wall.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reference {
     pub id: Guid,
     #[serde(default)]
     pub face: Face,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<End>,
+}
+
+impl Reference {
+    /// Element `id`'s line `face`.
+    pub fn line(id: Guid, face: Face) -> Reference {
+        Reference { id, face, point: None }
+    }
+
+    /// The same of a mirrored element, which runs back the other way ([`Face::mirrored`]): the end of a line along it
+    /// swaps, and a line across it (a wall's end, any of an `opening`'s lines) still runs from its inside to its outside.
+    pub fn mirrored(self, opening: bool) -> Reference {
+        let along = !opening && matches!(self.face, Face::Centre | Face::Left | Face::Right);
+        Reference { face: self.face.mirrored(), point: self.point.map(|p| if along { p.other() } else { p }), ..self }
+    }
+}
+
+/// Which end of a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum End {
+    Start,
+    End,
+}
+
+impl End {
+    pub fn other(self) -> End {
+        match self {
+            End::Start => End::End,
+            End::End => End::Start,
+        }
+    }
 }
 
 /// How far a point stands from a line `toward` it (a unit vector along x or y): see [`Model::clearances`].
@@ -622,10 +823,12 @@ pub struct Clearance {
 }
 
 /// A dimension in a level's plan. Aligned: the distances between parallel references, along a
-/// line through `at` across them. Angular: the angle between two references that meet, on the
-/// side of `at`, its arc through `at`. Radial: a round element's radius, its line toward `at`. It
+/// line through `at` across them; between points, along the line through the first two; lines and points, square to the
+/// lines. Linear: the same, its line horizontal or vertical as `orient` says (its lines square to it). Angular: the angle between two references that meet, on the
+/// side of `at`, its arc through `at`. Radial: a round element's radius, its line toward `at`; diameter, across it through
+/// its centre. Arc length: how long an arc is along it, its line an arc through `at` round the same centre. It
 /// measures the model as it is, so it follows what it measures.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dimension {
     pub level: Guid,
@@ -634,38 +837,173 @@ pub struct Dimension {
     pub view: Option<Guid>,
     #[serde(default)]
     pub kind: DimKind,
+    /// A linear dimension's: which way its line runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orient: Option<Orient>,
     pub refs: Vec<Reference>,
     pub at: P2,
+    /// Its dimension type (`crate::dims`): how it draws and letters its numbers.
+    #[serde(rename = "type", default)]
+    pub type_name: String,
+    /// Before and after each number, as Revit's Prefix and Suffix.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suffix: String,
+    /// Over and under its numbers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub above: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub below: String,
+    /// What shows instead of each number, as Revit's Replace With Text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replace: String,
+    /// Its segments show its type's equality text (EQ) instead of their lengths.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub equality: bool,
+    /// Text of single segments' own, over the dimension's (Revit's Dimension Text on one segment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texts: Vec<SegmentText>,
+    /// Its segments are kept equal: what it measures to between its first and last moves to keep them so (`crate::constraints`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub equal: bool,
+    /// Its segments locked at a length: what it measures to moves together to keep them so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<Lock>,
+}
+
+/// A dimension's segment `segment` (counted as its values are) kept at `length` mm, Revit's padlock.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lock {
+    pub segment: usize,
+    pub length: f64,
+}
+
+/// One segment's own text: what it shows in place of the dimension's where it says something. `segment` counts its numbers
+/// as [`Model::dimension_labels`] gives them, from 0: west to east, or south to north.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentText {
+    pub segment: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suffix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub above: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub below: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub replace: String,
+}
+
+impl SegmentText {
+    /// Its texts by name, as the dimension's are.
+    pub fn fields(&self) -> [(&'static str, &String); 5] {
+        [("prefix", &self.prefix), ("suffix", &self.suffix), ("above", &self.above), ("below", &self.below), ("replace", &self.replace)]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields().iter().all(|(_, t)| t.is_empty())
+    }
+}
+
+impl Dimension {
+    /// Segment `i`'s text `field` (prefix, suffix, above, below or replace): its own, else the dimension's.
+    pub fn text(&self, i: usize, field: &str) -> &str {
+        let own =
+            self.texts.iter().find(|t| t.segment == i).and_then(|t| t.fields().into_iter().find(|(n, _)| *n == field)).map(|(_, t)| t);
+        let whole = match field {
+            "prefix" => &self.prefix,
+            "suffix" => &self.suffix,
+            "above" => &self.above,
+            "below" => &self.below,
+            _ => &self.replace,
+        };
+        own.filter(|t| !t.is_empty()).unwrap_or(whole)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum DimKind {
     #[default]
     Aligned,
+    Linear,
     Angular,
     Radial,
+    /// Across a round element, through its centre.
+    Diameter,
+    /// Along an arc: a curved wall's centre line or face, or a detail line's arc.
+    ArcLength,
+}
+
+/// Which way a linear dimension's line runs: horizontal, measuring east and west, or vertical, north and south.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Orient {
+    Horizontal,
+    Vertical,
+}
+
+impl Orient {
+    /// The way it measures.
+    pub fn along(self) -> P2 {
+        match self {
+            Orient::Horizontal => P2(1.0, 0.0),
+            Orient::Vertical => P2(0.0, 1.0),
+        }
+    }
+
+    /// How a dimension between `points` placed at `at` runs, as Archicad's and AutoCAD's do: past the points' east or
+    /// west, vertical; past their north or south, horizontal; among them, aligned (None). Where they span no width, it
+    /// can't be horizontal, nor vertical where they span no height.
+    pub fn follow(points: &[P2], at: P2) -> Option<Orient> {
+        let (lo, hi) = points.iter().fold((P2(f64::INFINITY, f64::INFINITY), P2(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(lo, hi), p| {
+            (P2(lo.0.min(p.0), lo.1.min(p.1)), P2(hi.0.max(p.0), hi.1.max(p.1)))
+        });
+        let (wide, tall) = (hi.0 - lo.0 > TOL, hi.1 - lo.1 > TOL);
+        let (beside, over) = (at.0 < lo.0 || at.0 > hi.0, at.1 < lo.1 || at.1 > hi.1);
+        match (wide, tall) {
+            (true, false) => Some(Orient::Horizontal),
+            (false, true) => Some(Orient::Vertical),
+            _ if beside && !over => Some(Orient::Vertical),
+            _ if over && !beside => Some(Orient::Horizontal),
+            // Off a corner: the way it is farther out.
+            _ if beside && over => {
+                let dx = (lo.0 - at.0).max(at.0 - hi.0);
+                let dy = (lo.1 - at.1).max(at.1 - hi.1);
+                Some(if dx > dy { Orient::Vertical } else { Orient::Horizontal })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A text note in a view: a level's plan, a section, an elevation or a sheet. `at` is the top left
-/// of its first line, in the view's own terms; `size` its capitals' height on paper, mm; turned
-/// `angle` degrees counter-clockwise; with a leader to `leader`.
+/// of its first line, in the view's own terms; lettered as its text type says (`crate::text`); turned
+/// `angle` degrees counter-clockwise; with a leader to `leader`. With `override_format`, its `runs`
+/// make parts of it bold, italic or underlined, or not, whatever its type says; they stay when its type
+/// changes. `size` is a note's from before text types, which a file's reading gives a type of that size.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Note {
     pub view: Guid,
     pub at: P2,
     pub text: String,
-    #[serde(default = "note_size")]
-    pub size: f64,
+    #[serde(rename = "type", default)]
+    pub type_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
     #[serde(default)]
     pub angle: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leader: Option<P2>,
-}
-
-fn note_size() -> f64 {
-    NOTE_SIZE
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub override_format: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<crate::text::Run>,
 }
 
 /// A scan placed: the project's `cloud`, its middle at `at` in plan and `offset` mm over `level`, turned `angle` degrees
@@ -815,9 +1153,42 @@ pub struct View3D {
     /// The box it is cut to, as Revit's Section Box: kept, with its extents, when it's turned off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section_box: Option<SectionBox>,
+    /// Seen in perspective, as through a camera, rather than parallel (axonometric): kept, with its lens, when it's turned off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perspective: Option<Perspective>,
+    /// Where the view's camera stands and what it looks at, when it was placed as Revit's Camera tool does (an eye and a
+    /// target in the model). None for a view that is fitted over the model rather than through a camera of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<ViewCamera>,
+}
+
+/// A 3D view's camera: the model point its eye stands at, and the model point it looks at, in mm. The view is seen in
+/// perspective through its lens, from `eye` toward `target`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewCamera {
+    /// Where the camera's eye stands, [x, y, z] mm.
+    pub eye: [f64; 3],
+    /// What the camera looks at, [x, y, z] mm; never the eye itself.
+    pub target: [f64; 3],
+}
+
+/// A 3D view's perspective: the focal length of the lens it is seen through, mm on a 35 mm camera (whose film is the
+/// picture's width), while it is `on`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Perspective {
+    pub lens: f64,
+    #[serde(default = "yes")]
+    pub on: bool,
 }
 
 impl View3D {
+    /// The lens it is seen through while it's in perspective; none while it's parallel.
+    pub fn lens(&self) -> Option<f64> {
+        self.perspective.filter(|p| p.on).map(|p| p.lens)
+    }
+
     /// The default 3D view, `{3D}`, as it is before anything changes it.
     pub fn default_view() -> View3D {
         View3D {
@@ -826,6 +1197,8 @@ impl View3D {
             elevation: crate::view3d::ELEVATION,
             graphics: Graphics::default(),
             section_box: None,
+            perspective: None,
+            camera: None,
         }
     }
 }
@@ -895,6 +1268,10 @@ pub struct Column {
     /// Its values of the project's parameters, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, serde_json::Value>,
+    /// Revit's Room Bounding: whether it bounds rooms (where it stands at its level's Computation Height). Off, rooms
+    /// run through it.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub room_bounding: bool,
 }
 
 /// Which line of a run's section its heights are: the top of it, its middle, or its bottom.
@@ -948,7 +1325,7 @@ pub struct CarrierCompartment {
     pub systems: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
     /// End planes normal to the axis; false retains legacy unrolled, plumb-cut rectangles.
@@ -1378,7 +1755,7 @@ pub struct Sheet {
     pub size: String,
 }
 
-/// The paper an ISO size names, landscape: width and height in mm.
+/// The paper a standard size names, landscape: width and height in mm.
 pub fn paper(size: &str) -> Option<P2> {
     match size.trim().to_ascii_uppercase().as_str() {
         "A0" => Some(P2(1189.0, 841.0)),
@@ -1386,6 +1763,19 @@ pub fn paper(size: &str) -> Option<P2> {
         "A2" => Some(P2(594.0, 420.0)),
         "A3" => Some(P2(420.0, 297.0)),
         "A4" => Some(P2(297.0, 210.0)),
+        // US Architectural sizes (landscape, mm)
+        "ARCH A" | "ARCHA" => Some(P2(304.8, 228.6)),
+        "ARCH B" | "ARCHB" => Some(P2(457.2, 304.8)),
+        "ARCH C" | "ARCHC" => Some(P2(609.6, 457.2)),
+        "ARCH D" | "ARCHD" => Some(P2(914.4, 609.6)),
+        "ARCH E" | "ARCHE" => Some(P2(1219.2, 914.4)),
+        "ARCH E1" | "ARCHE1" => Some(P2(1066.8, 762.0)),
+        // ANSI Engineering sizes (landscape, mm)
+        "ANSI A" | "ANSIA" | "LETTER" => Some(P2(279.4, 215.9)),
+        "ANSI B" | "ANSIB" | "TABLOID" | "LEDGER" => Some(P2(431.8, 279.4)),
+        "ANSI C" | "ANSIC" => Some(P2(558.8, 431.8)),
+        "ANSI D" | "ANSID" => Some(P2(863.6, 558.8)),
+        "ANSI E" | "ANSIE" => Some(P2(1117.6, 863.6)),
         _ => None,
     }
 }
@@ -1409,6 +1799,9 @@ macro_rules! run_arm {
             | Element::StripFooting($r)
             | Element::Pipe($r)
             | Element::CableCarrier($r)
+            | Element::Duct($r)
+            | Element::Conduit($r)
+            | Element::CableTray($r)
             | Element::Wire($r)
             | Element::DownConductor($r)
             | Element::GroundConductor($r)
@@ -1435,7 +1828,11 @@ macro_rules! visit_refs {
                 if let Some(g) = & $($m)? w.attach_top { f(g) }
                 if let Some(g) = & $($m)? w.attach_base { f(g) }
             }
-            Element::Floor(Floor { level, .. }) | Element::Ceiling(Ceiling { level, .. }) | Element::Room(Room { level, .. }) => f(level),
+            Element::Floor(Floor { level, .. }) | Element::Ceiling(Ceiling { level, .. }) => f(level),
+            Element::Room(Room { level, top_level, .. }) => {
+                f(level);
+                if let Some(g) = top_level { f(g) }
+            }
             Element::Shaft(Shaft { level, top_level, .. })
             | Element::Mass(Mass { level, top_level, .. })
             | Element::Column(Column { level, top_level, .. })
@@ -1514,6 +1911,10 @@ macro_rules! visit_refs {
                 if let Some(g) = & $($m)? ci.view { f(g) }
             }
             Element::RoomSeparator(rs) => f(& $($m)? rs.level),
+            Element::Rebar(rb) => {
+                f(& $($m)? rb.level);
+                if let Some(g) = & $($m)? rb.host { f(g) }
+            }
         }
     }};
 }
@@ -1551,10 +1952,15 @@ pub enum Element {
     /// A cable carrier (`КНС`): a round carrier writes as an IFC conduit segment, a rectangular one as a cable tray segment.
     #[serde(rename = "cablecarrier")]
     CableCarrier(Run),
+    Duct(Run),
+    Conduit(Run),
+    CableTray(Run),
     Wire(Run),
     DownConductor(Run),
     GroundConductor(Run),
     Cable(Run),
+    /// A reinforcing bar in a concrete element, bent along its points.
+    Rebar(Rebar),
     Component(Component),
 
     Stair(Stair),
@@ -1690,6 +2096,9 @@ impl Element {
             "stripfooting" => Some(Element::StripFooting(r)),
             "pipe" => Some(Element::Pipe(r)),
             "cablecarrier" => Some(Element::CableCarrier(r)),
+            "duct" => Some(Element::Duct(r)),
+            "conduit" => Some(Element::Conduit(r)),
+            "cabletray" => Some(Element::CableTray(r)),
             "wire" => Some(Element::Wire(r)),
             "downconductor" => Some(Element::DownConductor(r)),
             "groundconductor" => Some(Element::GroundConductor(r)),
@@ -1765,6 +2174,7 @@ impl Element {
             Element::Window(_) => "window",
             Element::Room(_) => "room",
             Element::RoomSeparator(_) => "roomseparator",
+            Element::Rebar(_) => "rebar",
             Element::Dimension(_) => "dimension",
             Element::Tag(_) => "tag",
             Element::Section(_) => "section",
@@ -1778,6 +2188,9 @@ impl Element {
             Element::StripFooting(_) => "stripfooting",
             Element::Pipe(_) => "pipe",
             Element::CableCarrier(_) => "cablecarrier",
+            Element::Duct(_) => "duct",
+            Element::Conduit(_) => "conduit",
+            Element::CableTray(_) => "cabletray",
             Element::Wire(_) => "wire",
             Element::DownConductor(_) => "downconductor",
             Element::GroundConductor(_) => "groundconductor",
@@ -1856,7 +2269,8 @@ pub struct RunType {
 }
 
 /// The categories whose elements are runs, as `Element::run` returns them.
-pub const RUN_CATEGORIES: [&str; 8] = ["beam", "stripfooting", "pipe", "cablecarrier", "wire", "downconductor", "groundconductor", "cable"];
+pub const RUN_CATEGORIES: [&str; 11] =
+    ["beam", "stripfooting", "pipe", "duct", "cablecarrier", "conduit", "cabletray", "wire", "downconductor", "groundconductor", "cable"];
 
 /// A roof type: how thick its roofs are across their slope and, a compound one, its layers from
 /// the top down.
@@ -1868,7 +2282,7 @@ pub struct RoofType {
     pub layers: Vec<Layer>,
 }
 
-/// A door or window type. `sill` is a window's default sill height.
+/// A door or window type. `sill` is a window's default sill height; `operation`, how it opens, where it's said.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpeningType {
@@ -1876,6 +2290,102 @@ pub struct OpeningType {
     pub height: f64,
     #[serde(default)]
     pub sill: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
+}
+
+/// How a door's or a window's leaves open, as IFC's door operation types name them; which jamb a
+/// leaf is hinged on, or slides or folds toward, is the opening's `flip_hand`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Operation {
+    /// One leaf, hinged on a jamb.
+    Swing,
+    /// Two leaves, each hinged on its jamb, meeting in the middle.
+    DoubleSwing,
+    /// A leaf sliding along the wall, past a fixed one or the wall itself: a porta de correr.
+    Sliding,
+    /// Two leaves sliding apart from the middle.
+    DoubleSliding,
+    /// Leaves folding toward a jamb.
+    Folding,
+    /// Nothing opens.
+    Fixed,
+}
+
+impl Operation {
+    pub const ALL: [Operation; 6] =
+        [Operation::Swing, Operation::DoubleSwing, Operation::Sliding, Operation::DoubleSliding, Operation::Folding, Operation::Fixed];
+
+    /// Its name, as files and commands spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Operation::Swing => "swing",
+            Operation::DoubleSwing => "double-swing",
+            Operation::Sliding => "sliding",
+            Operation::DoubleSliding => "double-sliding",
+            Operation::Folding => "folding",
+            Operation::Fixed => "fixed",
+        }
+    }
+
+    /// Its name in English, as schedules head it; `Language::word` says it in another language.
+    pub fn label(self) -> &'static str {
+        match self {
+            Operation::Swing => msg!("Swing"),
+            Operation::DoubleSwing => msg!("Double Swing"),
+            Operation::Sliding => msg!("Sliding"),
+            Operation::DoubleSliding => msg!("Double Sliding"),
+            Operation::Folding => msg!("Folding"),
+            Operation::Fixed => msg!("Fixed"),
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Operation> {
+        Operation::ALL.into_iter().find(|o| o.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// A door's `IfcDoorTypeOperationEnum`, its leaf to the right with `right`; a door that says
+    /// nothing swings, as BIMCraft's always have.
+    pub fn ifc_door(op: Option<Operation>, right: bool) -> &'static str {
+        let side = |left: &'static str, to_right: &'static str| if right { to_right } else { left };
+        match op.unwrap_or(Operation::Swing) {
+            Operation::Swing => side(".SINGLE_SWING_LEFT.", ".SINGLE_SWING_RIGHT."),
+            Operation::DoubleSwing => ".DOUBLE_DOOR_SINGLE_SWING.",
+            Operation::Sliding => side(".SLIDING_TO_LEFT.", ".SLIDING_TO_RIGHT."),
+            Operation::DoubleSliding => ".DOUBLE_DOOR_SLIDING.",
+            Operation::Folding => side(".FOLDING_TO_LEFT.", ".FOLDING_TO_RIGHT."),
+            Operation::Fixed => ".NOTDEFINED.",
+        }
+    }
+
+    /// A door's operation and whether its leaf is to the right, from `IfcDoorTypeOperationEnum` (IFC4) or
+    /// `IfcDoorStyleOperationEnum` (IFC2x3), as the file spells it, with or without its dots.
+    pub fn from_ifc_door(e: &str) -> Option<(Operation, bool)> {
+        let e = e.trim_matches('.');
+        let right = e.ends_with("RIGHT");
+        let op = match e {
+            "SINGLE_SWING_LEFT" | "SINGLE_SWING_RIGHT" | "SWING_FIXED_LEFT" | "SWING_FIXED_RIGHT" => Operation::Swing,
+            "DOUBLE_SWING_LEFT" | "DOUBLE_SWING_RIGHT" => Operation::Swing,
+            "DOUBLE_DOOR_SINGLE_SWING"
+            | "DOUBLE_DOOR_DOUBLE_SWING"
+            | "DOUBLE_DOOR_SINGLE_SWING_OPPOSITE_LEFT"
+            | "DOUBLE_DOOR_SINGLE_SWING_OPPOSITE_RIGHT" => Operation::DoubleSwing,
+            "SLIDING_TO_LEFT" | "SLIDING_TO_RIGHT" => Operation::Sliding,
+            "DOUBLE_DOOR_SLIDING" => Operation::DoubleSliding,
+            "FOLDING_TO_LEFT" | "FOLDING_TO_RIGHT" | "DOUBLE_DOOR_FOLDING" => Operation::Folding,
+            _ => return None,
+        };
+        Some((op, right))
+    }
+
+    /// A window's `IfcWindowTypePartitioningEnum`: two panels side by side where two leaves meet, else one.
+    pub fn ifc_window_partitioning(op: Option<Operation>) -> &'static str {
+        match op {
+            Some(Operation::DoubleSwing | Operation::Sliding | Operation::DoubleSliding) => ".DOUBLE_PANEL_VERTICAL.",
+            _ => ".SINGLE_PANEL.",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1927,7 +2437,7 @@ pub struct ProjectParameter {
 pub const MAX_PROJECT_PARAMETERS: usize = 256;
 
 /// The categories project parameters are for.
-pub const PARAMETER_CATEGORIES: [&str; 23] = [
+pub const PARAMETER_CATEGORIES: [&str; 26] = [
     "wall",
     "floor",
     "ceiling",
@@ -1947,6 +2457,9 @@ pub const PARAMETER_CATEGORIES: [&str; 23] = [
     "stripfooting",
     "pipe",
     "cablecarrier",
+    "duct",
+    "conduit",
+    "cabletray",
     "wire",
     "downconductor",
     "groundconductor",
@@ -1974,6 +2487,44 @@ pub struct CarrierSettings {
     pub auto: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_type: String,
+}
+
+/// Where a project measures its rooms' areas and perimeters (Revit's Area and Volume Computations).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomArea {
+    /// At the walls' centre lines.
+    #[default]
+    Centre,
+    /// At the walls' finish faces: the floor inside them.
+    Finish,
+}
+
+impl RoomArea {
+    pub const ALL: [RoomArea; 2] = [RoomArea::Centre, RoomArea::Finish];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RoomArea::Centre => "centre",
+            RoomArea::Finish => "finish",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<RoomArea> {
+        RoomArea::ALL.into_iter().find(|a| a.name() == name)
+    }
+
+    /// As a menu names it (Revit's "At wall centerline" and "At wall finish").
+    pub fn label(self) -> &'static str {
+        match self {
+            RoomArea::Centre => ui_msg!("At wall centre line"),
+            RoomArea::Finish => ui_msg!("At wall finish"),
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == RoomArea::default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2005,6 +2556,9 @@ pub struct Model {
     /// Last synchronized rows for locally edited products; opening compares all three versions before writing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogue_pending_edits: BTreeMap<Guid, Vec<String>>,
+    /// Where room areas are measured: at the walls' centre lines, or at their finish faces.
+    #[serde(default, skip_serializing_if = "RoomArea::is_default")]
+    pub room_area: RoomArea,
     pub next_id: Id,
     pub types: Types,
     /// What layers are made of, by name.
@@ -2048,11 +2602,14 @@ pub struct Model {
     /// ([`Model::line_weights`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_weights: Option<crate::pen::LineWeights>,
+    /// What technical standard (NBR, ISO, ANSI, EU, JIS) drawing conventions follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard: Option<crate::standards::TechnicalStandard>,
     /// The pens each model category draws in, cut and in projection (Manage > Object Styles), by category: only those it
     /// has set apart from what a project starts with ([`Model::object_style`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub object_styles: BTreeMap<String, crate::styles::ObjectStyle>,
-    /// Its line patterns, by name: dashes, dots and spaces, mm on paper.
+    /// Its line patterns, by name: graphic segments along a centerline, mm on paper.
     #[serde(default = "lines::default_patterns")]
     pub line_patterns: BTreeMap<String, LinePattern>,
     /// Its line styles, by name: a pen, a colour and a pattern, what detail lines draw in.
@@ -2064,9 +2621,27 @@ pub struct Model {
     /// Its filled region types, by name: a foreground and a background pattern and their colours, masking or not.
     #[serde(default = "fills::default_region_types")]
     pub region_types: BTreeMap<String, FilledRegionType>,
+    /// Its text types, by name: the font, size and lettering of the notes of each.
+    #[serde(default = "crate::text::default_types")]
+    pub text_types: BTreeMap<String, crate::text::TextType>,
+    /// Its dimension types, by name: how the dimensions of each draw and letter their numbers.
+    #[serde(default = "crate::dims::types")]
+    pub dimension_types: BTreeMap<String, crate::dims::DimensionType>,
     /// Its detail group types, by name: the members each one placed draws.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub detail_groups: BTreeMap<String, crate::groups::GroupType>,
+    /// Its reinforcement presets, by name: the parameters `reinforce` takes for a kind of host, kept to arm others alike.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reinforcement: BTreeMap<String, crate::reinforce::Preset>,
+    /// Its electrical voltages, by name, each with the band a device may read within.
+    #[serde(default = "crate::electrical::voltages")]
+    pub voltages: BTreeMap<String, crate::electrical::Voltage>,
+    /// Its distribution systems, by name: phases, wires and the voltages each supplies.
+    #[serde(default = "crate::electrical::distribution_systems")]
+    pub distribution_systems: BTreeMap<String, crate::electrical::DistributionSystem>,
+    /// Its wire types, by name: material, insulation, temperature and the ampacity of each section, mm².
+    #[serde(default = "crate::electrical::wire_types")]
+    pub wire_types: BTreeMap<String, crate::electrical::WireType>,
     pub elements: Elements,
     /// The ids and GUIDs of the library: its types, materials, pictures, families, parameters, view filters and
     /// templates, phases, phase filters and design options.
@@ -2079,6 +2654,33 @@ pub struct Model {
 }
 
 impl Model {
+    /// What technical standard (NBR, ISO, ANSI, EU, JIS) drawing conventions follow: the project's own, else ISO. A project made
+    /// before standards existed has none, and its sheets are not changed by guessing one from its language or units.
+    pub fn standard(&self) -> crate::standards::TechnicalStandard {
+        self.standard.unwrap_or(crate::standards::TechnicalStandard::Iso)
+    }
+
+    /// Adapt the project to `std`: sets the technical standard and optionally updates line weights,
+    /// object styles, and units to standard defaults.
+    pub fn apply_standard(&mut self, std: crate::standards::TechnicalStandard, line_weights: bool, object_styles: bool, units: bool) {
+        self.standard = Some(std);
+        if units {
+            if std == crate::standards::TechnicalStandard::Ansi && !self.units.imperial() {
+                self.units = Units::FeetInches;
+            } else if std != crate::standards::TechnicalStandard::Ansi && self.units.imperial() {
+                self.units = std.default_units();
+            }
+        }
+        if line_weights {
+            self.line_weights = Some(std.line_weights(self.units));
+        }
+        if object_styles {
+            for (cat, style) in std.object_styles() {
+                self.object_styles.insert(cat.to_string(), style);
+            }
+        }
+    }
+
     /// What its pens draw on paper: its own line weights, or those a project in its units starts with.
     pub fn line_weights(&self) -> std::borrow::Cow<'_, crate::pen::LineWeights> {
         match &self.line_weights {
@@ -2094,6 +2696,10 @@ impl Model {
 
     /// An empty project in `language`: its two levels named in it.
     pub fn new_in(name: &str, language: Language) -> Model {
+        let standard = match language {
+            Language::Portuguese => Some(crate::standards::TechnicalStandard::Nbr),
+            _ => None,
+        };
         let mut m = Model {
             format: FORMAT,
             name: name.into(),
@@ -2105,6 +2711,7 @@ impl Model {
             catalogue_retired: BTreeSet::new(),
             catalogue_unexported: BTreeSet::new(),
             catalogue_pending_edits: BTreeMap::new(),
+            room_area: RoomArea::default(),
             next_id: FIRST_ID,
             types: Types::default(),
             materials: BTreeMap::new(),
@@ -2120,12 +2727,19 @@ impl Model {
             phase_overrides: phasing::overrides(),
             option_sets: BTreeMap::new(),
             line_weights: None,
+            standard,
             object_styles: BTreeMap::new(),
             line_patterns: lines::patterns(language),
             line_styles: lines::styles(language),
             fill_patterns: fills::patterns(language),
             region_types: fills::region_types(language),
+            text_types: crate::text::types(language),
+            dimension_types: crate::dims::types(),
             detail_groups: BTreeMap::new(),
+            reinforcement: BTreeMap::new(),
+            voltages: crate::electrical::voltages(),
+            distribution_systems: crate::electrical::distribution_systems(),
+            wire_types: crate::electrical::wire_types(),
             elements: Elements::new(),
             library: crate::library::Library::default(),
             loaded: BTreeMap::new(),
@@ -2151,7 +2765,9 @@ impl Model {
             (msg!("Copper"), [184, 115, 51], Pattern::Solid, Pattern::None, Some(Kind::Metal)),
         ] {
             let texture = texture.map(Texture::new);
-            m.materials.insert(language.word(name).into(), Material { color, cut, surface, texture, ..Material::default() });
+            // Glass is the one that lets the building behind it show.
+            let transparency = if name == "Glass" { GLASS_TRANSPARENCY } else { 0 };
+            m.materials.insert(language.word(name).into(), Material { color, cut, surface, texture, transparency, ..Material::default() });
         }
         m.families = crate::family::library(language);
         for (n, t) in [("Generic - 200mm", 200.0), ("Interior - 100mm", 100.0)] {
@@ -2173,10 +2789,10 @@ impl Model {
         m.types.wall.insert("Exterior - 300mm".into(), WallType { thickness: 300.0, layers });
         m.types.floor.insert("Generic - 200mm".into(), FloorType { thickness: 200.0, layers: Vec::new() });
         for (n, w) in [("Single 900 x 2100", 900.0), ("Single 800 x 2100", 800.0)] {
-            m.types.door.insert(n.into(), OpeningType { width: w, height: 2100.0, sill: 0.0 });
+            m.types.door.insert(n.into(), OpeningType { width: w, height: 2100.0, sill: 0.0, operation: None });
         }
         for (n, w, h, s) in [("Fixed 1200 x 1500", 1200.0, 1500.0, 900.0), ("Fixed 600 x 900", 600.0, 900.0, 1100.0)] {
-            m.types.window.insert(n.into(), OpeningType { width: w, height: h, sill: s });
+            m.types.window.insert(n.into(), OpeningType { width: w, height: h, sill: s, operation: None });
         }
         m.types.column.insert("Rectangular 400 x 400".into(), ColumnType { width: 400.0, depth: 400.0, round: false });
         m.types.column.insert("Round 300".into(), ColumnType { width: 300.0, depth: 300.0, round: true });
@@ -2238,6 +2854,26 @@ impl Model {
             [("Cat6", run(6.0, 6.0, true, "PVC")), ("Cat6A", run(7.5, 7.5, true, "PVC")), ("Optical 3", run(3.0, 3.0, true, "PVC"))];
         m.types.runs.insert("cable".into(), cables.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
         m.types.runs.insert("wire".into(), wires.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
+        // The electrical's: PVC and steel conduits (eletrodutos), perforated trays (eletrocalhas) and wires, by their outside size.
+        let conduits = [
+            ("PVC 20", run(20.0, 20.0, true, "PVC")),
+            ("PVC 25", run(25.0, 25.0, true, "PVC")),
+            ("PVC 32", run(32.0, 32.0, true, "PVC")),
+            ("Steel 25", run(25.0, 25.0, true, "Metal")),
+        ];
+        m.types.runs.insert("conduit".into(), conduits.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
+        let trays = [
+            ("Perforated 100 x 50", run(100.0, 50.0, false, "Metal")),
+            ("Perforated 200 x 50", run(200.0, 50.0, false, "Metal")),
+            ("Perforated 300 x 100", run(300.0, 100.0, false, "Metal")),
+        ];
+        m.types.runs.insert("cabletray".into(), trays.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
+        let ducts = [
+            ("Rectangular 400 x 300", run(400.0, 300.0, false, "Metal")),
+            ("Rectangular 600 x 400", run(600.0, 400.0, false, "Metal")),
+            ("Round 300", run(300.0, 300.0, true, "Metal")),
+        ];
+        m.types.runs.insert("duct".into(), ducts.into_iter().map(|(n, t)| (n.to_string(), t)).collect());
         m.types.roof.insert("Generic - 300mm".into(), RoofType { thickness: 300.0, layers: Vec::new() });
         m.types.ceiling.insert("Generic - 20mm".into(), CeilingType { thickness: 20.0, grid: 0.0, layers: Vec::new() });
         m.types.ceiling.insert("Tile 600 x 600".into(), CeilingType { thickness: 20.0, grid: 600.0, layers: Vec::new() });
@@ -2551,6 +3187,19 @@ impl Model {
             Element::Wire(c) => c.devices.iter().position(|d| *d == g).map(|k| format!("{}.{}", c.system, k + 1)),
             _ => None,
         })
+    }
+
+    /// Component `c`'s plan marks in the model: its family's symbols in its own axes, mirrored if it is, turned and moved to
+    /// where it stands. A label is lettered upright in the family's axes, so it turns (and mirrors) with the component.
+    pub fn component_marks(&self, c: &Component) -> Vec<crate::family::Mark> {
+        let Some(f) = self.families.get(&c.family) else { return Vec::new() };
+        if f.symbols.is_empty() {
+            return Vec::new();
+        }
+        let Ok(marks) = f.values(&c.type_name, &c.params).and_then(|v| f.marks(&v)) else { return Vec::new() };
+        let (sin, cos) = c.angle.to_radians().sin_cos();
+        let flip = if c.mirrored { -1.0 } else { 1.0 };
+        marks.iter().map(|k| k.map(|q| P2(c.at.0 + q.0 * cos - flip * q.1 * sin, c.at.1 + q.0 * sin + flip * q.1 * cos))).collect()
     }
 
     /// Component `c`'s solids in the model: its own, turned and moved to where it stands.
@@ -2940,7 +3589,63 @@ impl Model {
         // Older readers must not drop the mode and change a detached sloped carrier's shape.
         // 19 to 20: absent connection surfaces/sides retain fixed-point connections.
         // Older readers must not discard a free-contact policy and regenerate legacy legs.
+        // A material's `transparency` (added within 8) has no step: a file without it reads as opaque, as it was.
+        // 7 to 8: a note's size is its text type's. A note of a size gets a type of it.
+        self.typed_notes();
+        // 8 to 9: freely ordered graphic line segments; existing dash/space/dot patterns need no conversion.
+        // 9 to 10: a dimension may measure to a line's end (`point`) and run horizontal or vertical (`linear`), and has a
+        // dimension type; one of 10 read by 9 would measure its points as lines. A dimension of 9 gets its kind's type.
+        self.typed_dimensions();
+        // 10 to 11 (Swedish, Czech and French as a project's language) has no step: a file of 10 holds none of them.
+        // 11 to 12 (German and Dutch as a project's language, a wall that bounds no rooms, a family's connectors) has no step either: a
+        // file of 11 holds none. The electrical settings (voltages, distribution systems, wire types) have none within 11 or 12: a file
+        // without them reads with the starter set, and one that has them is read by an older version with them left out.
         self.format = FORMAT;
+    }
+
+    /// Each dimension from before dimension types given the one its kind starts in.
+    fn typed_dimensions(&mut self) {
+        let types = &self.dimension_types;
+        let type_one = |d: &mut Dimension| {
+            if d.type_name.is_empty() {
+                d.type_name = crate::dims::default_type(types, d.kind).cloned().unwrap_or_default();
+            }
+        };
+        for e in self.elements.values_mut() {
+            if let Element::Dimension(d) = e {
+                type_one(d);
+            }
+        }
+        for g in self.detail_groups.values_mut() {
+            for member in &mut g.members {
+                if let Element::Dimension(d) = &mut member.element {
+                    type_one(d);
+                }
+            }
+        }
+    }
+
+    /// Each note from before text types (a `size`, or no type) given a text type of its size.
+    fn typed_notes(&mut self) {
+        let mut types = std::mem::take(&mut self.text_types);
+        let mut type_one = |n: &mut Note| {
+            if n.size.is_some() || n.type_name.is_empty() {
+                n.type_name = crate::text::type_for_size(&mut types, n.size.take().unwrap_or(NOTE_SIZE));
+            }
+        };
+        for e in self.elements.values_mut() {
+            if let Element::Text(n) = e {
+                type_one(n);
+            }
+        }
+        for g in self.detail_groups.values_mut() {
+            for member in &mut g.members {
+                if let Element::Text(n) = &mut member.element {
+                    type_one(n);
+                }
+            }
+        }
+        self.text_types = types;
     }
 
     /// What points at an element by its id (as a command gives a reference, or a file from before GUIDs held it) points at
@@ -3218,10 +3923,33 @@ impl Model {
         self.spans(w, self.plan_range(level).cut)
     }
 
-    /// Whether the wall bounds the rooms of `level`: it spans the height rooms are found at,
-    /// [`CUT_HEIGHT`] above the level, whatever the level's plan cuts at.
+    /// Whether the wall bounds the rooms of `level`: it spans the height rooms are found at, the level's Computation Height
+    /// ([`CUT_HEIGHT`] unless set) above it, whatever the level's plan cuts at.
     pub fn bounding(&self, w: &Wall, level: impl Key) -> bool {
-        self.spans(w, self.elevation(level) + CUT_HEIGHT)
+        let up = self.level(level).map_or(CUT_HEIGHT, |l| l.computation_height);
+        self.spans(w, self.elevation(level) + up)
+    }
+
+    /// Whether the wall bounds the rooms of `level`: [`Model::bounding`], and its Room Bounding on.
+    pub fn room_bounding(&self, w: &Wall, level: impl Key) -> bool {
+        w.room_bounding && self.bounding(w, level)
+    }
+
+    /// The outlines of the columns (and structural columns) that bound the rooms of `level`: Room Bounding on, standing at
+    /// the level's Computation Height.
+    pub fn bounding_columns(&self, level: impl Key) -> Vec<Vec<P2>> {
+        let z = self.elevation(level) + self.level(level).map_or(CUT_HEIGHT, |l| l.computation_height);
+        self.elements
+            .values()
+            .filter(|e| {
+                matches!(e, Element::Column(c) | Element::StructuralColumn(c) if c.room_bounding && {
+                    let (bottom, top) = self.span(c.level, c.base_offset, c.top_level, c.height);
+                    bottom <= z && z < top
+                })
+            })
+            .map(|e| self.column_outline(e))
+            .filter(|o| o.len() >= 3)
+            .collect()
     }
 
     /// Whether the wall spans height `z`.
@@ -3371,6 +4099,8 @@ impl Model {
         }
         match crate::commands::category(category).as_str() {
             "region" => names(&self.region_types),
+            "text" => names(&self.text_types),
+            "dimension" => names(&self.dimension_types),
             "wall" => names(&self.types.wall),
             "floor" => names(&self.types.floor),
             "door" => names(&self.types.door),
@@ -3396,6 +4126,8 @@ impl Model {
         }
         let preferred = match crate::commands::category(category).as_str() {
             "region" => return fills::default_region_type(&self.region_types, self.language).map(String::as_str),
+            "text" => return crate::text::default_type(&self.text_types).map(String::as_str),
+            "dimension" => return crate::dims::default_type(&self.dimension_types, DimKind::Aligned).map(String::as_str),
             "wall" | "floor" => "Generic - 200mm",
             "door" => "Single 900 x 2100",
             "column" => "Rectangular 400 x 400",
@@ -3408,6 +4140,9 @@ impl Model {
             "stripfooting" => "Strip 600 x 300",
             "pipe" => "PVC 50",
             "cablecarrier" => "PVC 25",
+            "duct" => "Rectangular 400 x 300",
+            "conduit" => "PVC 25",
+            "cabletray" => "Perforated 100 x 50",
             "wire" => "Wire 2.5",
             "downconductor" => "Steel 8",
             "groundconductor" => "Copper 9",
@@ -3467,6 +4202,7 @@ impl Model {
             width: need(crate::family::WIDTH)?,
             height: need(crate::family::HEIGHT)?,
             sill: number(crate::family::SILL).unwrap_or(if is_door { 0.0 } else { 900.0 }),
+            operation: f.operation,
         })
     }
 
@@ -3486,11 +4222,11 @@ impl Model {
     /// A door's or window's family's solids and the lines its plan draws, in the family's own axes, turned out with
     /// the opening's flips as mirror images (its hinge on the other jamb, its swing to the wall's other side);
     /// none for one that isn't of a family, or doesn't build.
-    pub fn opening_local(&self, e: &Element) -> Option<(Vec<Piece>, Vec<Vec<P2>>)> {
+    pub fn opening_local(&self, e: &Element) -> Option<(Vec<Piece>, Vec<crate::family::Mark>)> {
         let (Element::Door(o) | Element::Window(o)) = e else { return None };
         let f = self.families.get(o.family.as_ref()?)?;
         let values = f.values_in(&o.type_name, &o.params, self.thickness(self.wall(o.host)?)).ok()?;
-        let (pieces, strokes) = (f.pieces(&values).ok()?, f.strokes(&values).ok()?);
+        let (pieces, marks) = (f.pieces(&values).ok()?, f.marks(&values).ok()?);
         let (fx, fy) = (if o.flip_hand { -1.0 } else { 1.0 }, if o.flip_facing { -1.0 } else { 1.0 });
         let mirrored = fx * fy < 0.0;
         let flip = |p: [f64; 3]| [fx * p[0] + 0.0, fy * p[1] + 0.0, p[2]];
@@ -3503,8 +4239,8 @@ impl Model {
                 Piece { tris: tris.collect(), outline: if mirrored { outline.into_iter().rev().collect() } else { outline }, ..pc }
             })
             .collect();
-        let strokes = strokes.into_iter().map(|l| l.into_iter().map(|q| P2(fx * q.0 + 0.0, fy * q.1 + 0.0)).collect()).collect();
-        Some((pieces, strokes))
+        let marks = marks.iter().map(|k| k.map(|q| P2(fx * q.0 + 0.0, fy * q.1 + 0.0))).collect();
+        Some((pieces, marks))
     }
 
     /// A door's or window's family's solids where it stands, in the model's own axes: each form's triangles, its
@@ -3528,11 +4264,11 @@ impl Model {
             .collect()
     }
 
-    /// The lines a door's or window's family draws in plan, where it stands.
-    pub fn opening_strokes(&self, e: &Element) -> Vec<Vec<P2>> {
+    /// The marks a door's or window's family draws in plan, where it stands.
+    pub fn opening_marks(&self, e: &Element) -> Vec<crate::family::Mark> {
         let (Element::Door(o) | Element::Window(o)) = e else { return Vec::new() };
-        let (Some((_, strokes)), Some((at, u, _))) = (self.opening_local(e), self.opening_frame(o)) else { return Vec::new() };
-        strokes.into_iter().map(|l| l.into_iter().map(|q| at + u * q.0 + u.perp() * q.1).collect()).collect()
+        let (Some((_, marks)), Some((at, u, _))) = (self.opening_local(e), self.opening_frame(o)) else { return Vec::new() };
+        marks.iter().map(|k| k.map(|q| at + u * q.0 + u.perp() * q.1)).collect()
     }
 
     /// The level an element stands on: a door's or window's is its wall's, a tag's its door's or
@@ -3549,6 +4285,7 @@ impl Model {
             Element::Mass(ms) => Some(ms.level),
             Element::Room(r) => Some(r.level),
             Element::RoomSeparator(rs) => Some(rs.level),
+            Element::Rebar(rb) => Some(rb.level),
             Element::Dimension(d) => Some(d.level),
             Element::Column(c) | Element::StructuralColumn(c) | Element::Footing(c) => Some(c.level),
             run_arm!(r) => Some(r.level),
@@ -4218,6 +4955,13 @@ impl Model {
         self.elements.iter().find_map(|(id, e)| matches!(e, Element::View3D(v) if v.name == "{3D}").then_some(*id))
     }
 
+    /// The level a point at height `z` stands on: the highest level at or below it, else the lowest. A camera stands on the
+    /// plan of that level.
+    pub fn camera_level(&self, z: f64) -> Option<Id> {
+        let levels = self.levels();
+        levels.iter().rev().find(|(_, l)| l.elevation <= z + TOL).or_else(|| levels.first()).map(|(id, _)| *id)
+    }
+
     /// The name of view `id`: a level's plan, a section, an elevation, a schedule or a 3D view;
     /// none for another element.
     pub fn view_name(&self, id: impl Key) -> Option<&str> {
@@ -4408,6 +5152,86 @@ impl Model {
         }
     }
 
+    /// The point a reference names: the end of its line it holds (`point`). A wall's centre line ends where its location
+    /// line does, and a face where the wall's outline turns off it (a corner, mitred where walls join); a curved wall's
+    /// faces are arcs, ending square to its ends; a detail line of any shape ends where it does.
+    pub fn reference_point(&self, r: &Reference) -> Result<P2, String> {
+        let Some(end) = r.point else { return Err(format!("{} {} is measured to as a line", self.cat(r.id), self.shown(r.id))) };
+        let pick = |(a, b): Line| if end == End::Start { a } else { b };
+        match (self.elements.get(r.id), r.face) {
+            (Some(Element::Wall(w)), face @ (Face::Centre | Face::Left | Face::Right)) => {
+                let axis = walls::Axis::of(w);
+                let (ext, int) = walls::faces(self, w);
+                let off = match face {
+                    Face::Left => ext,
+                    Face::Right => int,
+                    _ => (ext + int) / 2.0,
+                };
+                if face == Face::Centre || axis.radius().is_some() {
+                    return Ok(pick((axis.at(0.0, off), axis.at(axis.length(), off))));
+                }
+                let (a, b) = self.reference_line(&Reference::line(r.id, face))?;
+                let u = (b - a).unit();
+                let on: Vec<f64> = walls::outline(self, self.elements.id(r.id).unwrap_or_default())
+                    .iter()
+                    .filter(|p| (**p - a).cross(u).abs() <= 1e-6)
+                    .map(|p| (*p - a).dot(u))
+                    .collect();
+                let (lo, hi) = (on.iter().copied().fold(f64::INFINITY, f64::min), on.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                if !(lo.is_finite() && hi.is_finite()) {
+                    return Ok(pick((a, b)));
+                }
+                Ok(pick((a + u * lo, a + u * hi)))
+            }
+            (Some(Element::DetailLine(l)), Face::Centre) => Ok(pick((l.curve.start(), l.curve.end()))),
+            _ => self.reference_line(&Reference::line(r.id, r.face)).map(pick),
+        }
+    }
+
+    /// What a dimension measures to on `r`: its line, or, for a point, a line of no length there.
+    pub fn reference_geometry(&self, r: &Reference) -> Result<Line, String> {
+        match r.point {
+            Some(_) => self.reference_point(r).map(|p| (p, p)),
+            None => self.reference_line(r),
+        }
+    }
+
+    /// The points dimensions measure to on element `id`: both ends of each of its reference lines (and of a detail
+    /// line of any shape).
+    pub fn reference_points(&self, id: impl Key) -> Vec<(Reference, P2)> {
+        let id = self.guid(id);
+        let faces: &[Face] = match self.elements.get(id) {
+            Some(Element::Wall(_)) => &[Face::Centre, Face::Left, Face::Right],
+            Some(Element::Door(_) | Element::Window(_)) => &[Face::Centre, Face::Start, Face::End],
+            Some(Element::Grid(_) | Element::DetailLine(_)) => &[Face::Centre],
+            _ => &[],
+        };
+        faces
+            .iter()
+            .flat_map(|&face| [End::Start, End::End].map(|point| Reference { id, face, point: Some(point) }))
+            .filter_map(|r| Some((r, self.reference_point(&r).ok()?)))
+            .collect()
+    }
+
+    /// Of element `id`'s reference points, the one nearest `p`, and how far it is.
+    pub fn endpoint_at(&self, id: impl Key, p: P2) -> Option<(Reference, f64)> {
+        self.reference_points(id).into_iter().map(|(r, q)| (r, q.dist(p))).min_by(|x, y| x.1.total_cmp(&y.1))
+    }
+
+    /// The way an aligned or linear dimension measures, a unit vector: a linear one's `orient`; else square to its first
+    /// line, or with only points, from its first point toward the next elsewhere. None while its points are in one place.
+    pub fn measured_along(&self, d: &Dimension) -> Option<P2> {
+        if let Some(o) = d.orient {
+            return Some(o.along());
+        }
+        let geo: Vec<Line> = d.refs.iter().filter_map(|r| self.reference_geometry(r).ok()).collect();
+        if let Some((a, b)) = geo.iter().find(|(a, b)| a.dist(*b) > 1e-9) {
+            return Some((*b - *a).unit().perp());
+        }
+        let first = geo.first()?.0;
+        geo.iter().map(|g| g.0).find(|p| p.dist(first) > 1e-6).map(|p| (p - first).unit())
+    }
+
     /// The lines dimensions measure to on element `id`: a wall's centre line, faces and ends, a
     /// door's or a window's centre and jambs, a grid's line.
     pub fn reference_lines(&self, id: impl Key) -> Vec<(Reference, Line)> {
@@ -4422,7 +5246,7 @@ impl Model {
         faces
             .iter()
             .filter_map(|&face| {
-                let r = Reference { id, face };
+                let r = Reference::line(id, face);
                 Some((r, self.reference_line(&r).ok()?))
             })
             .collect()
@@ -4445,11 +5269,11 @@ impl Model {
             .elements
             .with_guids()
             .filter_map(|(_, id, e)| match e {
-                Element::Grid(g) => Some((Reference { id, face: Face::Centre }, (g.start, g.end))),
+                Element::Grid(g) => Some((Reference::line(id, Face::Centre), (g.start, g.end))),
                 Element::Wall(w) if w.arc == 0.0 && self.cut_by(w, level) => {
                     let (axis, (ext, int)) = (walls::Axis::of(w), walls::faces(self, w));
                     let mid = (ext + int) / 2.0;
-                    Some((Reference { id, face: Face::Centre }, (axis.at(0.0, mid), axis.at(axis.length(), mid))))
+                    Some((Reference::line(id, Face::Centre), (axis.at(0.0, mid), axis.at(axis.length(), mid))))
                 }
                 _ => None,
             })
@@ -4544,6 +5368,63 @@ impl Model {
         }
     }
 
+    /// The arc an arc length dimension measures along on `r`: its centre, its radius, the angle its start lies at from the
+    /// centre and how far it sweeps (radians, counter-clockwise positive). A curved wall's centre line or one of its faces,
+    /// or a detail line that is an arc.
+    pub fn reference_sweep(&self, r: &Reference) -> Result<(P2, f64, f64, f64), String> {
+        let what = "an arc length dimension measures along curved walls and arcs";
+        match self.elements.get(r.id) {
+            Some(Element::Wall(w)) => {
+                let axis = walls::Axis::of(w);
+                let Some((c, radius, a0, sweep)) = axis.arc() else { return Err(format!("wall {} is straight; {what}", r.id)) };
+                let (ext, int) = walls::faces(self, w);
+                let off = match r.face {
+                    Face::Left => ext,
+                    Face::Right => int,
+                    Face::Centre => (ext + int) / 2.0,
+                    Face::Start | Face::End => return Err(format!("wall {}'s ends are straight; {what}", r.id)),
+                };
+                Ok((c, radius - sweep.signum() * off, a0, sweep))
+            }
+            Some(Element::DetailLine(l)) => match &l.curve {
+                crate::curves::Curve::Circle { .. } => Err(format!("detail line {} is a circle, which has no ends; {what}", r.id)),
+                c => c
+                    .segments()
+                    .first()
+                    .filter(|_| c.kind() == "arc")
+                    .and_then(walls::Axis::arc)
+                    .ok_or_else(|| format!("detail line {} is a {}; {what}", r.id, c.kind())),
+            },
+            Some(e) => Err(format!("{} {} isn't curved; {what}", e.category(), r.id)),
+            None => Err(format!("element {} doesn't exist", r.id)),
+        }
+    }
+
+    /// What an arc length dimension measures along: its arc ([`Model::reference_sweep`]), all of it, or with two points
+    /// after it, from one to the other along it (either order). An error when a point isn't on the arc.
+    pub fn arc_span(&self, d: &Dimension) -> Result<(P2, f64, f64, f64), String> {
+        let Some(arc) = d.refs.first() else { return Err("an arc length dimension measures along an arc".into()) };
+        let (c, radius, a0, sweep) = self.reference_sweep(arc)?;
+        let points = &d.refs[1..];
+        if points.is_empty() {
+            return Ok((c, radius, a0, sweep));
+        }
+        let [p, q] = points else { return Err("an arc length dimension measures between two points on its arc, or all of it".into()) };
+        let along = |r: &Reference| -> Result<f64, String> {
+            let p = self.reference_point(r)?;
+            let what = format!("{} {}'s {}", self.cat(r.id), self.shown(r.id), if r.point == Some(End::Start) { "start" } else { "end" });
+            // How far round from the arc's start, the way it sweeps; on it, give or take a millimetre.
+            let t = (sweep.signum() * ((p.1 - c.1).atan2(p.0 - c.0) - a0)).rem_euclid(TAU);
+            let t = if t > sweep.abs() && TAU - t < 1.0 / radius.max(1.0) { 0.0 } else { t };
+            if (p.dist(c) - radius).abs() > TOL || t > sweep.abs() + 1.0 / radius.max(1.0) {
+                return Err(format!("{what} isn't on the arc it measures along"));
+            }
+            Ok(t.min(sweep.abs()))
+        };
+        let (s, e) = (along(p)?, along(q)?);
+        Ok((c, radius, a0 + sweep.signum() * s.min(e), sweep.signum() * (s - e).abs()))
+    }
+
     /// An angular dimension's arc: where its two lines meet, the angle (radians, counter-clockwise
     /// from east) of the ray it starts on, and how far it sweeps counter-clockwise to the other:
     /// the one of the four angles the lines make that holds `at`.
@@ -4574,26 +5455,100 @@ impl Model {
     /// when it runs north and south. Then where its references cross it, in order that way: how
     /// far from `at`, and the reference's line.
     pub fn crossings(&self, d: &Dimension) -> (P2, Vec<(f64, Line)>) {
-        let lines: Vec<Line> = d.refs.iter().filter_map(|r| self.reference_line(r).ok()).collect();
-        let Some(&(a, b)) = lines.first() else { return (P2(0.0, 0.0), Vec::new()) };
-        let n = (b - a).unit().perp();
+        let (n, stations) = self.stations(d);
+        (n, stations.into_iter().map(|(s, l, _)| (s, l)).collect())
+    }
+
+    /// [`Model::crossings`], each with the reference it is of.
+    pub fn stations(&self, d: &Dimension) -> (P2, Vec<(f64, Line, Reference)>) {
+        let lines: Vec<(Line, Reference)> = d.refs.iter().filter_map(|r| Some((self.reference_geometry(r).ok()?, *r))).collect();
+        let Some(n) = self.measured_along(d) else { return (P2(0.0, 0.0), Vec::new()) };
         let n = if n.0 < -1e-9 || (n.0.abs() <= 1e-9 && n.1 < 0.0) { n * -1.0 } else { n };
-        let mut v: Vec<(f64, Line)> = lines
+        let mut v: Vec<(f64, Line, Reference)> = lines
             .into_iter()
-            .map(|(a, b)| {
-                let c = geom::line_intersection(d.at, d.at + n, a, b).unwrap_or(a);
-                ((c - d.at).dot(n), (a, b))
+            .map(|((a, b), r)| {
+                // A point is where it stands along the line; a line, where the dimension line crosses it.
+                let c = if a.dist(b) <= 1e-9 { a } else { geom::line_intersection(d.at, d.at + n, a, b).unwrap_or(a) };
+                ((c - d.at).dot(n), (a, b), r)
             })
             .collect();
         v.sort_by(|x, y| x.0.total_cmp(&y.0));
         (n, v)
     }
 
+    /// The type dimension `d` draws in: its own, else (a type deleted while a command runs) one as a project starts with.
+    pub fn dimension_type(&self, d: &Dimension) -> crate::dims::DimensionType {
+        self.dimension_types.get(&d.type_name).cloned().unwrap_or_default()
+    }
+
+    /// What a dimension's numbers read, as its type and its own text say: each segment's length (a baseline string's
+    /// from its first reference; an ordinate's, each witness line's, the first 0), an angle in degrees, a radius or a
+    /// diameter after its type's symbol, an arc's length. Its prefix and suffix round each; its replacement stands for
+    /// each; with equality, a string of more than one segment shows its type's equality text.
+    pub fn dimension_labels(&self, d: &Dimension) -> Vec<String> {
+        let t = self.dimension_type(d);
+        let values = self.dimension_values(d);
+        let length = |x: f64| t.length(self.units, x);
+        let shown: Vec<String> = match d.kind {
+            DimKind::Aligned | DimKind::Linear => {
+                let sums = values.iter().scan(0.0, |sum, v| {
+                    *sum += v;
+                    Some(*sum)
+                });
+                match t.string {
+                    crate::dims::DimString::Continuous => values.iter().map(|&v| length(v)).collect(),
+                    crate::dims::DimString::Baseline => sums.map(length).collect(),
+                    crate::dims::DimString::Ordinate => std::iter::once(0.0).chain(sums).map(length).collect(),
+                }
+            }
+            DimKind::Angular => values.iter().map(|v| format!("{}°", (v * 100.0).round() / 100.0 + 0.0)).collect(),
+            DimKind::Radial => values.iter().map(|&v| format!("{} {}", t.radius_symbol, length(v)).trim().to_string()).collect(),
+            DimKind::Diameter => values.iter().map(|&v| format!("{} {}", t.diameter_symbol, length(v)).trim().to_string()).collect(),
+            DimKind::ArcLength => values.iter().map(|&v| length(v)).collect(),
+        };
+        let equal = d.equality && values.len() > 1 && t.string == crate::dims::DimString::Continuous;
+        shown
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| match d.text(i, "replace") {
+                _ if equal => t.equality_text.clone(),
+                r if !r.is_empty() => r.to_string(),
+                _ => format!("{}{v}{}", d.text(i, "prefix"), d.text(i, "suffix")),
+            })
+            .collect()
+    }
+
+    /// What number `i` of dimension `d` has over and under it.
+    pub fn dimension_extra(&self, d: &Dimension, i: usize) -> (String, String) {
+        (d.text(i, "above").to_string(), d.text(i, "below").to_string())
+    }
+
+    /// Which of dimension `d`'s numbers (as [`Model::dimension_labels`] counts them) is over point `p`: an aligned or a
+    /// linear one's segment `p` lies across (an ordinate's witness line nearest it), else its only one.
+    pub fn dimension_segment_at(&self, d: &Dimension, p: P2) -> usize {
+        if !matches!(d.kind, DimKind::Aligned | DimKind::Linear) {
+            return 0;
+        }
+        let (n, cross) = self.crossings(d);
+        let s = (p - d.at).dot(n);
+        let ss: Vec<f64> = cross.iter().map(|c| c.0).collect();
+        let last = ss.len().saturating_sub(2);
+        match self.dimension_type(d).string {
+            crate::dims::DimString::Ordinate => {
+                ss.iter().enumerate().min_by(|a, b| (a.1 - s).abs().total_cmp(&(b.1 - s).abs())).map_or(0, |(i, _)| i)
+            }
+            // The segment it is over: a baseline's lines are told by where each ends, the first end past the point.
+            crate::dims::DimString::Baseline | crate::dims::DimString::Continuous => {
+                ss.iter().skip(1).position(|&e| s <= e).unwrap_or(last).min(last)
+            }
+        }
+    }
+
     /// What a dimension shows: an aligned one's lengths, segment by segment (west to east, or
     /// south to north); an angular one's angle, in degrees; a radial one's radius.
     pub fn dimension_values(&self, d: &Dimension) -> Vec<f64> {
         match d.kind {
-            DimKind::Aligned => self
+            DimKind::Aligned | DimKind::Linear => self
                 .crossings(d)
                 .1
                 .windows(2)
@@ -4604,6 +5559,8 @@ impl Model {
                 .collect(),
             DimKind::Angular => self.angle_sector(d).map(|(_, _, sweep)| sweep.to_degrees()).into_iter().collect(),
             DimKind::Radial => d.refs.first().and_then(|r| self.reference_arc(r).ok()).map(|(_, r)| r).into_iter().collect(),
+            DimKind::Diameter => d.refs.first().and_then(|r| self.reference_arc(r).ok()).map(|(_, r)| 2.0 * r).into_iter().collect(),
+            DimKind::ArcLength => self.arc_span(d).ok().map(|(_, r, _, t)| r * t.abs()).into_iter().collect(),
         }
     }
 
@@ -4630,21 +5587,33 @@ impl Model {
         }
     }
 
-    /// What bounds the rooms of `level`: the centre lines of its walls, arcs as chords, and its room separation lines.
+    /// What bounds the rooms of `level`: the centre lines of its walls, arcs as chords, and its room separation lines. A
+    /// separation line drawn to a wall's face, as one drawn on a plan usually is, runs on to the wall's centre line, so it
+    /// splits rooms measured there too.
     pub fn bounding_lines(&self, level: impl Key) -> Vec<(P2, P2)> {
-        let mut lines = self.wall_lines(level);
-        lines.extend(self.separators(level));
+        let walls = self.wall_segments(level, true);
+        let mut lines: Vec<(P2, P2)> = walls.iter().map(|&(a, b, _)| (a, b)).collect();
+        lines.extend(self.separators(level).into_iter().map(|(a, b)| (to_centre(b, a, &walls), to_centre(a, b, &walls))));
         lines
     }
 
     /// Centre lines of the walls that bound the rooms of `level`, arcs as chords.
     pub fn wall_lines(&self, level: impl Key) -> Vec<(P2, P2)> {
+        self.wall_segments(level, false).into_iter().map(|(a, b, _)| (a, b)).collect()
+    }
+
+    /// The segments of [`Model::wall_lines`], each with half its wall's thickness.
+    /// With `rooms`, of the walls whose Room Bounding is on.
+    fn wall_segments(&self, level: impl Key, rooms: bool) -> Vec<(P2, P2, f64)> {
         self.elements
             .iter()
-            .filter(|(_, e)| matches!(e, Element::Wall(w) if self.bounding(w, level)))
-            .flat_map(|(&id, _)| {
+            .filter_map(|(&id, e)| match e {
+                Element::Wall(w) if self.bounding(w, level) && (!rooms || w.room_bounding) => Some((id, self.thickness(w) / 2.0)),
+                _ => None,
+            })
+            .flat_map(|(id, half)| {
                 let line = walls::centre_line(self, id);
-                line.windows(2).filter_map(|s| s.first().zip(s.get(1)).map(|(a, b)| (*a, *b))).collect::<Vec<_>>()
+                line.windows(2).filter_map(|s| s.first().zip(s.get(1)).map(|(a, b)| (*a, *b, half))).collect::<Vec<_>>()
             })
             .collect()
     }
@@ -4670,10 +5639,121 @@ impl Model {
             .collect()
     }
 
-    /// A room's boundary, from the walls around its point. `None` when it isn't enclosed.
-    /// Areas are measured at the wall centre lines (Revit's "At wall centerline" setting).
+    /// A room's boundary, from the walls around its point, where the project measures rooms (`room_area`). `None` when it
+    /// isn't enclosed.
     pub fn room_region(&self, r: &Room) -> Option<Region> {
-        geom::region_at(&self.bounding_lines(r.level), r.point, TOL)
+        self.room_region_at(r, self.room_area)
+    }
+
+    /// A room's boundary measured at `at`: the walls' centre lines (Revit's "At wall centerline") or their faces ("At wall
+    /// finish": the area inside the walls, which Brazilian codes call área útil).
+    pub fn room_region_at(&self, r: &Room, at: RoomArea) -> Option<Region> {
+        self.room_bound(r, at).ok()
+    }
+
+    /// A room's boundary measured at `at`, or why it has none. A frozen room's is the one it keeps, found from nothing; else
+    /// the loop round its point, unless a room placed before it already has its point in that loop: two rooms can't share a
+    /// space, so the later is left unbounded, as Revit's redundant room.
+    pub fn room_bound(&self, r: &Room, at: RoomArea) -> Result<Region, Unbound> {
+        if let Some(k) = &r.kept {
+            return k.at(at).cloned().ok_or(Unbound::NotEnclosed);
+        }
+        if self.wall_holding(r, at).is_some() {
+            return Err(Unbound::NotEnclosed);
+        }
+        let g = geom::region_at(&self.room_lines(r.level, at), r.point, TOL).ok_or(Unbound::NotEnclosed)?;
+        self.room_before(r, &g).map_or(Ok(g), |id| Err(Unbound::Shared(id)))
+    }
+
+    /// The room on `r`'s level, placed before it (of a lower id; any, for a room not yet in the model), whose point lies in
+    /// `g`: the room that has the space `g` is.
+    pub fn room_before(&self, r: &Room, g: &Region) -> Option<Id> {
+        let me = self.elements.iter().find(|(_, e)| matches!(e, Element::Room(o) if std::ptr::eq(o, r))).map(|(id, _)| *id);
+        self.elements
+            .iter()
+            .take_while(|(id, _)| me.is_none_or(|m| **id < m))
+            .find(|(_, e)| matches!(e, Element::Room(o) if self.same(o.level, r.level) && region_holds(g, o.point)))
+            .map(|(id, _)| *id)
+    }
+
+    /// What a room covers in plan: its boundary's outer ring where the project measures rooms, or, unbounded, a square
+    /// [`UNBOUNDED_ROOM`] mm a side round its point, as Revit shows a room in no enclosed region. Whether it is bounded.
+    pub fn room_outline(&self, r: &Room) -> (Vec<P2>, bool) {
+        match self.room_region(r) {
+            Some(g) => (g.outer, true),
+            None => (unbounded_square(r.point), false),
+        }
+    }
+
+    /// The room-bounding wall whose body a room's point lies in, when rooms are measured at `at` the finish faces. There the
+    /// faces of a wall close its body into a loop of its own, so a point inside a wall would make a room of the wall. At the
+    /// centre lines nothing closes a wall's body, so there is nothing to refuse.
+    pub fn wall_holding(&self, r: &Room, at: RoomArea) -> Option<Id> {
+        if at != RoomArea::Finish {
+            return None;
+        }
+        self.elements
+            .iter()
+            .filter(|(_, e)| matches!(e, Element::Wall(w) if self.room_bounding(w, r.level)))
+            .find(|&(&id, _)| geom::contains(&walls::outline(self, id), r.point))
+            .map(|(&id, _)| id)
+    }
+
+    /// A room's bottom and top: its level's elevation plus its base offset, and its upper limit's (its level's, when it
+    /// has none) plus its limit offset.
+    pub fn room_span(&self, r: &Room) -> (f64, f64) {
+        (self.elevation(r.level) + r.base_offset, self.elevation(r.top_level.unwrap_or(r.level)) + r.limit_offset)
+    }
+
+    /// A room's Unbounded Height: from its bottom up to its top (`room_span`).
+    pub fn room_height(&self, r: &Room) -> f64 {
+        let (bottom, top) = self.room_span(r);
+        top - bottom
+    }
+
+    /// Frozen rooms that keep no boundary yet are given the one they have now; rooms no longer frozen let theirs go. The
+    /// engine calls it after every command, so freezing is a field like any other (`modify {frozen: true}`).
+    pub fn keep_rooms(&mut self) {
+        let changed: Vec<(Id, Option<Kept>)> = self
+            .elements
+            .iter()
+            .filter_map(|(&id, e)| match e {
+                Element::Room(r) if r.frozen && r.kept.is_none() => Some((
+                    id,
+                    Some(Kept { centre: self.room_region_at(r, RoomArea::Centre), finish: self.room_region_at(r, RoomArea::Finish) }),
+                )),
+                Element::Room(r) if !r.frozen && r.kept.is_some() => Some((id, None)),
+                _ => None,
+            })
+            .collect();
+        for (id, kept) in changed {
+            if let Some(Element::Room(r)) = self.elements.get_mut(id) {
+                r.kept = kept;
+            }
+        }
+    }
+
+    /// The lines rooms on `level` are found among, measured at `at`.
+    /// Room-bounding walls (their centre lines, or their faces) and separation lines, and the faces of room-bounding
+    /// columns either way, a column having no centre line to measure to.
+    pub fn room_lines(&self, level: impl Key, at: RoomArea) -> Vec<(P2, P2)> {
+        let mut lines = match at {
+            RoomArea::Centre => self.bounding_lines(level),
+            RoomArea::Finish => {
+                let mut lines: Vec<(P2, P2)> = self
+                    .elements
+                    .iter()
+                    .filter(|(_, e)| matches!(e, Element::Wall(w) if self.room_bounding(w, level)))
+                    .flat_map(|(&id, _)| geom::ring_edges(&walls::outline(self, id)).collect::<Vec<_>>())
+                    .collect();
+                lines.extend(self.separators(level));
+                lines
+            }
+        };
+        for o in self.bounding_columns(level) {
+            lines.extend(geom::ring_edges(&o));
+        }
+        lines
     }
 
     /// What a detail line, a filled region or a text note must be, wherever it is: in a view or in a detail group.
@@ -4681,13 +5761,21 @@ impl Model {
         match e {
             Element::Text(n) => {
                 point(who, n.at)?;
-                text(who, "text", &n.text)?;
+                let len = n.text.chars().count();
+                if len > crate::text::MAX_NOTE {
+                    return Err(format!("{who}: its text is {len} characters long; a note holds up to {}", crate::text::MAX_NOTE));
+                }
                 if n.text.trim().is_empty() {
                     return Err(format!("{who}: a text note needs text"));
                 }
-                if !(n.size > 0.0 && n.size <= 100.0) {
-                    return Err(format!("{who}: size {} mm isn't above 0 and at most 100", n.size));
+                if n.size.is_some() {
+                    return Err(format!("{who}: a note's size is its text type's; give it a `type` of that size (text_type makes one)"));
                 }
+                if !self.text_types.contains_key(&n.type_name) {
+                    let there: Vec<&str> = self.text_types.keys().map(String::as_str).collect();
+                    return Err(format!("{who}: there's no text type `{}` (there are: {})", n.type_name, there.join(", ")));
+                }
+                crate::text::check_runs(who, &n.runs, len)?;
                 coord(&format!("{who} angle"), n.angle)?;
                 if let Some(l) = n.leader {
                     point(&format!("{who} leader"), l)?;
@@ -4732,6 +5820,52 @@ impl Model {
             _ => {}
         }
         Ok(())
+    }
+
+    /// What is amiss in the model but doesn't make it wrong: soft issues, said so they can be fixed. `check` refuses a model;
+    /// these it accepts. A room the walls no longer close; a family of lighting, outlets or switches in use that holds no
+    /// connector, so its devices count as a load of zero (a family of plan symbols alone, a symbol set's, is no device).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .elements
+            .iter()
+            .filter_map(|(id, e)| match e {
+                Element::Room(r) => match self.room_bound(r, self.room_area) {
+                    Ok(_) => None,
+                    Err(Unbound::NotEnclosed) => {
+                        Some(format!("room {id} ({} {}) is not enclosed: the walls around it no longer close", r.number, r.name))
+                    }
+                    Err(Unbound::Shared(other)) => Some(format!(
+                        "room {id} ({} {}) is in the space room {} has; two rooms can't share one, so it is unbounded: delete one, \
+                         or part them with a room separation line",
+                        r.number,
+                        r.name,
+                        self.shown(other)
+                    )),
+                },
+                _ => None,
+            })
+            .collect();
+        let mut bare: BTreeMap<&str, usize> = BTreeMap::new();
+        for e in self.elements.values() {
+            if let Element::Component(c) = e
+                && let Some(f) = self.families.get(&c.family)
+                && f.category.electrical_device()
+                && f.connectors.is_empty()
+                // A family of plan symbols alone (a symbol set's) is notation, not a device that draws a load.
+                && !(f.forms.is_empty() && !f.symbols.is_empty())
+            {
+                *bare.entry(c.family.as_str()).or_default() += 1;
+            }
+        }
+        out.extend(bare.into_iter().map(|(n, k)| {
+            format!(
+                "family `{n}` has no connector, so its {k} placed device{} count{} as a load of zero: give it one with `family` `connectors`",
+                if k == 1 { "" } else { "s" },
+                if k == 1 { "s" } else { "" }
+            )
+        }));
+        out
     }
 
     /// Everything that must hold between commands: references resolve, geometry is finite and
@@ -4800,6 +5934,23 @@ impl Model {
         for (n, t) in &self.region_types {
             t.check(n, &self.fill_patterns)?;
         }
+        for (n, t) in &self.text_types {
+            t.check(n)?;
+        }
+        if self.reinforcement.len() > crate::reinforce::MAX_PRESETS {
+            return Err(format!(
+                "the project has {} reinforcement presets; it holds up to {}",
+                self.reinforcement.len(),
+                crate::reinforce::MAX_PRESETS
+            ));
+        }
+        for (n, p) in &self.reinforcement {
+            p.check(n)?;
+        }
+        for (n, t) in &self.dimension_types {
+            t.check(n)?;
+        }
+        crate::electrical::check(self)?;
         for (n, x) in &self.materials {
             for p in [&x.cut_pattern, &x.surface_pattern].into_iter().flatten() {
                 if !self.fill_patterns.contains_key(p) {
@@ -4864,6 +6015,9 @@ impl Model {
             text(&format!("material `{n}`"), "name", n)?;
             if n.trim().is_empty() {
                 return Err("a material needs a name".into());
+            }
+            if x.transparency > 100 {
+                return Err(format!("material `{n}`: transparency is a percent, 0 to 100, not {}", x.transparency));
             }
             if let Some(t) = &x.texture {
                 t.check(&self.images).map_err(|e| format!("material `{n}`: texture: {e}"))?;
@@ -5032,6 +6186,7 @@ impl Model {
                 Element::Level(l) => {
                     text(&who, "name", &l.name)?;
                     coord(&format!("{who} elevation"), l.elevation)?;
+                    coord(&format!("{who} computation height"), l.computation_height)?;
                     if !level_names.insert(l.name.as_str()) {
                         return Err(format!("{who}: another level is already named `{}`", l.name));
                     }
@@ -5058,6 +6213,47 @@ impl Model {
                 Element::RoomSeparator(rs) => {
                     level_ok(rs.level)?;
                     line(&who, rs.start, rs.end)?;
+                }
+                Element::Rebar(rb) => {
+                    level_ok(rb.level)?;
+                    text(&who, "grade", &rb.grade)?;
+                    text(&who, "layer", &rb.layer)?;
+                    if rb.grade.trim().is_empty() {
+                        return Err(format!("{who}: a bar needs a steel grade"));
+                    }
+                    let (thin, thick) = crate::rebar::DIAMETERS;
+                    if !(thin..=thick).contains(&rb.diameter) {
+                        return Err(format!("{who}: diameter {} mm isn't between {thin} and {thick} mm", rb.diameter));
+                    }
+                    if !(2..=MAX_POINTS).contains(&rb.path.len()) {
+                        return Err(format!("{who}: a path needs 2 to {MAX_POINTS} points"));
+                    }
+                    if rb.path.iter().flatten().any(|c| !(c.is_finite() && c.abs() <= MAX_COORD)) {
+                        return Err(format!("{who}: a point of its path is not finite or reaches past {MAX_COORD} mm"));
+                    }
+                    if crate::rebar::length(&rb.path) <= TOL {
+                        return Err(format!("{who}: its path has no length"));
+                    }
+                    if let Some(h) = rb.host {
+                        match self.elements.get(h) {
+                            Some(
+                                Element::Beam(_)
+                                | Element::StripFooting(_)
+                                | Element::Column(_)
+                                | Element::StructuralColumn(_)
+                                | Element::Footing(_)
+                                | Element::Floor(_),
+                            ) => {}
+                            Some(other) => {
+                                return Err(format!(
+                                    "{who}: {} {} is no host for bars; a beam, a column, a footing or a floor is",
+                                    other.category(),
+                                    self.shown(h)
+                                ));
+                            }
+                            None => return Err(format!("{who}: host {h} doesn't exist")),
+                        }
+                    }
                 }
                 Element::Wall(w) => {
                     known(&who, &w.type_name, &self.types.wall)?;
@@ -5158,7 +6354,7 @@ impl Model {
                     if let Some(f) = o.family.as_ref().and_then(|n| self.families.get(n)) {
                         self.family_values_ok(&who, o.family.as_deref().unwrap_or_default(), f, &o.params)?;
                         let values = f.values_in(&o.type_name, &o.params, self.thickness(w)).map_err(|e| format!("{who}: {e}"))?;
-                        f.pieces(&values).and_then(|_| f.strokes(&values)).map_err(|e| format!("{who}: {e}"))?;
+                        f.pieces(&values).and_then(|_| f.marks(&values)).map_err(|e| format!("{who}: {e}"))?;
                         size(&format!("{who} width"), t.width)?;
                         size(&format!("{who} height"), t.height)?;
                     }
@@ -5195,6 +6391,23 @@ impl Model {
                     point(&who, r.point)?;
                     text(&who, "name", &r.name)?;
                     text(&who, "number", &r.number)?;
+                    kept(&who, r)?;
+                    if let Some(t) = r.top_level {
+                        level_ok(t)?;
+                    }
+                    coord(&format!("{who} base offset"), r.base_offset)?;
+                    coord(&format!("{who} limit offset"), r.limit_offset)?;
+                    let (bottom, top) = self.room_span(r);
+                    if top <= bottom + TOL {
+                        return Err(format!(
+                            "{who}: the room's top (its upper limit {} + limit offset {}) must be above its bottom (its level {} + \
+                             base offset {}); raise the limit offset or lower the base offset",
+                            self.elevation(r.top_level.unwrap_or(r.level)),
+                            r.limit_offset,
+                            self.elevation(r.level),
+                            r.base_offset
+                        ));
+                    }
                 }
                 Element::Dimension(d) => {
                     level_ok(d.level)?;
@@ -5203,23 +6416,103 @@ impl Model {
                             .ok_or_else(|| format!("{who}: view {} isn't a plan view of its level", self.shown(v)))?;
                     }
                     point(&who, d.at)?;
+                    if !self.dimension_types.contains_key(&d.type_name) {
+                        let there: Vec<&str> = self.dimension_types.keys().map(String::as_str).collect();
+                        return Err(format!("{who}: there's no dimension type `{}` (there are: {})", d.type_name, there.join(", ")));
+                    }
+                    for (what, t) in
+                        [("prefix", &d.prefix), ("suffix", &d.suffix), ("above", &d.above), ("below", &d.below), ("replace", &d.replace)]
+                    {
+                        crate::dims::dim_text(&who, what, t)?;
+                    }
+                    if d.equal && !(matches!(d.kind, DimKind::Aligned | DimKind::Linear) && d.refs.len() > 2) {
+                        return Err(format!("{who}: only an aligned or a linear dimension of two segments or more is kept equal"));
+                    }
+                    if !d.locked.is_empty() && !matches!(d.kind, DimKind::Aligned | DimKind::Linear) {
+                        return Err(format!("{who}: only an aligned or a linear dimension's segments are locked"));
+                    }
+                    let mut locks = BTreeSet::new();
+                    for l in &d.locked {
+                        if l.segment >= MAX_POINTS || !locks.insert(l.segment) || !(l.length.is_finite() && l.length.abs() <= MAX_COORD) {
+                            return Err(format!("{who}: segment {} is locked twice, at no length, or isn't a segment", l.segment));
+                        }
+                    }
+                    let mut segments = BTreeSet::new();
+                    for st in &d.texts {
+                        if st.segment >= MAX_POINTS || !segments.insert(st.segment) {
+                            return Err(format!("{who}: segment {}'s text is given twice, or there's no such segment", st.segment));
+                        }
+                        for (what, t) in st.fields() {
+                            crate::dims::dim_text(&format!("{who} segment {}", st.segment), what, t)?;
+                        }
+                    }
                     match (d.kind, d.refs.len()) {
-                        (DimKind::Aligned, 2..=MAX_POINTS) | (DimKind::Angular, 2) | (DimKind::Radial, 1) => {}
-                        (DimKind::Aligned, _) => return Err(format!("{who}: a dimension measures between 2 to {MAX_POINTS} references")),
+                        (DimKind::Aligned | DimKind::Linear, 2..=MAX_POINTS)
+                        | (DimKind::Angular, 2)
+                        | (DimKind::Radial | DimKind::Diameter | DimKind::ArcLength, 1) => {}
+                        (DimKind::Aligned | DimKind::Linear, _) => {
+                            return Err(format!("{who}: a dimension measures between 2 to {MAX_POINTS} references"));
+                        }
                         (DimKind::Angular, _) => return Err(format!("{who}: an angular dimension measures between two lines")),
                         (DimKind::Radial, _) => return Err(format!("{who}: a radial dimension measures one round element")),
+                        (DimKind::Diameter, _) => return Err(format!("{who}: a diameter dimension measures one round element")),
+                        (DimKind::ArcLength, 3) => {}
+                        (DimKind::ArcLength, _) => {
+                            return Err(format!(
+                                "{who}: an arc length dimension measures along one arc, all of it or between two points on it"
+                            ));
+                        }
                     }
+                    match (d.kind, d.orient) {
+                        (DimKind::Linear, None) => {
+                            return Err(format!("{who}: a linear dimension runs horizontal or vertical: give it an `orient`"));
+                        }
+                        (DimKind::Linear, Some(_)) | (_, None) => {}
+                        (_, Some(_)) => return Err(format!("{who}: only a linear dimension has an `orient`; this one is {:?}", d.kind)),
+                    }
+                    let linear = d.kind == DimKind::Linear;
+                    let along = self.measured_along(d);
                     let mut seen = BTreeSet::new();
                     let mut first: Option<(Reference, Line)> = None;
                     for r in &d.refs {
-                        if d.kind == DimKind::Radial {
-                            self.reference_arc(r).map_err(|e| format!("{who}: {e}"))?;
+                        match d.kind {
+                            DimKind::Radial => {
+                                self.reference_arc(r).map_err(|e| format!("{who}: {e}"))?;
+                                continue;
+                            }
+                            DimKind::Diameter => {
+                                self.reference_arc(r).map_err(|e| format!("{who}: {}", e.replace("a radial", "a diameter")))?;
+                                continue;
+                            }
+                            DimKind::ArcLength => {
+                                self.arc_span(d).map_err(|e| format!("{who}: {e}"))?;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        let what = format!("{} {}", self.cat(r.id), self.shown(r.id));
+                        if r.point.is_some() && d.kind == DimKind::Angular {
+                            return Err(format!("{who}: it measures to an end of {what}; an angle is between two lines"));
+                        }
+                        let line = self.reference_geometry(r).map_err(|e| format!("{who}: {e}"))?;
+                        if !seen.insert((r.id, r.face, r.point)) {
+                            let at = match r.point {
+                                Some(End::Start) => "start of its ",
+                                Some(End::End) => "end of its ",
+                                None => "",
+                            };
+                            return Err(format!("{who}: it measures to {what}'s {at}{} twice", r.face.name()));
+                        }
+                        if r.point.is_some() {
                             continue;
                         }
-                        let line = self.reference_line(r).map_err(|e| format!("{who}: {e}"))?;
-                        let what = format!("{} {}", self.cat(r.id), self.shown(r.id));
-                        if !seen.insert((r.id, r.face)) {
-                            return Err(format!("{who}: it measures to {what}'s {} twice", r.face.name()));
+                        if let (true, Some(n)) = (linear, along)
+                            && !geom::parallel(line.0, line.1, P2(0.0, 0.0), n.perp())
+                        {
+                            let way = if d.orient == Some(Orient::Horizontal) { "horizontal" } else { "vertical" };
+                            return Err(format!(
+                                "{who}: {what} isn't square to a {way} dimension; measure to its ends, or make the dimension aligned"
+                            ));
                         }
                         match first {
                             None => first = Some((*r, line)),
@@ -5236,6 +6529,9 @@ impl Model {
                                 }
                             }
                         }
+                    }
+                    if matches!(d.kind, DimKind::Aligned | DimKind::Linear) && along.is_none() {
+                        return Err(format!("{who}: its points are all in one place, so it has no way to run"));
                     }
                 }
                 Element::Text(Note { view, .. })
@@ -5411,6 +6707,15 @@ impl Model {
                     if let Some(b) = &v.section_box {
                         section_box_ok(&who, b)?;
                     }
+                    if let Some(p) = &v.perspective
+                        && !(crate::view3d::MIN_LENS..=crate::view3d::MAX_LENS).contains(&p.lens)
+                    {
+                        let (lo, hi) = (crate::view3d::MIN_LENS, crate::view3d::MAX_LENS);
+                        return Err(format!("{who}: a {} mm lens is no camera's; a perspective's lens is {lo} to {hi} mm", p.lens));
+                    }
+                    if let Some(cam) = &v.camera {
+                        camera_ok(&who, cam)?;
+                    }
                     if !view_names.insert(v.name.as_str()) {
                         return Err(format!("{who}: another view is already named `{}`", v.name));
                     }
@@ -5471,7 +6776,7 @@ impl Model {
                         }
                     }
                     self.family_values_ok(&who, &c.family, f, &c.params)?;
-                    f.values(&c.type_name, &c.params).and_then(|v| f.pieces(&v)).map_err(|e| format!("{who}: {e}"))?;
+                    f.values(&c.type_name, &c.params).and_then(|v| f.pieces(&v).and(f.marks(&v))).map_err(|e| format!("{who}: {e}"))?;
                 }
                 Element::Column(col) | Element::StructuralColumn(col) | Element::Footing(col) => {
                     let types = match e {
@@ -5740,7 +7045,7 @@ impl Model {
                         return Err(format!("{who}: another sheet is already numbered `{}`", sh.number));
                     }
                     if paper(&sh.size).is_none() {
-                        return Err(format!("{who}: size `{}` isn't A0, A1, A2, A3 or A4", sh.size));
+                        return Err(format!("{who}: size `{}` isn't A0, A1, A2, A3 or A4, or an Arch / ANSI size", sh.size));
                     }
                 }
                 Element::Viewport(v) => {
@@ -5841,6 +7146,21 @@ fn section_box_ok(who: &str, b: &SectionBox) -> Result<(), String> {
                 "{who}: its section box runs from {lo} to {hi} mm in {axis}; its max is at least {MIN_SECTION_BOX} mm past its min on each axis"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Whether `cam` is a camera a view can stand at: an eye and a target that are usable numbers, apart, so the view has a
+/// direction to look in.
+fn camera_ok(who: &str, cam: &ViewCamera) -> Result<(), String> {
+    for (what, p) in [("eye", cam.eye), ("target", cam.target)] {
+        for (axis, v) in ["x", "y", "z"].into_iter().zip(p) {
+            coord(&format!("{who} camera {what} {axis}"), v)?;
+        }
+    }
+    let across = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| a[k] - b[k]).fold(0.0, |s, d| s + d * d).sqrt();
+    if across(cam.eye, cam.target) <= TOL {
+        return Err(format!("{who}: its camera's eye is on its target, so it has nothing to look at; give them two points a little apart"));
     }
     Ok(())
 }
@@ -5948,6 +7268,29 @@ fn solid(loops: &[Vec<P2>], holes: &[Vec<P2>]) -> Vec<Vec<P2>> {
 }
 
 /// An outline: 3 to [`MAX_POINTS`] points around some area.
+/// A frozen room's kept boundary: rings of usable points, and some boundary to keep.
+fn kept(who: &str, r: &Room) -> Result<(), String> {
+    let Some(k) = &r.kept else { return Ok(()) };
+    if k.centre.is_none() && k.finish.is_none() {
+        return Err(format!(
+            "{who}: the room is frozen but unbounded (not enclosed, or in a space another room has); a room is frozen with \
+             the boundary it has, so give it one first (walls or room separation lines round it, the other room deleted or \
+             parted from it), or leave it unfrozen"
+        ));
+    }
+    for (at, g) in [("centre", &k.centre), ("finish", &k.finish)] {
+        let Some(g) = g else { continue };
+        if g.holes.iter().map(Vec::len).sum::<usize>().saturating_add(g.outer.len()) > MAX_POINTS {
+            return Err(format!("{who}: its kept {at} boundary has more than {MAX_POINTS} points"));
+        }
+        boundary(&format!("{who} (room) kept {at} boundary"), &g.outer)?;
+        for h in &g.holes {
+            boundary(&format!("{who} (room) kept {at} island"), h)?;
+        }
+    }
+    Ok(())
+}
+
 fn boundary(who: &str, ring: &[P2]) -> Result<(), String> {
     if ring.len() < 3 || ring.len() > MAX_POINTS {
         return Err(format!("{who}: a boundary needs 3 to {MAX_POINTS} points"));
@@ -6054,6 +7397,25 @@ struct OpeningSpan {
     id: Id,
 }
 
+/// Where the line from `from` through `end` reaches the centre line of a wall that `end` lies inside (within half the wall's
+/// thickness of that line), carrying on the way it points; `end` itself when it lies in no wall or is on a centre line already.
+fn to_centre(from: P2, end: P2, walls: &[(P2, P2, f64)]) -> P2 {
+    let way = (end - from).unit();
+    if !way.is_finite() {
+        return end;
+    }
+    walls
+        .iter()
+        .filter(|&&(a, b, half)| half > 0.0 && geom::dist_to_segment(end, a, b) <= half + TOL)
+        .filter_map(|&(a, b, half)| {
+            // Far enough to cross a wall met at a slant, short of the wall beyond it.
+            let reach = 4.0 * half + TOL;
+            geom::crossing(end, end + way * reach, a, b).map(|t| t * reach)
+        })
+        .min_by(f64::total_cmp)
+        .map_or(end, |d| end + way * d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6072,6 +7434,7 @@ mod tests {
             location: Location::Centre,
             attach_top: None,
             attach_base: None,
+            room_bounding: true,
         })
     }
 
@@ -6151,8 +7514,14 @@ mod tests {
     fn rooms_are_bounded_by_the_walls_their_level_cuts() {
         let mut m = Model::new("t");
         boxed(&mut m);
-        let room =
-            Room { params: Default::default(), level: m.guid(100000), point: P2(3000.0, 2000.0), name: "Hall".into(), number: "1".into() };
+        let room = Room {
+            params: Default::default(),
+            level: m.guid(100000),
+            point: P2(3000.0, 2000.0),
+            name: "Hall".into(),
+            number: "1".into(),
+            ..Room::new(m.guid(100000), P2(0.0, 0.0), "", "")
+        };
         assert_eq!(m.room_region(&room).map(|r| r.area()), Some(24e6));
         let upstairs = Room { level: m.guid(100001), ..room };
         assert_eq!(m.room_region(&upstairs), None, "Level 2 has no walls");

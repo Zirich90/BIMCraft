@@ -146,3 +146,6 @@ m²), a field with no value leaving it with none (an unset yes or no is no). Fil
 them, so two that show the same are equal. The six schedules every project has (`schedule::VIEWS`) aren't elements
 until changed or placed (`schedule::standard`), and a schedule named as one of them, in any language or case, is that one; renaming a parameter renames it in schedules, but a formula naming it holds
 the rename back.
+A table goes to a file as CSV (`schedule::to_csv`, text a spreadsheet would read as a formula guarded with `'`) or, for a path
+ending `.xlsx`, as a workbook of one sheet (`schedule::to_xlsx` over `xlsx.rs`, which writes the parts and the zip by hand on
+`flate2`): headings in bold, numbers as numbers so they sum, text as inline strings, which a spreadsheet never takes for a formula.

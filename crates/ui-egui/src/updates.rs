@@ -3,13 +3,15 @@
 //! this draws what it says and passes the user's clicks on. A window starts with no updater, so a test never phones home: the
 //! desktop's `main` attaches one.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bimcraft_update::{Note, State};
-use egui::{Button, Color32, Context, Frame, Id, Modal, OpenUrl, ProgressBar, RichText, Stroke, Ui, ViewportCommand, vec2};
+use egui::{Button, Color32, Context, Frame, Id, OpenUrl, ProgressBar, RichText, Stroke, Ui, ViewportCommand, vec2};
 
 use crate::lang::{t, tf};
 use crate::style::pal;
@@ -67,10 +69,12 @@ impl BimApp {
     pub(crate) fn installing_box(&self, ctx: &Context) {
         let Some(State::Installing { release, .. }) = self.updates.as_ref().map(|u| u.state()) else { return };
         let text = tf("Installing BIMCraft {}…", &[&release.version.to_string()]);
-        Modal::new(Id::new("installing")).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(text).strong());
+        Modal::new(Id::new("installing"), t("Updates")).width(580.0).closable(false).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(text).strong());
+                });
             });
         });
     }

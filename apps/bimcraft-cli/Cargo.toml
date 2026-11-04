@@ -12,14 +12,19 @@ workspace = true
 [features]
 # Reads Revit's .rvt and .rfa files. That code is ported from rvt-rs and is Apache-2.0 only (docs/rvt-provenance.md),
 # so a build without it, which keeps the repository's MIT OR Apache-2.0, is `--no-default-features`.
-default = ["rvt"]
+default = ["rvt", "dwg"]
 rvt = ["dep:bimcraft-rvt"]
+# Reads DWG drawings in `import_cad`, through bimcraft-dwg, which uses acadrust (MPL-2.0, unmodified; NOTICE).
+dwg = ["dep:bimcraft-dwg"]
 
 [dependencies]
 bimcraft-core = { workspace = true }
 bimcraft-rvt = { workspace = true, optional = true }
+bimcraft-dwg = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# DWG files made from DXF text, for the test of the child that reads them.
+bimcraft-dwg = { workspace = true, features = ["testing"] }
 # Synthetic Revit-shaped files for the tests of `info`.
 bimcraft-rvt = { workspace = true, features = ["testing"] }

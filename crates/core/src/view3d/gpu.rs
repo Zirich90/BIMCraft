@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use super::{Camera, DATUM, EDGE, LevelMarks, P3, Scene, add, cross, dot, level_marks, mul, sub, unit};
+use super::{Camera, DATUM, EDGE, LevelMarks, NEAR, P3, Scene, add, cross, dot, level_marks, mul, sub, unit, weighed};
 use crate::geom::{self, P2};
 use crate::graphics::{Look, VisualStyle};
 use crate::model::Id;
@@ -68,6 +68,18 @@ pub struct View {
     pub target: [f32; 3],
     pub scale: f32,
     pub depth: f32,
+    /// In perspective: the lens's focal length in px, how far the eye is from the target, mm, and the card's depth (larger
+    /// nearer, 1 at [`NEAR`] in front of the eye and 0 as far past the target as the mesh reaches) as `a + b / ahead` for a
+    /// point `ahead` mm in front of the eye.
+    pub perspective: Option<Perspective>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Perspective {
+    pub focal: f32,
+    pub eye: f32,
+    pub a: f32,
+    pub b: f32,
 }
 
 struct Tri {
@@ -147,12 +159,12 @@ impl Mesh {
             return Err(format!("{} triangles, more than the card is given", shown.len()));
         }
         // What the view sees through is drawn after what it doesn't, each in the order the processor draws it.
-        let clear = |i: usize| !plain && look.transparency(scene.tris[i].owner) > 0;
+        let clear = |i: usize| scene.tris[i].alpha(look) > 0;
         let shown: Vec<usize> = shown.iter().copied().filter(|&i| !clear(i)).chain(shown.iter().copied().filter(|&i| clear(i))).collect();
         let clear_from = shown.iter().take_while(|&&i| !clear(i)).count() * 3;
         // A texture is looked up as the CPU does unless the view colours its surface another way.
         let colour = |t: &super::Tri| if plain { t.color } else { look.surface(t.owner, t.color) };
-        let textured = |t: &super::Tri| scene.skins.get(t.tex as usize).is_some_and(Option::is_some) && colour(t) == t.color;
+        let textured = |t: &super::Tri| scene.skins.get(t.texture() as usize).is_some_and(Option::is_some) && colour(t) == t.color;
         let levels: Vec<_> = scene.levels.iter().filter(|(id, ..)| plain || look.shows(*id)).cloned().collect();
         let corners = levels.iter().flat_map(|(.., c)| c.iter());
         let points = shown.iter().flat_map(|&i| scene.tris[i].p.iter()).chain(corners);
@@ -172,11 +184,12 @@ impl Mesh {
             tris: Vec::with_capacity(shown.len()),
             bvh: OnceLock::new(),
         };
-        let mut owners: BTreeMap<Id, u32> = BTreeMap::new();
+        let mut owners: BTreeMap<(Id, u8), u32> = BTreeMap::new();
         for i in shown {
             let t = &scene.tris[i];
-            let owner = *owners.entry(t.owner).or_insert_with(|| {
-                let transparency = if plain { 0 } else { look.transparency(t.owner).min(100) };
+            let alpha = t.alpha(look).min(100);
+            let owner = *owners.entry((t.owner, alpha)).or_insert_with(|| {
+                let transparency = alpha;
                 mesh.owners.push(Owner { id: t.owner, edge: look.edge(t.owner, EDGE), transparency });
                 mesh.owners.len() as u32
             });
@@ -185,7 +198,7 @@ impl Mesh {
             let face = unit(cross(sub(t.p[1], t.p[0]), sub(t.p[2], t.p[0])));
             let smooth = scene.smooth.get(i).and_then(Option::as_deref);
             let plane = scene.planes.get(i).map_or(i, |p| *p) as u32 + 1;
-            let tex = if textured(t) { t.tex } else { 0 };
+            let tex = if textured(t) { t.texture() } else { 0 };
             for (k, p) in t.p.iter().enumerate() {
                 let normal = smooth.map_or(face, |n| unit(n[k])).map(|v| v as f32);
                 let position = sub(*p, origin).map(|v| v as f32);
@@ -240,14 +253,13 @@ impl Mesh {
         let (back, right, up) = cam.axes();
         let target = sub(cam.target, self.origin);
         let f = |v: P3| v.map(|x| x as f32);
-        View {
-            right: f(right),
-            up: f(up),
-            back: f(back),
-            target: f(target),
-            scale: cam.scale as f32,
-            depth: (self.radius + dot(target, target).sqrt() + 1.0) as f32,
-        }
+        let depth = self.radius + dot(target, target).sqrt() + 1.0;
+        let perspective = cam.focal().zip(cam.eye_distance()).map(|(focal, eye)| {
+            let far = (eye + depth).max(2.0 * NEAR);
+            let b = NEAR * far / (far - NEAR);
+            Perspective { focal: focal as f32, eye: eye as f32, a: (-NEAR / (far - NEAR)) as f32, b: b as f32 }
+        });
+        View { right: f(right), up: f(up), back: f(back), target: f(target), scale: cam.scale as f32, depth: depth as f32, perspective }
     }
 
     /// The marks drawn over the surfaces: each shown level's plane and head, `tints` colouring (and showing all four edges of)
@@ -281,7 +293,6 @@ impl Mesh {
         let (opaque, clear) = self.nearest(cam, centre);
         // A level's mark is hidden by what is opaque only, as the processor's are.
         let behind = opaque.map_or(f64::NEG_INFINITY, |(z, _)| f64::from(z));
-        let slack = 1.5 / cam.scale.max(1e-9);
         // A surface seen through shows where it is nearer than anything opaque.
         let seen = clear.filter(|(z, _)| opaque.is_none_or(|(d, _)| *z > d)).or(opaque);
         let mut hit = seen.map(|(_, hit)| hit);
@@ -290,8 +301,9 @@ impl Mesh {
             let on_line = marks.lines.iter().find_map(|([a, b], wide)| covers((cam.project(*a), cam.project(*b)), *wide, centre));
             let head: Vec<_> = marks.head.iter().map(|p| cam.project(*p)).collect();
             let ring: Vec<P2> = head.iter().map(|(x, y, _)| P2(*x, *y)).collect();
-            let on_head = geom::contains(&ring, at).then(|| head.iter().map(|p| p.2).sum::<f64>() / 4.0);
-            if on_line.or(on_head).is_some_and(|z| behind <= z + slack) {
+            let whole = ring.iter().all(|q| q.0.is_finite() && q.1.is_finite());
+            let on_head = (whole && geom::contains(&ring, at)).then(|| head.iter().map(|p| p.2).sum::<f64>() / 4.0);
+            if on_line.or(on_head).is_some_and(|z| behind <= z + cam.slack(1.5, z)) {
                 hit = Some(Hit { id: marks.id, face: "" });
             }
         }
@@ -304,16 +316,20 @@ impl Mesh {
         let Some(bvh) = Some(self.bvh()).filter(|b| !b.nodes.is_empty()) else { return (None, None) };
         // Opaque, then seen through.
         let mut found: [Option<(f32, usize)>; 2] = [None, None];
+        let project = cam.projector();
         let mut stack = vec![0usize];
         while let Some(n) = stack.pop() {
             let Some(node) = bvh.nodes.get(n) else { continue };
-            // The box's picture is inside the rectangle its corners make.
-            let corners = (0..8).map(|k| cam.project([0, 1, 2].map(|a| if k >> a & 1 == 0 { node.lo[a] } else { node.hi[a] })));
-            let (lo, hi) = corners.fold((P2(f64::MAX, f64::MAX), P2(f64::MIN, f64::MIN)), |(lo, hi), (cx, cy, _)| {
-                (P2(lo.0.min(cx), lo.1.min(cy)), P2(hi.0.max(cx), hi.1.max(cy)))
-            });
-            if x < lo.0 - 1e-6 || x > hi.0 + 1e-6 || y < lo.1 - 1e-6 || y > hi.1 + 1e-6 {
-                continue;
+            // The box's picture is inside the rectangle its corners make, where all of it is in front of the eye.
+            let corners = (0..8).map(|k| [0, 1, 2].map(|a| if k >> a & 1 == 0 { node.lo[a] } else { node.hi[a] }));
+            if corners.clone().all(|p| project.ahead(p) >= NEAR) {
+                let (lo, hi) =
+                    corners.map(|p| project.at(p)).fold((P2(f64::MAX, f64::MAX), P2(f64::MIN, f64::MIN)), |(lo, hi), (cx, cy, _)| {
+                        (P2(lo.0.min(cx), lo.1.min(cy)), P2(hi.0.max(cx), hi.1.max(cy)))
+                    });
+                if x < lo.0 - 1e-6 || x > hi.0 + 1e-6 || y < lo.1 - 1e-6 || y > hi.1 + 1e-6 {
+                    continue;
+                }
             }
             if let Some(children) = node.children {
                 stack.extend(children);
@@ -321,21 +337,25 @@ impl Mesh {
             }
             for &i in bvh.order.get(node.first..node.first + node.count).unwrap_or_default() {
                 let Some(t) = self.tris.get(i) else { continue };
-                let [a, b, c] = t.p.map(|p| cam.project(p));
-                let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-                if area.is_nan() || area.abs() <= 1e-12 {
-                    continue;
-                }
-                let wa = ((b.0 - x) * (c.1 - y) - (b.1 - y) * (c.0 - x)) / area;
-                let wb = ((c.0 - x) * (a.1 - y) - (c.1 - y) * (a.0 - x)) / area;
-                let wc = 1.0 - wa - wb;
-                if wa < -1e-9 || wb < -1e-9 || wc < -1e-9 {
-                    continue;
-                }
-                let z = (wa * a.2 + wb * b.2 + wc * c.2) as f32;
-                let found = &mut found[usize::from(t.clear)];
-                if found.is_none_or(|(d, j)| z > d || z == d && i < j) {
-                    *found = Some((z, i));
+                // In front of the eye, as the processor cuts it.
+                let (parts, count) = project.in_front(&t.p);
+                for part in parts.iter().take(count) {
+                    let [a, b, c] = weighed(&t.p, part).map(|p| project.at(p));
+                    let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                    if area.is_nan() || area.abs() <= 1e-12 {
+                        continue;
+                    }
+                    let wa = ((b.0 - x) * (c.1 - y) - (b.1 - y) * (c.0 - x)) / area;
+                    let wb = ((c.0 - x) * (a.1 - y) - (c.1 - y) * (a.0 - x)) / area;
+                    let wc = 1.0 - wa - wb;
+                    if wa < -1e-9 || wb < -1e-9 || wc < -1e-9 {
+                        continue;
+                    }
+                    let z = (wa * a.2 + wb * b.2 + wc * c.2) as f32;
+                    let found = &mut found[usize::from(t.clear)];
+                    if found.is_none_or(|(d, j)| z > d || z == d && i < j) {
+                        *found = Some((z, i));
+                    }
                 }
             }
         }
@@ -406,8 +426,13 @@ mod tests {
     /// Whether picking `s`'s 3D view through its mesh finds what the processor's picture shows, at every third pixel.
     fn picks_as_the_picture(s: &Session) {
         let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
+        picks_through(s, scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look));
+    }
+
+    /// Whether picking `s`'s 3D view through its mesh, seen through `cam`, finds what the processor's picture shows.
+    fn picks_through(s: &Session, cam: Camera) {
+        let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
         let mesh = Mesh::new(&scene, &look).unwrap();
-        let cam = scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look);
         let tints = [(s.model.levels().first().unwrap().0, Rgb(0, 120, 215))];
         let image = scene.render_in(&cam, &tints, &look);
         let (mut agree, mut total) = (0, 0);
@@ -426,6 +451,17 @@ mod tests {
     #[test]
     fn picking_the_mesh_finds_what_the_cpu_picture_shows() {
         picks_as_the_picture(&sample());
+    }
+
+    #[test]
+    fn picking_the_mesh_in_perspective_finds_what_the_cpu_picture_shows_from_afar_and_from_within() {
+        let s = sample();
+        let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
+        let flat = scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look);
+        let cam = scene.fit_from(Camera { lens: Some(crate::view3d::LENS), ..flat }, &look);
+        picks_through(&s, cam);
+        // The eye inside the house, 1.6 m up, through a wide lens: what is behind it is cut away alike.
+        picks_through(&s, crate::view3d::inside(&s.model, cam));
     }
 
     #[test]
@@ -466,6 +502,24 @@ mod tests {
         let reach = mesh.radius as f32 * 1.001 + 1.0;
         assert!(mesh.vertices.iter().all(|v| v.position.iter().all(|c| c.abs() <= reach)));
         assert!(mesh.vertices.iter().all(|v| v.owner >= 1 && v.owner as usize <= mesh.owners.len() && v.plane >= 1));
-        assert_eq!(mesh.clear_from, mesh.vertices.len(), "nothing seen through");
+        // Only the glass of the windows is seen through, and it is drawn last.
+        let clear: Vec<_> = mesh.owners.iter().filter(|o| o.transparency > 0).collect();
+        assert!(!clear.is_empty() && clear.iter().all(|o| s.model.elements.get(o.id).is_some_and(|e| e.category() == "window")));
+        assert!(mesh.clear_from < mesh.vertices.len());
+    }
+
+    #[test]
+    fn a_glass_layer_is_an_owner_of_its_own_with_the_materials_transparency() {
+        let mut s = Session::new();
+        s.script(
+            r#"type {"category": "wall", "name": "Curtain", "layers": [{"material": "Glass", "thickness": 50}, {"material": "Concrete block", "thickness": 100}]}
+               wall {"points": [[0,0],[8000,0]], "type": "Curtain"}"#,
+        )
+        .unwrap();
+        let mesh = Mesh::new(&Scene::new(&s.model), &Look::of_3d(&s.model)).unwrap();
+        let mut alphas: Vec<u8> = mesh.owners.iter().map(|o| o.transparency).collect();
+        alphas.sort_unstable();
+        assert_eq!(alphas, vec![0, crate::model::GLASS_TRANSPARENCY], "one wall, drawn in two parts");
+        assert!(mesh.clear_from > 0 && mesh.clear_from < mesh.vertices.len(), "the opaque layer first, then the glass");
     }
 }

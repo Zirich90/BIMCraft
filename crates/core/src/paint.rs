@@ -20,8 +20,9 @@ pub fn faces(category: &str) -> &'static [&'static str] {
     match category {
         "wall" => &["exterior", "interior"],
         "floor" | "roof" | "ceiling" => &["top", "bottom"],
-        "column" | "structuralcolumn" | "footing" | "beam" | "stripfooting" | "pipe" | "cablecarrier" | "wire" | "downconductor"
-        | "groundconductor" | "cable" | "component" | "door" | "window" | "stair" | "ramp" | "railing" => &["all"],
+        "column" | "structuralcolumn" | "footing" | "beam" | "stripfooting" | "pipe" | "duct" | "cablecarrier" | "conduit"
+        | "cabletray" | "wire" | "downconductor" | "groundconductor" | "cable" | "component" | "door" | "window" | "stair" | "ramp"
+        | "railing" => &["all"],
         _ => &[],
     }
 }

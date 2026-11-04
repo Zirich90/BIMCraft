@@ -52,6 +52,8 @@ const MASS: Rgb = Rgb(158, 190, 224);
 const RAIL: Rgb = Rgb(120, 122, 128);
 /// A beam, a footing, a structural column made of nothing the library has.
 const STRUCTURE: Rgb = Rgb(182, 184, 190);
+/// Steel, darker than the concrete round it.
+const REBAR: Rgb = Rgb(92, 96, 104);
 /// A component's form made of nothing the library has.
 const COMPONENT: Rgb = Rgb(214, 204, 188);
 /// Room around a fitted model, px.
@@ -85,9 +87,32 @@ struct Tri {
     p: [P3; 3],
     owner: Id,
     color: Rgb,
-    /// The texture over its colour: one more than where its material is in the library; 0, none.
+    /// The skin of its material ([`skin`]): in the low 24 bits the texture over its colour, one more than where the material
+    /// is in the library, 0 for none; in the high 8, how see-through the material is, percent.
     tex: u32,
     curve: Option<(Id, usize)>,
+}
+
+/// The bits of a skin that hold the texture.
+const TEXTURE: u32 = 0x00ff_ffff;
+
+impl Tri {
+    /// The texture over its colour, 0 for none.
+    fn texture(&self) -> u32 {
+        self.tex & TEXTURE
+    }
+
+    /// How see-through its material makes it, percent.
+    fn clearness(&self) -> u8 {
+        (self.tex >> 24).min(100) as u8
+    }
+
+    /// How see-through it is in `look`: as much as its material, or the view makes it, whichever is more. A view's own
+    /// override counts only where it changes the picture.
+    pub(crate) fn alpha(&self, look: &Look) -> u8 {
+        let view = if look.is_plain() { 0 } else { look.transparency(self.owner) };
+        self.clearness().max(view)
+    }
 }
 
 /// A wall's plan frame: its start, along it, and square to it.
@@ -515,6 +540,14 @@ fn solids_in(m: &Model, elements: &[(Id, &Element)], index: Option<&walls::Index
                     }
                 }
             }
+            // A bar: a tube along each straight piece of its path, cut by a section as a round run is.
+            Element::Rebar(rb) => {
+                let base = m.elevation(rb.level);
+                let path: Vec<P3> = rb.path.iter().map(|q| [q[0], q[1], q[2] + base]).collect();
+                for (tris, caps) in crate::rebar::tubes(&path, rb.diameter) {
+                    out.push(Solid::Mesh { owner: id, color: REBAR, tex: 0, tris, caps, round: true, cut: true });
+                }
+            }
             // Lofted, a skin of triangles from the footprint to the top outline.
             Element::Mass(ms) if ms.lofted() => {
                 let tris = crate::massing::tris(&ms.footprint(), &ms.top_ring(), m.span(ms.level, ms.base_offset, ms.top_level, ms.height));
@@ -602,12 +635,13 @@ fn solids_in(m: &Model, elements: &[(Id, &Element)], index: Option<&walls::Index
                     }
                 } else if let (Some(t), Some(w)) = (m.opening_type(e), m.wall(o.host)) {
                     let color = if matches!(e, Element::Door(_)) { DOOR } else { GLASS };
+                    let tex = if matches!(e, Element::Door(_)) { 0 } else { skin(m, m.language.word("Glass")) & !TEXTURE };
                     let z = m.own_base(w) + o.sill;
                     let axis = Axis::of(w);
                     let u = axis.tangent(o.offset);
                     let frame = Frame { o: axis.at(o.offset, walls::centre(m, w)), u, n: u.perp() };
                     let a = (-t.width / 2.0, t.width / 2.0);
-                    out.push(Solid::Box { owner: id, color, tex: 0, frame, a, c: (-25.0, 25.0), z: (z, z + t.height) });
+                    out.push(Solid::Box { owner: id, color, tex, frame, a, c: (-25.0, 25.0), z: (z, z + t.height) });
                 }
             }
             _ => {}
@@ -687,10 +721,17 @@ fn planes(tris: &[Tri]) -> Vec<usize> {
         .collect()
 }
 
-/// The texture id a library material gives what is made of it: one more than where it is in the library's order, 0
-/// for one with no texture, or none in the library.
+/// What a library material gives what is made of it: in the low 24 bits the texture id, one more than where it is in the
+/// library's order (0 for none), and in the high 8 how see-through it is, percent.
 fn skin(m: &Model, name: &str) -> u32 {
-    m.materials.iter().position(|(k, x)| k == name && x.texture.is_some()).map_or(0, |i| i as u32 + 1)
+    let Some((i, x)) = m.materials.iter().enumerate().find_map(|(i, (k, x))| (k == name).then_some((i, x))) else { return 0 };
+    let texture = if x.texture.is_some() { i as u32 + 1 } else { 0 };
+    texture | u32::from(x.transparency.min(100)) << 24
+}
+
+/// A layer's skin, or its element's where the layer has none.
+fn over(layer: u32, outer: u32) -> u32 {
+    if layer == 0 { outer } else { layer }
 }
 
 /// The model's solids as its pictures show them: an element of a compound type split into its
@@ -721,7 +762,7 @@ fn layered(m: &Model, s: Solid) -> Vec<Solid> {
                 if r > 1e-9 {
                     let lift = rise - above - r;
                     let face = face.iter().map(|p| [p[0], p[1], p[2] + lift]).collect();
-                    out.push(Solid::Slab { owner, color: colour(l, color), tex: skin(m, &l.material).max(tex), face, rise: r });
+                    out.push(Solid::Slab { owner, color: colour(l, color), tex: over(skin(m, &l.material), tex), face, rise: r });
                 }
                 above += r;
             }
@@ -749,7 +790,7 @@ fn layered(m: &Model, s: Solid) -> Vec<Solid> {
                     (part.len() >= 3 && geom::area(&part).abs() > 1e-6).then(|| Solid::Prism {
                         owner,
                         color: colour(l, color),
-                        tex: skin(m, &l.material).max(tex),
+                        tex: over(skin(m, &l.material), tex),
                         ring: part,
                         bottom,
                         top,
@@ -1104,7 +1145,7 @@ impl Scene {
         let faces: Vec<&'static str> = tris.iter().map(|t| rules.get(&t.owner).map_or("", |r| r.face(&t.p))).collect();
         painted(m, &mut tris, &faces);
         // The textures the scene uses, ready to look up, and what each textured triangle lies across.
-        let used: BTreeSet<u32> = tris.iter().map(|t| t.tex).filter(|t| *t > 0).collect();
+        let used: BTreeSet<u32> = tris.iter().map(Tri::texture).filter(|t| *t > 0).collect();
         let mut skins: Vec<Option<Sampler>> = vec![None; m.materials.len() + 1];
         for id in used {
             let found = m.materials.values().nth(id as usize - 1);
@@ -1112,7 +1153,7 @@ impl Scene {
                 *slot = x.texture.as_ref().and_then(|t| Sampler::new(t, x.color, &m.images));
             }
         }
-        let bases = tris.iter().map(|t| skins.get(t.tex as usize).is_some_and(Option::is_some).then(|| basis(t))).collect();
+        let bases = tris.iter().map(|t| skins.get(t.texture() as usize).is_some_and(Option::is_some).then(|| basis(t))).collect();
         let (planes, smooth) = (planes(&tris), corner_normals(&tris));
         let masses = m.elements.iter().filter(|(_, e)| matches!(e, Element::Mass(_))).map(|(id, _)| *id).collect();
         let default = std::cell::OnceCell::new();
@@ -1149,7 +1190,30 @@ impl Scene {
 
     /// A view of what `look` shows of the model, fitted into the picture.
     pub fn fit_in(&self, azimuth: f64, elevation: f64, width: u32, height: u32, look: &Look) -> Camera {
-        let mut cam = Camera { azimuth, elevation: elevation.clamp(-89.0, 89.0), scale: 1.0, target: [0.0; 3], width, height };
+        let cam = Camera { azimuth, elevation, scale: 1.0, target: [0.0; 3], width, height, lens: None };
+        self.fit_from(cam, look)
+    }
+
+    /// What `look` shows of the model, fitted into `cam`'s picture from where it looks and through its lens: in perspective,
+    /// with the eye as far back as lets all of it in.
+    pub fn fit_from(&self, cam: Camera, look: &Look) -> Camera {
+        let fitted = self.fit_parallel(Camera { lens: None, ..cam }, look);
+        let Some(lens) = cam.lens else { return fitted };
+        let cam = Camera { lens: Some(lens), ..fitted };
+        let Some(f) = cam.focal() else { return cam };
+        // All of it within a ball round the target, and the ball within the narrower side of the picture.
+        let solids = self.tris.iter().filter(|t| look.shows(t.owner)).flat_map(|t| t.p);
+        let levels = self.levels.iter().filter(|(id, ..)| look.shows(*id)).flat_map(|(.., c)| *c);
+        let scans = self.scans.iter().filter(|s| look.shows(s.owner)).flat_map(|s| s.corners);
+        let reach = solids.chain(levels).chain(scans).map(|p| dot(sub(p, cam.target), sub(p, cam.target)).sqrt()).fold(0.0, f64::max);
+        let half = (f64::from(cam.width.min(cam.height)) / 2.0 - MARGIN).max(1.0);
+        let d = reach.max(1000.0) / (half / f).atan().sin().max(1e-9);
+        Camera { scale: (f / d).clamp(1e-6, 50.0), ..cam }
+    }
+
+    fn fit_parallel(&self, cam: Camera, look: &Look) -> Camera {
+        let (width, height) = (cam.width, cam.height);
+        let mut cam = Camera { elevation: cam.elevation.clamp(-89.0, 89.0), scale: 1.0, target: [0.0; 3], ..cam };
         let room = |px: u32| (f64::from(px) - 2.0 * MARGIN).max(1.0);
         let solids = self.tris.iter().filter(|t| look.shows(t.owner)).flat_map(|t| t.p);
         let levels = self.levels.iter().filter(|(id, ..)| look.shows(*id)).flat_map(|(.., c)| *c);
@@ -1219,33 +1283,35 @@ impl Scene {
             y: (usize, usize),
             corners: Option<[f64; 3]>,
         }
-        let (back, right, up) = cam.axes();
-        let project = |p| {
-            let d = sub(p, cam.target);
-            (f64::from(cam.width) / 2.0 + dot(d, right) * cam.scale, f64::from(cam.height) / 2.0 - dot(d, up) * cam.scale, dot(d, back))
-        };
+        let project = cam.projector();
         let mut tris = Vec::new();
         let mut bins = vec![Vec::new(); h.div_ceil(ROWS)];
         for (i, t) in self.tris.iter().enumerate() {
             if !keep(t) || cut.is_some_and(|k| k.misses(t)) {
                 continue;
             }
-            let [a, b, c] = t.p.map(project);
-            let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-            if area.is_nan() || area.abs() <= 1e-12 {
-                continue;
-            }
-            let (x0, x1) = (a.0.min(b.0).min(c.0), a.0.max(b.0).max(c.0));
-            let (y0, y1) = (a.1.min(b.1).min(c.1), a.1.max(b.1).max(c.1));
-            if !(x1 >= 0.0 && x0 < w as f64 && y1 >= 0.0 && y0 < h as f64) {
-                continue;
-            }
-            let x = (x0.max(0.0) as usize, x1.min(w as f64 - 1.0) as usize);
-            let y = (y0.max(0.0) as usize, y1.min(h as f64 - 1.0) as usize);
-            let n = tris.len();
-            tris.push(Projected { id: i as u32, p: [a, b, c], area, x, y, corners: lights(i) });
-            for bin in bins.iter_mut().take(y.1 / ROWS + 1).skip(y.0 / ROWS) {
-                bin.push(n);
+            // In perspective, what is in front of the eye: a triangle, or the one or two its near part makes.
+            let (parts, count) = project.in_front(&t.p);
+            let lit = lights(i);
+            for part in parts.iter().take(count) {
+                let [a, b, c] = weighed(&t.p, part).map(|p| project.at(p));
+                let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+                if area.is_nan() || area.abs() <= 1e-12 {
+                    continue;
+                }
+                let (x0, x1) = (a.0.min(b.0).min(c.0), a.0.max(b.0).max(c.0));
+                let (y0, y1) = (a.1.min(b.1).min(c.1), a.1.max(b.1).max(c.1));
+                if !(x1 >= 0.0 && x0 < w as f64 && y1 >= 0.0 && y0 < h as f64) {
+                    continue;
+                }
+                let x = (x0.max(0.0) as usize, x1.min(w as f64 - 1.0) as usize);
+                let y = (y0.max(0.0) as usize, y1.min(h as f64 - 1.0) as usize);
+                let corners = lit.map(|l| part.map(|w| w[0] * l[0] + w[1] * l[1] + w[2] * l[2]));
+                let n = tris.len();
+                tris.push(Projected { id: i as u32, p: [a, b, c], area, x, y, corners });
+                for bin in bins.iter_mut().take(y.1 / ROWS + 1).skip(y.0 / ROWS) {
+                    bin.push(n);
+                }
             }
         }
         let stripe = |band: usize, (depth, hit, lit): (&mut [f32], &mut [u32], &mut [f32])| {
@@ -1416,6 +1482,7 @@ impl Scene {
                 };
                 let Rgb(r, g, bl) = tints.get(&owner).copied().unwrap_or_else(|| look.edge(owner, EDGE));
                 let Some([a, b]) = look.section_box().map_or(Some([a, b]), |bx| within(a, b, bx)) else { continue };
+                let Some([a, b]) = cam.in_front(a, b) else { continue };
                 let (pa, pb) = (cam.project(a), cam.project(b));
                 if ![pa.0, pa.1, pb.0, pb.1].iter().all(|x| x.is_finite()) {
                     continue;
@@ -1517,6 +1584,9 @@ impl Scene {
         let plain = look.is_plain();
         let (w, h) = (cam.width.clamp(1, MAX_SIDE) as usize, cam.height.clamp(1, MAX_SIDE) as usize);
         let (back, right, up) = cam.axes();
+        // The side of a face the camera sees: in perspective, the side the eye is on.
+        let eye = cam.eye();
+        let toward = |p: P3| eye.map_or(back, |e| sub(e, p));
         // Lit from over the viewer's left shoulder; a face turned away from the light keeps 62%.
         let light = unit(add(add(mul(right, -0.35), mul(up, 0.55)), mul(back, 0.75)));
         let lit = |n: P3| 0.62 + 0.38 * dot(n, light).max(0.0);
@@ -1533,11 +1603,11 @@ impl Scene {
         let corner_light = |i: usize| {
             let (t, n) = (self.tris.get(i)?, smooth.get(i)?.as_deref()?);
             let face = unit(cross(sub(t.p[1], t.p[0]), sub(t.p[2], t.p[0])));
-            Some(n.map(|n| lit(if dot(face, back) < 0.0 { mul(n, -1.0) } else { n })))
+            Some(n.map(|n| lit(if dot(face, toward(t.p[0])) < 0.0 { mul(n, -1.0) } else { n })))
         };
         // What the view sees through is drawn over what lies behind it, after the opaque surfaces: the
         // nearest of them at each pixel, where nothing opaque is nearer. (Not in a section's hidden line.)
-        let see_through = |t: &Tri| !flat && !plain && look.transparency(t.owner) > 0;
+        let see_through = |t: &Tri| !flat && t.alpha(look) > 0;
         let shown = |t: &Tri| (plain || look.shows(t.owner)) && !(clip.is_some() && self.masses.contains(&t.owner));
         let mut depth = vec![f32::NEG_INFINITY; w * h];
         let mut hit = vec![u32::MAX; w * h];
@@ -1552,7 +1622,7 @@ impl Scene {
         let first = self.tris.len();
         let dots = self.dots((cam, clip, cut), (w, h), |s| plain || look.shows(s.owner), plain, look, (&mut depth, &mut hit));
         // Only a picture with something in it to see through needs the second pass, and its buffers.
-        let through_any = !plain && self.tris.iter().any(|t| shown(t) && see_through(t));
+        let through_any = self.tris.iter().any(|t| shown(t) && see_through(t));
         let (mut seen, mut seen_lit, mut near) = (Vec::new(), Vec::new(), Vec::new());
         if through_any {
             near = vec![f32::NEG_INFINITY; w * h];
@@ -1566,7 +1636,7 @@ impl Scene {
             .iter()
             .map(|t| {
                 let n = unit(cross(sub(t.p[1], t.p[0]), sub(t.p[2], t.p[0])));
-                lit(if dot(n, back) < 0.0 { mul(n, -1.0) } else { n })
+                lit(if dot(n, toward(t.p[0])) < 0.0 { mul(n, -1.0) } else { n })
             })
             .collect();
         let shade: Vec<Rgb> = self.tris.iter().zip(&light).map(|(t, l)| if flat { PAPER } else { paint(colour(t), *l) }).collect();
@@ -1579,13 +1649,13 @@ impl Scene {
                 return None;
             }
             let tri = self.tris.get(t)?;
-            let sampler = self.skins.get(tri.tex as usize)?.as_ref()?;
+            let sampler = self.skins.get(tri.texture() as usize)?.as_ref()?;
             if !plain && colour(tri) != tri.color {
                 return None;
             }
             let [across, up] = (*self.bases.get(t)?).as_ref()?;
             let (x, y) = ((k % w) as f64 + 0.5, (k / w) as f64 + 0.5);
-            let at = add(cam.unproject((x, y)), mul(back, f64::from(z)));
+            let at = cam.point_at((x, y), f64::from(z));
             Some(sampler.at(dot(at, *across), dot(at, *up), foot))
         };
         // What triangle `t` shows at pixel `k`, whose surface is `depths` there: a curve's, the blend of its corners' lighting; a
@@ -1628,10 +1698,12 @@ impl Scene {
             };
             // Over it, the nearest surface seen through, as much of it as the view lets show (and a
             // tinted one always a little, or selecting it would show nothing).
-            let c = match through(k).and_then(|t| Some((shaded(t, k, &seen_lit, &near)?, self.tris.get(t)?.owner))) {
-                Some((s, owner)) => {
+            let c = match through(k)
+                .and_then(|t| Some((shaded(t, k, &seen_lit, &near)?, self.tris.get(t)?.owner, self.tris.get(t)?.alpha(look))))
+            {
+                Some((s, owner, alpha)) => {
                     let tint = tints.get(&owner);
-                    let weight = 1.0 - f64::from(look.transparency(owner)) / 100.0;
+                    let weight = 1.0 - f64::from(alpha) / 100.0;
                     blend(c, tint.map_or(s, |c| mix(s, *c)), if tint.is_some() { weight.max(0.35) } else { weight })
                 }
                 None => c,
@@ -1662,7 +1734,6 @@ impl Scene {
         // Unselected, the two edges nearer the camera are left out, as in Revit; selected, all four.
         // Its head goes past the far edges' right end: its name lettered, all of it picking the level.
         if clip.is_none() {
-            let slack = 1.5 / cam.scale.max(1e-9);
             let color = |id: Id| (plain || look.shows(id)).then(|| tints.get(&id).map_or((look.edge(id, DATUM), false), |c| (*c, true)));
             // A section box leaves out a level whose plane is above or below it, and cuts the rest to its sides.
             let levels: Vec<(Id, String, [P3; 4])> = match cut {
@@ -1684,18 +1755,22 @@ impl Scene {
                     }
                 };
                 for ([a, b], wide) in &marks.lines {
-                    outline((cam.project(*a), cam.project(*b)), (w, h), *wide, slack, &depth, &mut paint);
+                    outline((cam.project(*a), cam.project(*b)), (w, h), *wide, &|z| cam.slack(1.5, z), &depth, &mut paint);
                 }
-                // The rest of the head picks the level too, unpainted.
+                // The rest of the head picks the level too, unpainted: where all of it is in front of the eye.
                 let ring: Vec<P2> = marks.head.iter().map(|p| cam.project(*p)).map(|(x, y, _)| P2(x, y)).collect();
+                if !ring.iter().all(|q| q.0.is_finite() && q.1.is_finite()) {
+                    continue;
+                }
                 let z = marks.head.iter().map(|p| cam.project(*p).2).sum::<f64>() / 4.0;
+                let slack = cam.slack(1.5, z);
                 let (lo, hi) = ring.iter().fold((P2(f64::MAX, f64::MAX), P2(f64::MIN, f64::MIN)), |(lo, hi), q| {
                     (P2(lo.0.min(q.0), lo.1.min(q.1)), P2(hi.0.max(q.0), hi.1.max(q.1)))
                 });
                 let (x0, x1) = (lo.0.max(0.0).floor() as usize, hi.0.min(w as f64 - 1.0).max(0.0) as usize);
                 let (y0, y1) = (lo.1.max(0.0).floor() as usize, hi.1.min(h as f64 - 1.0).max(0.0) as usize);
-                for py in y0..=y1.min(y0 + 4 * MAX_SIDE as usize) {
-                    for px in x0..=x1.min(x0 + 4 * MAX_SIDE as usize) {
+                for py in y0..=y1.min(y0.saturating_add(4 * MAX_SIDE as usize)) {
+                    for px in x0..=x1.min(x0.saturating_add(4 * MAX_SIDE as usize)) {
                         let k = py * w + px;
                         if geom::contains(&ring, P2(px as f64 + 0.5, py as f64 + 0.5))
                             && depth.get(k).is_some_and(|d| f64::from(*d) <= z + slack)
@@ -1750,8 +1825,10 @@ fn level_marks(levels: &[(Id, String, [P3; 4])], cam: &Camera, color: &dyn Fn(Id
         let near = nearest(cam, corners);
         let mut lines = Vec::new();
         for (i, (a, b)) in corners.iter().zip(corners.iter().cycle().skip(1)).enumerate() {
-            if selected || (i != near && (i + 1) % 4 != near) {
-                lines.push(([*a, *b], 2));
+            if (selected || (i != near && (i + 1) % 4 != near))
+                && let Some(seen) = cam.in_front(*a, *b)
+            {
+                lines.push((seen, 2));
             }
         }
         let [foot, along, ..] = head.corners;
@@ -1760,8 +1837,10 @@ fn level_marks(levels: &[(Id, String, [P3; 4])], cam: &Camera, color: &dyn Fn(Id
         let to3 = |(x, y): (f32, f32)| add(add(foot, mul(d, f64::from(x) * px)), [0.0, 0.0, (height - f64::from(y)) * px]);
         for stroke in crate::font::letters(&head.name, HEAD_PAD, HEAD_PAD + HEAD_TEXT, HEAD_TEXT).lines() {
             for seg in stroke.windows(2) {
-                if let [a, b] = seg {
-                    lines.push(([to3(*a), to3(*b)], 1));
+                if let [a, b] = seg
+                    && let Some(seen) = cam.in_front(to3(*a), to3(*b))
+                {
+                    lines.push((seen, 1));
                 }
             }
         }
@@ -1776,12 +1855,12 @@ fn nearest(cam: &Camera, corners: &[P3; 4]) -> usize {
 }
 
 /// The pixels of a `w` x `h` picture a line from `a` to `b` (each a pixel and its nearness)
-/// covers, `wide` (1 or 2) px wide, where nothing in `depth` lies more than `slack` mm nearer: each to `paint`.
+/// covers, `wide` (1 or 2) px wide, where nothing in `depth` lies more than `slack` gives (for its nearness) nearer: each to `paint`.
 fn outline(
     (a, b): ((f64, f64, f64), (f64, f64, f64)),
     (w, h): (usize, usize),
     wide: u8,
-    slack: f64,
+    slack: &dyn Fn(f64) -> f64,
     depth: &[f32],
     mut paint: impl FnMut(usize),
 ) {
@@ -1800,7 +1879,7 @@ fn outline(
                 continue;
             }
             let k = py as usize * w + px as usize;
-            if depth.get(k).is_some_and(|d| f64::from(*d) <= z + slack) {
+            if depth.get(k).is_some_and(|d| f64::from(*d) <= z + slack(z)) {
                 paint(k);
             }
         }
@@ -1818,8 +1897,9 @@ pub struct Clip {
     pub y: (f64, f64),
 }
 
-/// A 3D view's section box as `cam` sees it: what of a pixel's depth, or of the model, it keeps. The view is square on, so the
-/// model point a pixel shows at a depth is the same sum for every pixel.
+/// A 3D view's section box as `cam` sees it: what of a pixel's depth, or of the model, it keeps. In a parallel view, the
+/// model point a pixel shows at a depth is the same sum for every pixel; in perspective, that sum gives the point on the plane
+/// through the target, and the point is along the line from the eye through it.
 pub(crate) struct Boxed {
     lo: P3,
     hi: P3,
@@ -1828,6 +1908,8 @@ pub(crate) struct Boxed {
     dx: P3,
     dy: P3,
     dz: P3,
+    /// In perspective, the eye and how far it is from the target.
+    eye: Option<(P3, f64)>,
 }
 
 impl Boxed {
@@ -1836,7 +1918,7 @@ impl Boxed {
         let k = 1.0 / cam.scale.max(1e-12);
         let (w, h) = (f64::from(cam.width) / 2.0, f64::from(cam.height) / 2.0);
         let o = add(cam.target, sub(mul(up, h * k), mul(right, w * k)));
-        Boxed { lo, hi, o, dx: mul(right, k), dy: mul(up, -k), dz: back }
+        Boxed { lo, hi, o, dx: mul(right, k), dy: mul(up, -k), dz: back, eye: cam.eye().zip(cam.eye_distance()) }
     }
 
     /// Whether model point `p` lies in the box.
@@ -1846,7 +1928,13 @@ impl Boxed {
 
     /// Whether what pixel `(x, y)` shows at depth `z` lies in the box.
     fn keeps(&self, x: f64, y: f64, z: f64) -> bool {
-        self.holds(std::array::from_fn(|i| self.o[i] + self.dx[i] * x + self.dy[i] * y + self.dz[i] * z))
+        match self.eye {
+            None => self.holds(std::array::from_fn(|i| self.o[i] + self.dx[i] * x + self.dy[i] * y + self.dz[i] * z)),
+            Some((eye, d)) => {
+                let k = d / (z + d);
+                self.holds(std::array::from_fn(|i| eye[i] + (self.o[i] + self.dx[i] * x + self.dy[i] * y - eye[i]) * k))
+            }
+        }
     }
 
     /// Whether triangle `t` lies wholly outside one of the box's planes, so none of it is kept.
@@ -1935,13 +2023,24 @@ pub fn camera(m: &Model, azimuth: f64, elevation: f64, scale: f64, room: f64) ->
 
 /// [`camera`] for what `look` shows of the model.
 pub fn camera_in(m: &Model, azimuth: f64, elevation: f64, scale: f64, room: f64, look: &Look) -> Camera {
-    let mut cam = Camera { azimuth, elevation: elevation.clamp(-89.0, 89.0), scale, target: [0.0; 3], width: 1, height: 1 };
+    let mut cam = Camera { azimuth, elevation: elevation.clamp(-89.0, 89.0), scale, target: [0.0; 3], width: 1, height: 1, lens: None };
     let pts: Vec<P3> = solids(m).iter().filter(|s| look.shows(s.owner())).flat_map(Solid::corners).collect();
     if let Some((target, w, h)) = extent(&cam, &pts) {
         let side = |d: f64| (d * scale + 2.0 * room).ceil().clamp(1.0, f64::from(MAX_SIDE)) as u32;
         (cam.target, cam.width, cam.height) = (target, side(w), side(h));
     }
     cam
+}
+
+/// The camera view `v` is drawn through, as large as [`camera_in`] fits it at `scale` and `room` px clear: from the view's
+/// own eye and target through its lens when it has a camera (Revit's Camera tool), else fitted over the model as the default
+/// 3D view is. A camera view on a sheet keeps the picture the fit gives, so it fills its frame the same way.
+pub fn camera_of(m: &Model, v: &crate::model::View3D, scale: f64, room: f64, look: &Look) -> Camera {
+    let fitted = camera_in(m, v.azimuth, v.elevation, scale, room, look);
+    match (v.camera, v.lens()) {
+        (Some(cam), Some(lens)) => Camera::at(cam.eye, cam.target, lens, fitted.width, fitted.height),
+        _ => fitted,
+    }
 }
 
 /// Each element's top over plan point `p`: the highest top of its solids standing over it.
@@ -1967,6 +2066,16 @@ fn mix(a: Rgb, b: Rgb) -> Rgb {
     Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
 }
 
+/// The width of the film a lens's focal length is given for, mm: a 35 mm camera's, whose frame is 36 mm across.
+pub const FILM: f64 = 36.0;
+/// The lens a 3D view is first seen through in perspective, mm.
+pub const LENS: f64 = 35.0;
+/// The shortest and longest lenses a perspective view takes, mm.
+pub const MIN_LENS: f64 = 10.0;
+pub const MAX_LENS: f64 = 600.0;
+/// How far in front of the eye a perspective picture begins, mm: what is nearer is cut away, on the processor and the card.
+pub const NEAR: f64 = 10.0;
+
 /// Where the 3D view looks from, and how much of the model its picture holds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -1974,12 +2083,89 @@ pub struct Camera {
     pub azimuth: f64,
     /// Degrees above the horizon it looks down from, within ±89.
     pub elevation: f64,
-    /// Pixels per mm.
+    /// Pixels per mm: at the target, in perspective.
     pub scale: f64,
     /// The model point in the middle of the picture.
     pub target: P3,
     pub width: u32,
     pub height: u32,
+    /// In perspective, the focal length of the lens it looks through: mm on a 35 mm camera, whose film ([`FILM`]) is the
+    /// picture's width. None for a parallel (axonometric) view. The eye stands back from the target as far as makes `scale`
+    /// true there, so orbiting turns it about the target, panning carries both, and zooming walks it in.
+    pub lens: Option<f64>,
+}
+
+/// A camera's projection, its axes worked out once for the many points of a picture.
+#[derive(Clone, Copy)]
+pub(crate) struct Projector {
+    back: P3,
+    right: P3,
+    up: P3,
+    target: P3,
+    middle: (f64, f64),
+    scale: f64,
+    /// In perspective: the focal length in px, and how far the eye is from the target, mm.
+    eye: Option<(f64, f64)>,
+}
+
+impl Projector {
+    /// The pixel `p` shows at, and how near the camera it is (larger is nearer): mm toward the camera from the target in a
+    /// parallel view; in perspective, `d² / a - d` for a point `a` in front of an eye `d` from the target, which is as near as
+    /// that is at the target and, as `1 / a` is, runs straight across the picture of a plane. Behind the eye, not a number.
+    fn at(&self, p: P3) -> (f64, f64, f64) {
+        let d = sub(p, self.target);
+        let (x, y, z) = (dot(d, self.right), dot(d, self.up), dot(d, self.back));
+        match self.eye {
+            None => (self.middle.0 + x * self.scale, self.middle.1 - y * self.scale, z),
+            Some((f, e)) => {
+                let ahead = e - z;
+                if ahead.is_nan() || ahead <= 0.0 {
+                    return (f64::NAN, f64::NAN, f64::NEG_INFINITY);
+                }
+                (self.middle.0 + x * f / ahead, self.middle.1 - y * f / ahead, e * e / ahead - e)
+            }
+        }
+    }
+
+    /// How far in front of the eye `p` is, mm; infinitely, in a parallel view.
+    fn ahead(&self, p: P3) -> f64 {
+        self.eye.map_or(f64::INFINITY, |(_, e)| e - dot(sub(p, self.target), self.back))
+    }
+
+    /// The parts of triangle `p` at least [`NEAR`] in front of the eye, each as the weights of its corners on `p`'s: the
+    /// triangle itself where it all is, none where none of it is.
+    fn in_front(&self, p: &[P3; 3]) -> ([[P3; 3]; 2], usize) {
+        const ONE: [P3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let ahead = p.map(|q| self.ahead(q) - NEAR);
+        if ahead.iter().all(|a| *a >= 0.0) {
+            return ([ONE, ONE], 1);
+        }
+        // Sutherland and Hodgman's clipping, to one plane: three corners in, four at most out.
+        let mut ring: [P3; 4] = [[0.0; 3]; 4];
+        let mut n = 0;
+        for k in 0..3 {
+            let (j, a, b) = ((k + 1) % 3, ahead[k], ahead[(k + 1) % 3]);
+            if a >= 0.0 {
+                ring[n.min(3)] = ONE[k];
+                n += 1;
+            }
+            if (a >= 0.0) != (b >= 0.0) && (a - b).abs() > 0.0 {
+                let t = a / (a - b);
+                ring[n.min(3)] = std::array::from_fn(|i| ONE[k][i] * (1.0 - t) + ONE[j][i] * t);
+                n += 1;
+            }
+        }
+        match n {
+            3 => ([[ring[0], ring[1], ring[2]], ONE], 1),
+            4 => ([[ring[0], ring[1], ring[2]], [ring[0], ring[2], ring[3]]], 2),
+            _ => ([ONE, ONE], 0),
+        }
+    }
+}
+
+/// The points weights `w` give on triangle `p`'s corners.
+pub(crate) fn weighed(p: &[P3; 3], w: &[P3; 3]) -> [P3; 3] {
+    w.map(|w| std::array::from_fn(|i| w[0] * p[0][i] + w[1] * p[1][i] + w[2] * p[2][i]))
 }
 
 impl Camera {
@@ -1991,20 +2177,136 @@ impl Camera {
         (back, right, cross(back, right))
     }
 
-    /// The pixel `p` shows at, and how near the camera it is (larger is nearer).
-    pub fn project(&self, p: P3) -> (f64, f64, f64) {
+    pub(crate) fn projector(&self) -> Projector {
         let (back, right, up) = self.axes();
-        let d = sub(p, self.target);
-        (f64::from(self.width) / 2.0 + dot(d, right) * self.scale, f64::from(self.height) / 2.0 - dot(d, up) * self.scale, dot(d, back))
+        let eye = self.focal().zip(self.eye_distance());
+        let middle = (f64::from(self.width) / 2.0, f64::from(self.height) / 2.0);
+        Projector { back, right, up, target: self.target, middle, scale: self.scale, eye }
+    }
+
+    /// In perspective, the lens's focal length in px.
+    fn focal(&self) -> Option<f64> {
+        let lens = self.lens.filter(|l| l.is_finite() && *l > 0.0)?;
+        Some(f64::from(self.width.max(1)) * lens / FILM)
+    }
+
+    /// In perspective, how far the eye is from the target, mm.
+    pub fn eye_distance(&self) -> Option<f64> {
+        Some(self.focal()? / self.scale.max(1e-12))
+    }
+
+    /// In perspective, where the eye is.
+    pub fn eye(&self) -> Option<P3> {
+        let (back, ..) = self.axes();
+        Some(add(self.target, mul(back, self.eye_distance()?)))
+    }
+
+    /// In perspective, how high the eye is, mm.
+    pub fn eye_elevation(&self) -> Option<f64> {
+        Some(self.eye()?[2])
+    }
+
+    /// The eye raised or lowered to height `z` (in perspective; a parallel view is as it was), looking at the same target from
+    /// as far across the plan: it looks down, or up, the more for it.
+    pub fn with_eye_elevation(self, z: f64) -> Camera {
+        let (Some(eye), Some(f)) = (self.eye(), self.focal()) else { return self };
+        if !z.is_finite() {
+            return self;
+        }
+        let across = (eye[0] - self.target[0]).hypot(eye[1] - self.target[1]).max(1e-6);
+        let elevation = (z - self.target[2]).atan2(across).to_degrees().clamp(-89.0, 89.0);
+        let d = across / elevation.to_radians().cos();
+        Camera { elevation, scale: (f / d).clamp(1e-6, 50.0), ..self }
+    }
+
+    /// The picture made `width` by `height` px, through `lens` (none for a parallel view). In perspective the eye stays where
+    /// it stood, so a wider picture or a longer lens takes in less round the target; a parallel view keeps its scale, and
+    /// one turned to perspective keeps it at the target.
+    pub fn sized(self, width: u32, height: u32, lens: Option<f64>) -> Camera {
+        let next = Camera { width, height, lens, ..self };
+        match (self.eye_distance(), next.focal()) {
+            (Some(d), Some(f)) => Camera { scale: (f / d).clamp(1e-6, 50.0), ..next },
+            _ => next,
+        }
+    }
+
+    /// The camera that stands at `eye`, looking at `target`, through `lens`, into a picture `width` by `height` px: the
+    /// exact view of [`ViewCamera`](crate::model::ViewCamera) (its eye and target), so `eye()` is `eye` and `target` is
+    /// `target` — the render path for a camera view. Its azimuth and elevation are the direction from the eye to the
+    /// target, as [`axes`](Self::axes) reads them.
+    pub fn at(eye: P3, target: P3, lens: f64, width: u32, height: u32) -> Camera {
+        let lens = lens.clamp(MIN_LENS, MAX_LENS);
+        let back = sub(eye, target);
+        let d = dot(back, back).sqrt().max(1e-9);
+        let back = mul(back, 1.0 / d);
+        // The angle of `back`, as axes() rebuilds it: up within ±89°, and round from east.
+        let elevation = back[2].clamp(-1.0, 1.0).asin().to_degrees().clamp(-89.0, 89.0);
+        let azimuth = back[1].atan2(back[0]).to_degrees();
+        let f = f64::from(width.max(1)) * lens / FILM;
+        let scale = (f / d).clamp(1e-6, 50.0);
+        Camera { azimuth, elevation, scale, target, width, height, lens: Some(lens) }
+    }
+
+    /// The pixel `p` shows at, and how near the camera it is (larger is nearer): mm toward the camera from the target in a
+    /// parallel view, and as near as that at the target in perspective (where it is `d² / a - d` for a point `a` in front of
+    /// an eye `d` from the target, which runs straight across the picture of a plane). Behind the eye, not a number.
+    pub fn project(&self, p: P3) -> (f64, f64, f64) {
+        self.projector().at(p)
+    }
+
+    /// The model point that pixel `(x, y)` shows at nearness `z`, as [`project`](Self::project) gives it.
+    pub fn point_at(&self, (x, y): (f64, f64), z: f64) -> P3 {
+        let (back, ..) = self.axes();
+        let p = self.unproject((x, y));
+        match (self.eye(), self.eye_distance()) {
+            (Some(eye), Some(d)) => add(eye, mul(sub(p, eye), d / (z + d))),
+            _ => add(p, mul(back, z)),
+        }
+    }
+
+    /// Toward the camera from `p`: from anywhere the same way in a parallel view, toward the eye in perspective.
+    pub fn toward(&self, p: P3) -> P3 {
+        match self.eye() {
+            Some(eye) => sub(eye, p),
+            None => self.axes().0,
+        }
+    }
+
+    /// What of the line from `a` to `b` is at least [`NEAR`] in front of the eye: all of it in a parallel view.
+    pub fn in_front(&self, a: P3, b: P3) -> Option<[P3; 2]> {
+        let k = self.projector();
+        let (da, db) = (k.ahead(a) - NEAR, k.ahead(b) - NEAR);
+        match (da >= 0.0, db >= 0.0) {
+            (true, true) => Some([a, b]),
+            (false, false) => None,
+            _ => {
+                let cut = add(a, mul(sub(b, a), da / (da - db)));
+                Some(if da >= 0.0 { [a, cut] } else { [cut, b] })
+            }
+        }
+    }
+
+    /// How much nearer, in nearness as [`project`](Self::project) gives it, a surface may be than a line at nearness `z` and
+    /// leave it showing: `px` pixels' worth, which in perspective is less the further off it is.
+    pub fn slack(&self, px: f64, z: f64) -> f64 {
+        let base = px / self.scale.max(1e-9);
+        match self.eye_distance() {
+            Some(d) => base * (1.0 + z / d).max(0.0),
+            None => base,
+        }
     }
 
     /// The point at pixel `(x, y)` on the horizontal plane at height `z`; none where the view is
-    /// level with it.
+    /// level with it, or in perspective where the plane is behind the eye there.
     pub fn on_plane(&self, at: (f64, f64), z: f64) -> Option<P3> {
         let (back, ..) = self.axes();
         let p = self.unproject(at);
-        let t = (z - p[2]) / back[2];
-        (back[2].abs() > 1e-9 && t.is_finite()).then(|| add(p, mul(back, t)))
+        let (from, along) = match self.eye() {
+            Some(eye) => (eye, unit(sub(p, eye))),
+            None => (p, back),
+        };
+        let t = (z - from[2]) / along[2];
+        (along[2].abs() > 1e-9 && t.is_finite() && (self.lens.is_none() || t > 0.0)).then(|| add(from, mul(along, t)))
     }
 
     /// The model point at pixel `(x, y)` on the plane through the target, square to the view.
@@ -2021,23 +2323,37 @@ impl Camera {
         Camera { azimuth: if a > 180.0 { a - 360.0 } else { a }, elevation: (self.elevation + up).clamp(-89.0, 89.0), ..self }
     }
 
-    /// Moved so the model point under pixel `from` comes under pixel `to`.
+    /// Moved so the model point under pixel `from` comes under pixel `to`: in perspective, the point on the plane through
+    /// the target.
     pub fn pan(self, from: (f64, f64), to: (f64, f64)) -> Camera {
         Camera { target: add(self.target, sub(self.unproject(from), self.unproject(to))), ..self }
     }
 
-    /// Zoomed by `factor` about pixel `at`, which keeps its model point.
+    /// Zoomed by `factor` about pixel `at`, which keeps its model point (in perspective, on the plane through the target,
+    /// which the eye walks toward).
     pub fn zoom(self, factor: f64, at: (f64, f64)) -> Camera {
         let p = self.unproject(at);
         let zoomed = Camera { scale: (self.scale * factor).clamp(1e-6, 50.0), ..self };
         zoomed.pan(zoomed.project_xy(p), at)
     }
 
-    /// How far, mm, a drag on the picture from pixel `from` to pixel `to` moves a point along the model's axis `axis` (0 for
-    /// x, 1 for y, 2 for z): the drag's part along that axis as the picture shows it. None where the axis points at the camera.
-    pub fn along(&self, axis: usize, from: (f64, f64), to: (f64, f64)) -> Option<f64> {
+    /// How far, mm, a drag on the picture from pixel `from` to pixel `to` moves model point `at` along the model's axis `axis`
+    /// (0 for x, 1 for y, 2 for z): the drag's part along that axis as the picture shows it there. None where the axis points
+    /// at the camera.
+    pub fn along(&self, axis: usize, at: P3, from: (f64, f64), to: (f64, f64)) -> Option<f64> {
         let unit: P3 = std::array::from_fn(|i| if i == axis { 1.0 } else { 0.0 });
-        let (o, e) = (self.project_xy([0.0; 3]), self.project_xy(unit));
+        // In perspective, a mm along the axis shows shorter the further off it is: the point on the axis through `at` nearest
+        // the line from the eye through each pixel, so what is dragged stays under the pointer.
+        if let Some(eye) = self.eye() {
+            let on_axis = |q: (f64, f64)| {
+                let ray = sub(self.unproject(q), eye);
+                let (b, c, w) = (dot(unit, ray), dot(ray, ray), sub(at, eye));
+                let square = c - b * b;
+                (axis < 3 && square > 1e-9 * c).then(|| (b * dot(ray, w) - c * dot(unit, w)) / square)
+            };
+            return Some(on_axis(to)? - on_axis(from)?).filter(|d| d.is_finite());
+        }
+        let (o, e) = (self.project_xy(at), self.project_xy(add(at, unit)));
         let (dx, dy) = (e.0 - o.0, e.1 - o.1);
         let shown = dx * dx + dy * dy;
         // Less than a twentieth of a pixel for 100 m: square to the picture.
@@ -2048,6 +2364,18 @@ impl Camera {
         let (x, y, _) = self.project(p);
         (x, y)
     }
+}
+
+/// `cam` with its eye in the middle of `m`'s plan, 1.6 m up, a metre from its target and looking level through a 20 mm lens:
+/// for tests of what a camera inside a building sees.
+#[doc(hidden)]
+pub fn inside(m: &Model, cam: Camera) -> Camera {
+    let (lo, hi) = m.model_box().unwrap_or(([0.0; 3], [0.0; 3]));
+    let cam = Camera { elevation: 0.0, lens: Some(20.0), ..cam };
+    let (back, ..) = cam.axes();
+    let middle = [(lo[0] + hi[0]) / 2.0 - back[0] * 1000.0, (lo[1] + hi[1]) / 2.0 - back[1] * 1000.0, 1600.0];
+    let f = cam.focal().unwrap_or(1.0);
+    Camera { target: middle, scale: f / 1000.0, ..cam }
 }
 
 /// A picture of the 3D view: its pixels, and which element each one shows.
@@ -2066,6 +2394,12 @@ impl Image {
     fn index(&self, x: f64, y: f64) -> Option<usize> {
         let (w, h) = (f64::from(self.width), f64::from(self.height));
         (x >= 0.0 && y >= 0.0 && x < w && y < h).then(|| y as usize * self.width as usize + x as usize)
+    }
+
+    /// Whether a pixel is covered by model geometry, including linked elements and meshes
+    /// without named faces. Canvas backgrounds may show through only where this is false.
+    pub fn covered(&self, x: f64, y: f64) -> bool {
+        self.index(x, y).and_then(|i| self.hit.get(i)).is_some_and(|t| *t != u32::MAX)
     }
 
     /// The element the pixel at `(x, y)` shows.
@@ -2269,6 +2603,18 @@ mod tests {
         ] {
             assert!(scene.surface_hit(100002, origin, direction, reach).is_err());
         }
+    }
+
+    #[test]
+    fn background_coverage_includes_geometry_without_a_named_face() {
+        let image =
+            Image { width: 2, height: 1, rgba: vec![255; 8], hit: vec![0, u32::MAX], owners: vec![Id::MAX], faces: Arc::new(vec![""]) };
+        assert!(image.covered(0.0, 0.0));
+        assert_eq!(image.face(0.0, 0.0), None);
+        assert_eq!(image.pick(0.0, 0.0), None, "linked geometry is covered even though it cannot be picked");
+        assert!(!image.covered(1.0, 0.0));
+        assert!(!image.covered(-1.0, 0.0));
+        assert!(!image.covered(2.0, 0.0));
     }
 
     #[test]
@@ -2645,6 +2991,43 @@ mod tests {
         s
     }
 
+    #[test]
+    fn a_glass_layer_lets_what_is_behind_a_wall_show_through_in_a_plain_view() {
+        let build = |layer: &str, columns: bool| {
+            let mut s = Session::new();
+            s.script(&format!(
+                r#"type {{"category": "wall", "name": "Curtain", "layers": [{{"function": "structure", "material": "{layer}", "thickness": 100}}]}}
+                   wall {{"points": [[0,0],[8000,0]], "type": "Curtain"}}"#
+            ))
+            .unwrap();
+            if columns {
+                s.script("column {\"at\": [3500, -900]}\ncolumn {\"at\": [3500, 900]}").unwrap();
+            }
+            s
+        };
+        let (glass, plain_wall) = (build("Glass", true), build("Concrete block", true));
+        // One camera for all four, so the pictures line up.
+        let cam = Scene::new(&glass.model).fit(AZIMUTH, ELEVATION, 400, 300);
+        let render = |s: &Session| {
+            let img = Scene::new(&s.model).render(&cam, &[]);
+            let wall = s.model.elements.iter().find(|(_, e)| matches!(e, Element::Wall(_))).map(|(id, _)| *id);
+            (img, wall)
+        };
+        let (g, gw) = render(&glass);
+        let (o, ow) = render(&plain_wall);
+        let (g0, _) = render(&build("Glass", false));
+        let (o0, _) = render(&build("Concrete block", false));
+        let covered =
+            |img: &Image, wall| (0..400 * 300).filter(|i| img.pick((i % 400) as f64, (i / 400) as f64) == wall).collect::<Vec<_>>();
+        let differs =
+            |a: &Image, b: &Image, px: &[usize]| px.iter().filter(|i| a.rgba[**i * 4..**i * 4 + 3] != b.rgba[**i * 4..**i * 4 + 3]).count();
+        let (gc, oc) = (covered(&g, gw), covered(&o, ow));
+        assert!(gc.len() > 300 && oc.len() > 300);
+        assert!(differs(&g, &g0, &gc) > 50, "a column behind the glass shows through it");
+        let (seen, not) = (differs(&g, &g0, &gc), differs(&o, &o0, &oc));
+        assert!(not * 10 < seen, "and not through an opaque wall: {not} against {seen} pixels");
+    }
+
     /// A height in the middle of a brick course (each 75 mm), up a wall.
     const COURSE: f64 = 1537.5;
 
@@ -2854,6 +3237,326 @@ mod tests {
         let zoomed = cam.zoom(2.0, (100.0, 80.0));
         let (x, y) = at(&zoomed, p);
         assert!((x - 100.0).abs() < 1e-6 && (y - 80.0).abs() < 1e-6 && zoomed.scale == cam.scale * 2.0);
+    }
+
+    #[test]
+    fn a_perspective_camera_sees_the_nearer_of_two_like_things_larger_and_orbits_pans_and_zooms_as_ever() {
+        let s = house();
+        let scene = Scene::new(&s.model);
+        let flat = scene.fit(AZIMUTH, ELEVATION, 400, 300);
+        let cam = scene.fit_from(Camera { lens: Some(LENS), ..flat }, &Look::default());
+        // All the house is in the picture, and the eye stands back from the target as far as the lens and scale say.
+        for (x, y) in [(0.0, 0.0), (8000.0, 0.0), (8000.0, 6000.0), (0.0, 6000.0)] {
+            for z in [0.0, 3000.0] {
+                let (px, py) = at(&cam, [x, y, z]);
+                assert!((0.0..400.0).contains(&px) && (0.0..300.0).contains(&py), "[{x}, {y}, {z}] at {px}, {py}");
+            }
+        }
+        let d = cam.eye_distance().unwrap();
+        assert!((d - 400.0 * LENS / FILM / cam.scale).abs() < 1e-6);
+        assert_eq!(flat.eye_distance(), None, "a parallel view has no eye");
+        // The south-east corner is nearer the eye than the north-west one: its 3 m of height is longer in the picture.
+        let tall = |x: f64, y: f64| at(&cam, [x, y, 0.0]).1 - at(&cam, [x, y, 3000.0]).1;
+        assert!(tall(8000.0, 0.0) > tall(0.0, 6000.0) * 1.1, "{} {}", tall(8000.0, 0.0), tall(0.0, 6000.0));
+        let even = |x: f64, y: f64| at(&flat, [x, y, 0.0]).1 - at(&flat, [x, y, 3000.0]).1;
+        assert!((even(8000.0, 0.0) - even(0.0, 6000.0)).abs() < 1e-9, "parallel, they are as long");
+        // Nearer is larger in depth, and a pixel's depth gives back the point it shows.
+        let (near, far) = (cam.project([8000.0, 0.0, 0.0]), cam.project([0.0, 6000.0, 0.0]));
+        assert!(near.2 > far.2);
+        let back = cam.point_at((near.0, near.1), near.2);
+        assert!(dist(back, [8000.0, 0.0, 0.0]) < 1e-6, "{back:?}");
+        // Behind the eye, nothing.
+        let behind = add(cam.eye().unwrap(), mul(sub(cam.eye().unwrap(), cam.target), 0.5));
+        assert!(cam.project(behind).0.is_nan());
+        // Orbit, pan and zoom as a parallel view does: the target in the middle, the point under the cursor kept.
+        let turned = cam.orbit(90.0, 10.0);
+        let (x, y) = at(&turned, turned.target);
+        assert!((x - 200.0).abs() < 1e-9 && (y - 150.0).abs() < 1e-9);
+        assert!((turned.eye_distance().unwrap() - d).abs() < 1e-9, "orbiting keeps the eye as far off");
+        let p = cam.unproject((100.0, 80.0));
+        let (x, y) = at(&cam.pan((100.0, 80.0), (150.0, 120.0)), p);
+        assert!((x - 150.0).abs() < 1e-6 && (y - 120.0).abs() < 1e-6);
+        let zoomed = cam.zoom(2.0, (100.0, 80.0));
+        let (x, y) = at(&zoomed, p);
+        assert!((x - 100.0).abs() < 1e-6 && (y - 80.0).abs() < 1e-6);
+        assert!((zoomed.eye_distance().unwrap() - d / 2.0).abs() < 1e-6, "zooming in walks the eye in");
+        // A wider picture or a longer lens leaves the eye where it stood.
+        for next in [cam.sized(800, 300, Some(LENS)), cam.sized(400, 300, Some(85.0))] {
+            assert!(dist(next.eye().unwrap(), cam.eye().unwrap()) < 1e-6);
+        }
+        assert_eq!(cam.sized(400, 300, None).eye(), None, "back to parallel");
+        assert_eq!(flat.sized(400, 300, Some(LENS)).scale, flat.scale, "into perspective, the target keeps its scale");
+        // The eye raised to 1.6 m: the target stays, and the eye is that high, as far across the plan from it.
+        let low = cam.with_eye_elevation(1600.0);
+        let eye = low.eye().unwrap();
+        assert!((eye[2] - 1600.0).abs() < 1e-6 && dist(low.target, cam.target) < 1e-9, "{eye:?}");
+        let across = |c: &Camera| (c.eye().unwrap()[0] - c.target[0]).hypot(c.eye().unwrap()[1] - c.target[1]);
+        assert!((across(&low) - across(&cam)).abs() < 1e-6);
+        assert_eq!(low.eye_elevation(), Some(eye[2]));
+        // A drag from a point's picture to another's moves it along an axis by as far as they are apart, however foreshortened.
+        let (a, b) = ([8000.0, 0.0, 3000.0], [8000.0, 0.0, 500.0]);
+        let moved = cam.along(2, a, at(&cam, a), at(&cam, b)).unwrap();
+        assert!((moved + 2500.0).abs() < 1e-6, "{moved}");
+        let moved = cam.along(1, a, at(&cam, a), at(&cam, [8000.0, 4000.0, 3000.0])).unwrap();
+        assert!((moved - 4000.0).abs() < 1e-6, "{moved}");
+    }
+
+    #[test]
+    fn a_3d_view_is_turned_to_perspective_through_a_lens_and_back_and_renders_so() {
+        use serde_json::json;
+        let mut s = house();
+        let lens = |s: &Session| match s.model.default_3d().and_then(|v| s.model.elements.get(v)) {
+            Some(Element::View3D(v)) => v.perspective.filter(|p| p.on).map(|p| p.lens),
+            _ => None,
+        };
+        assert_eq!(lens(&s), None, "parallel to begin with");
+        let r = s.execute("perspective", &json!({})).unwrap();
+        assert_eq!((r["on"].as_bool(), r["lens"].as_f64()), (Some(true), Some(LENS)));
+        assert_eq!(lens(&s), Some(LENS));
+        s.execute("perspective", &json!({"lens": 50})).unwrap();
+        assert_eq!(lens(&s), Some(50.0));
+        // A lens no camera has, or a view that isn't 3D, is refused and changes nothing.
+        for bad in [json!({"lens": 2}), json!({"lens": 5000}), json!({"lens": "long"}), json!({"on": "yes"}), json!({"view": "Level 1"})] {
+            assert!(s.execute("perspective", &bad).is_err(), "{bad}");
+        }
+        assert_eq!(lens(&s), Some(50.0));
+        // The 3D view renders as its camera sees it, and from as high as the eye is put.
+        let png = |r: &serde_json::Value| r["pngBase64"].as_str().map(str::len);
+        let seen = s.execute("render", &json!({"view": "{3D}", "width": 200, "height": 150})).unwrap();
+        assert_eq!(seen["lens"].as_f64(), Some(50.0));
+        let low = s.execute("render", &json!({"view": "{3D}", "width": 200, "height": 150, "eye_elevation": 1600})).unwrap();
+        assert!((low["eye_elevation"].as_f64().unwrap() - 1600.0).abs() < 1e-6);
+        assert_ne!(png(&seen), png(&low));
+        // Turned off, it keeps its lens for when it's turned on again.
+        let r = s.execute("perspective", &json!({"on": false})).unwrap();
+        assert_eq!((r["on"].as_bool(), r["lens"].as_f64()), (Some(false), Some(50.0)));
+        assert_eq!(lens(&s), None);
+        let flat = s.execute("render", &json!({"view": "{3D}", "width": 200, "height": 150})).unwrap();
+        assert!(flat["lens"].is_null() && flat["eye_elevation"].is_null());
+        assert!(s.execute("render", &json!({"view": "{3D}", "eye_elevation": 1600})).is_err(), "a parallel view has no eye");
+        s.execute("perspective", &json!({"on": true})).unwrap();
+        assert_eq!(lens(&s), Some(50.0));
+        // It is the view's, and saved with it.
+        let reopened = crate::model::Model::read(&s.model.to_json().unwrap()).unwrap().0;
+        assert!(
+            matches!(reopened.default_3d().and_then(|v| reopened.elements.get(v)), Some(Element::View3D(v)) if v.perspective.is_some())
+        );
+    }
+
+    fn dist(a: P3, b: P3) -> f64 {
+        dot(sub(a, b), sub(a, b)).sqrt()
+    }
+
+    /// The `camera` command: it creates a named perspective 3D view from an eye and a target, changes an
+    /// existing one, and reads a camera back, as MCP and the desktop use it.
+    #[test]
+    fn a_camera_command_makes_and_reads_a_camera_view_from_an_eye_and_a_target() {
+        use serde_json::json;
+        let mut s = house();
+        // The camera and the lit lens of the view named `name`, if it is a 3D view with one.
+        let camera = |s: &Session, name: &str| -> Option<(crate::model::ViewCamera, Option<f64>)> {
+            s.model.elements.iter().find_map(|(_, e)| match e {
+                Element::View3D(v) if v.name == name => Some((v.camera?, v.perspective.filter(|p| p.on).map(|p| p.lens))),
+                _ => None,
+            })
+        };
+        // Creation: a new view stands where the eye looks at the target, in perspective, named by number.
+        let eye = [-5000.0, -4000.0, 1600.0];
+        let target = [4000.0, 3000.0, 1200.0];
+        let r = s.execute("camera", &json!({"eye": eye, "target": target})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        assert_eq!(r["name"].as_str(), Some("Camera 1"));
+        assert_eq!((r["eye"].clone(), r["target"].clone()), (json!(eye), json!(target)));
+        assert_eq!((r["lens"].as_f64(), r["perspective"].as_bool()), (Some(LENS), Some(true)));
+        assert_eq!(camera(&s, "Camera 1").map(|(_, l)| l), Some(Some(LENS)));
+        assert!(matches!(s.model.elements.get(id), Some(Element::View3D(v)) if v.name == "Camera 1"));
+        // A second camera is named after the first's.
+        let r2 = s.execute("camera", &json!({"eye": [0.0, -8000.0, 1700.0], "target": [4000.0, 3000.0, 1000.0], "lens": 24})).unwrap();
+        assert_eq!(r2["name"].as_str(), Some("Camera 2"));
+        assert_eq!(r2["lens"].as_f64(), Some(24.0));
+        // Changing a view's camera keeps its id and its number.
+        let moved = s.execute("camera", &json!({"view": "Camera 1", "eye": [-6000.0, -5000.0, 2000.0], "target": target})).unwrap();
+        assert_eq!(moved["view"].as_u64(), Some(id));
+        assert_eq!(camera(&s, "Camera 1").map(|(c, _)| c.eye), Some([-6000.0, -5000.0, 2000.0]));
+        // Its lens (its angle of view) changes on the same view, keeping its id and its points.
+        let relensed =
+            s.execute("camera", &json!({"view": "Camera 1", "eye": [-6000.0, -5000.0, 2000.0], "target": target, "lens": 50})).unwrap();
+        assert_eq!((relensed["view"].as_u64(), relensed["lens"].as_f64()), (Some(id), Some(50.0)));
+        assert_eq!(camera(&s, "Camera 1").map(|(c, l)| (c.eye, l)), Some(([-6000.0, -5000.0, 2000.0], Some(50.0))));
+        // Reading the default `{3D}` before it was ever made: no camera, not in perspective, and reading made nothing.
+        let before = s.execute("camera", &json!({"view": "{3D}"})).unwrap();
+        assert_eq!(
+            (before["eye"].clone(), before["target"].clone(), before["perspective"].clone()),
+            (json!(null), json!(null), json!(false))
+        );
+        assert!(s.model.default_3d().is_none(), "reading made nothing");
+        // A lens alone on a view with no camera yet has no points to keep: refused, and it makes nothing.
+        assert!(s.execute("camera", &json!({"view": "{3D}", "lens": 50})).is_err());
+        assert!(s.model.default_3d().is_none(), "a refused change made nothing");
+        // The default 3D view can be given a camera too, by name.
+        s.execute("camera", &json!({"view": "{3D}", "eye": [0.0, -12000.0, 9000.0], "target": [4000.0, 3000.0, 1500.0]})).unwrap();
+        assert!(matches!(s.model.default_3d().and_then(|v| s.model.elements.get(v)), Some(Element::View3D(v)) if v.camera.is_some()));
+        // Reading: the camera comes back with its lens; a view without one says so.
+        let read = s.execute("camera", &json!({"view": "Camera 1"})).unwrap();
+        assert_eq!((read["eye"].clone(), read["target"].clone()), (json!([-6000.0, -5000.0, 2000.0]), json!(target)));
+        assert_eq!((read["lens"].as_f64(), read["perspective"].as_bool()), (Some(50.0), Some(true)));
+        // A lens alone is a change, not a read: it keeps the eye and the target.
+        let relensed_only = s.execute("camera", &json!({"view": "Camera 1", "lens": 80})).unwrap();
+        assert_eq!(
+            (relensed_only["eye"].clone(), relensed_only["target"].clone(), relensed_only["lens"].as_f64()),
+            (json!([-6000.0, -5000.0, 2000.0]), json!(target), Some(80.0))
+        );
+        // A point alone moves just that point; the other stays where the camera had it.
+        let eyed_only = s.execute("camera", &json!({"view": "Camera 1", "eye": [-7000.0, -4000.0, 2100.0]})).unwrap();
+        assert_eq!(eyed_only["target"], json!(target));
+        assert_eq!(camera(&s, "Camera 1").map(|(c, l)| (c.eye, l)), Some(([-7000.0, -4000.0, 2100.0], Some(80.0))));
+        // Changed camera, still read back.
+        let plain = s.execute("camera", &json!({"view": "Camera 2"})).unwrap();
+        assert_eq!(plain["eye"], json!([0.0, -8000.0, 1700.0]));
+        // The built camera's eye and target are the ones given (the render path uses them).
+        let built = Camera::at(eye, target, LENS, 400, 300);
+        assert!((built.eye().unwrap()[0] - eye[0]).abs() < 1e-6 && dist(built.eye().unwrap(), eye) < 1e-6, "{:?}", built.eye());
+        assert_eq!(built.target, target);
+        assert_eq!(built.lens, Some(LENS));
+        // It is saved with the project and read back.
+        let reopened = crate::model::Model::read(&s.model.to_json().unwrap()).unwrap().0;
+        let again = reopened.elements.iter().find(|(_, e)| matches!(e, Element::View3D(v) if v.name == "Camera 1"));
+        assert!(again.is_some_and(|(_, e)| matches!(e, Element::View3D(v) if v.camera.is_some())), "the camera is saved");
+    }
+
+    /// What the `camera` command refuses: an eye at the target, bad coordinates, a lens no camera has, a view that
+    /// isn't 3D, and a missing eye or target when one is asked for.
+    #[test]
+    fn the_camera_command_refuses_what_no_camera_would_be() {
+        use serde_json::json;
+        let mut s = house();
+        let eye = [0.0, -8000.0, 1600.0];
+        let target = [4000.0, 3000.0, 1200.0];
+        for bad in [
+            json!({"eye": eye, "target": eye}),
+            json!({"eye": eye}),
+            json!({"target": target}),
+            json!({"eye": [f64::MAX, 0.0, 0.0], "target": target}),
+            json!({"eye": "far", "target": target}),
+            json!({"eye": [0.0, -8000.0], "target": target}),
+            json!({"eye": eye, "target": target, "lens": 2}),
+            json!({"eye": eye, "target": target, "lens": 5000}),
+            json!({"view": "Level 1", "eye": eye, "target": target}),
+            json!({"view": "nowhere", "eye": eye, "target": target}),
+        ] {
+            assert!(s.execute("camera", &bad).is_err(), "{bad}");
+        }
+        // A changed view stays as it was after a refused change.
+        s.execute("camera", &json!({"eye": eye, "target": target})).unwrap();
+        s.execute("camera", &json!({"view": "Camera 1", "eye": [1000.0, -9000.0, 1700.0], "target": target})).unwrap();
+        assert!(s.execute("camera", &json!({"view": "Camera 1", "eye": eye, "target": eye})).is_err());
+        assert!(
+            matches!(
+                s.model.elements.iter().find(|(_, e)| matches!(e, Element::View3D(v) if v.name == "Camera 1")),
+                Some((_, Element::View3D(v))) if v.camera == Some(crate::model::ViewCamera { eye: [1000.0, -9000.0, 1700.0], target })
+            ),
+            "the refused change left the camera alone"
+        );
+    }
+
+    /// A camera view renders from its own eye through its lens, and its picture differs from the default's.
+    #[test]
+    fn a_camera_view_renders_from_where_its_camera_stands() {
+        use serde_json::json;
+        let mut s = house();
+        s.execute("camera", &json!({"eye": [-5000.0, -4000.0, 1600.0], "target": [4000.0, 3000.0, 1200.0]})).unwrap();
+        let png = |r: &serde_json::Value| r["pngBase64"].as_str().map(str::len);
+        let named = s.execute("render", &json!({"view": "Camera 1", "width": 300, "height": 200})).unwrap();
+        assert_eq!(named["kind"].as_str(), Some("3D view"));
+        assert_eq!(named["eye"], json!([-5000.0, -4000.0, 1600.0]));
+        assert_eq!(named["lens"].as_f64(), Some(LENS));
+        assert!(png(&named).is_some());
+        // The default 3D view, fitted over the model, looks different.
+        let flat = s.execute("render", &json!({"view": "{3D}", "width": 300, "height": 200})).unwrap();
+        assert_ne!(png(&named), png(&flat));
+        // Rendering the camera again is stable.
+        let again = s.execute("render", &json!({"view": "Camera 1", "width": 300, "height": 200})).unwrap();
+        assert_eq!(png(&named), png(&again));
+        // A camera view renders through its lens, and asks for a usable picture.
+        assert!(s.execute("render", &json!({"view": "Camera 1", "width": 5})).is_ok());
+    }
+
+    /// A camera stands on its level's plan: its mark is drawn there and picks as the view; another level's plan doesn't show it.
+    #[test]
+    fn a_camera_shows_on_its_levels_plan_and_a_pick_there_finds_it() {
+        use serde_json::json;
+        let mut s = house();
+        let r = s.execute("camera", &json!({"eye": [12000.0, 3000.0, 1600.0], "target": [4000.0, 3000.0, 1200.0]})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        let d = crate::render::plan(&s.model, 100000, 900, 700);
+        assert!(d.owners.iter().flatten().any(|o| *o == id), "its mark is on Level 1's plan");
+        assert_eq!(d.pick(d.view.px(P2(12000.0, 3000.0)), 8.0), Some(id), "a pick at its eye finds the view");
+        // Level 2's plan doesn't show it: the camera stands on Level 1.
+        let up = crate::render::plan(&s.model, 100001, 900, 700);
+        assert!(!up.owners.iter().flatten().any(|o| *o == id), "not on another level's plan");
+        // Raised through Level 2's mark, it stands on Level 2's plan at once: the level follows the eye.
+        s.execute("camera", &json!({"view": "Camera 1", "eye": [12000.0, 3000.0, 4000.0]})).unwrap();
+        assert!(!crate::render::plan(&s.model, 100000, 900, 700).owners.iter().flatten().any(|o| *o == id), "gone from Level 1");
+        assert!(
+            crate::render::plan(&s.model, 100001, 900, 700).owners.iter().flatten().any(|o| *o == id),
+            "its mark follows its eye to Level 2"
+        );
+    }
+
+    /// Moving or mirroring a camera's mark on the plan takes the camera as a whole (each point keeping its height); a view
+    /// with no camera of its own still has no place in plan.
+    #[test]
+    fn a_camera_view_moves_on_the_plan_as_a_whole() {
+        use serde_json::json;
+        let mut s = house();
+        let r = s.execute("camera", &json!({"eye": [1500.0, -2200.0, 1600.0], "target": [5000.0, 3000.0, 1200.0]})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        let cam = |s: &Session| match s.model.elements.get(id) {
+            Some(Element::View3D(v)) => v.camera,
+            _ => None,
+        };
+        // Dragged east and north: both points go, each keeping its height.
+        s.execute("move", &json!({"ids": [id], "by": [2000.0, 500.0]})).unwrap();
+        assert_eq!(
+            cam(&s),
+            Some(crate::model::ViewCamera { eye: [3500.0, -1700.0, 1600.0], target: [7000.0, 3500.0, 1200.0] }),
+            "the mark drags the camera with it"
+        );
+        assert_eq!(s.model.check(), Ok(()));
+        // Mirrored over the east-west line: it looks back the other way, still at its heights.
+        s.execute("mirror", &json!({"ids": [id], "axis": [[0.0, 0.0], [1000.0, 0.0]]})).unwrap();
+        assert_eq!(
+            cam(&s),
+            Some(crate::model::ViewCamera { eye: [3500.0, 1700.0, 1600.0], target: [7000.0, -3500.0, 1200.0] }),
+            "a mirror image flips it in plan, keeping its heights"
+        );
+        // The default `{3D}`, with no camera of its own, still has nothing to move.
+        s.execute("perspective", &json!({})).unwrap();
+        let flat = s.model.default_3d().unwrap_or_default();
+        let e = s.execute("move", &json!({"ids": [flat], "by": [100.0, 0.0]})).unwrap_err();
+        assert!(e.contains("has no place in plan"), "{e}");
+    }
+
+    #[test]
+    fn a_perspective_picture_shows_and_picks_what_it_sees_and_cuts_away_what_is_behind_the_eye() {
+        let s = house();
+        let scene = Scene::new(&s.model);
+        let cam = scene.fit_from(Camera { lens: Some(LENS), ..scene.fit(AZIMUTH, ELEVATION, 400, 300) }, &Look::default());
+        let img = scene.render(&cam, &[]);
+        // The wall along the south, at its middle, picks as a wall.
+        let (x, y) = at(&cam, [4000.0, 0.0, 1500.0]);
+        let wall = img.pick(x, y).and_then(|id| s.model.elements.get(id)).map(|e| e.category());
+        assert_eq!(wall, Some("wall"));
+        // The eye inside the house, at a person's height: the walls all round fill the picture, and the ones behind it
+        // and those it stands across are drawn as far as they are in front of it.
+        let inside = Camera { target: [4000.0, 3000.0, 1600.0], elevation: 0.0, scale: 400.0 * 20.0 / FILM / 1000.0, ..cam };
+        assert!(inside.eye().is_some_and(|e| (0.0..8000.0).contains(&e[0]) && (0.0..6000.0).contains(&e[1])));
+        let img = scene.render(&inside, &[]);
+        let shown = (0..300).flat_map(|y| (0..400).map(move |x| (x, y))).filter(|&(x, y)| img.pick(f64::from(x), f64::from(y)).is_some());
+        assert!(shown.count() > 400 * 300 / 2, "the walls are round the eye");
+        // The floor runs on under the eye and behind it: what is in front of it is drawn at the picture's foot.
+        let foot = img.pick(200.5, 299.5).and_then(|id| s.model.elements.get(id)).map(|e| e.category());
+        assert_eq!(foot, Some("floor"));
     }
 
     #[test]

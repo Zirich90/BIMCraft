@@ -144,3 +144,29 @@ fn a_purged_project_is_saved_and_read_back_whole() {
     assert_eq!((back.types.wall.len(), back.families.len()), (s.model.types.wall.len(), s.model.families.len()));
     assert!(back.check().is_ok());
 }
+
+#[test]
+fn rename_type_renames_a_type_or_a_family_type_and_what_uses_it_follows() {
+    let mut s = walls();
+    let (wall, was) =
+        s.model.elements.iter().find_map(|(id, e)| if let Element::Wall(w) = e { Some((*id, w.type_name.clone())) } else { None }).unwrap();
+    let guid = s.model.library.guid(&crate::library::Kind::Type("wall".into()), &was);
+    let r = run(&mut s, "rename_type", json!({"category": "wall", "type": was, "name": " Brick 200 "}));
+    assert_eq!(r["renamed"], json!({"kind": "wall type", "from": was, "to": "Brick 200"}));
+    assert!(wall_types(&s).contains(&"Brick 200".to_string()) && !wall_types(&s).contains(&was));
+    assert!(matches!(s.model.elements.get(wall), Some(Element::Wall(w)) if w.type_name == "Brick 200"), "the wall follows");
+    assert_eq!(s.model.library.guid(&crate::library::Kind::Type("wall".into()), "Brick 200"), guid, "it keeps its GUID");
+    let taken = wall_types(&s).into_iter().find(|n| n != "Brick 200").unwrap();
+    let e = s.execute("rename_type", &json!({"category": "wall", "type": "Brick 200", "name": taken})).unwrap_err();
+    assert!(e.contains("already a wall type"), "{e}");
+    let e = s.execute("rename_type", &json!({"category": "wall", "type": "Brick 200", "name": "  "})).unwrap_err();
+    assert!(e.contains("`name`"), "{e}");
+    // A family's type, its components following.
+    chair(&mut s);
+    let c = run(&mut s, "component", json!({"family": "Chair", "type": "Small", "at": [1000, 1000]}))["id"].as_u64().unwrap();
+    run(&mut s, "rename_type", json!({"family": "Chair", "type": "Small", "name": "Child"}));
+    assert!(s.model.families["Chair"].types.contains_key("Child") && !s.model.families["Chair"].types.contains_key("Small"));
+    assert!(matches!(s.model.elements.get(c), Some(Element::Component(x)) if x.type_name == "Child"));
+    run(&mut s, "undo", json!({}));
+    assert!(s.model.families["Chair"].types.contains_key("Small"));
+}

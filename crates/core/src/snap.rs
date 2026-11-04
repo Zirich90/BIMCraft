@@ -86,6 +86,10 @@ pub struct Snaps {
     /// Degrees between the angles a direction snaps to, from east and from the line before it,
     /// from 1 to 180; anything else for none.
     pub angle: f64,
+    /// Whether temporary alignment guides (smart snapping) are active.
+    pub alignment_guides: bool,
+    /// Alignment snap tolerance in screen pixels (default 8.0 px).
+    pub alignment_tolerance: f32,
 }
 
 impl Snaps {
@@ -102,6 +106,8 @@ impl Snaps {
             nearest: false,
             cloud: false,
             angle: 0.0,
+            alignment_guides: false,
+            alignment_tolerance: 8.0,
         }
     }
 
@@ -137,6 +143,8 @@ impl Default for Snaps {
             nearest: true,
             cloud: true,
             angle: 15.0,
+            alignment_guides: true,
+            alignment_tolerance: 8.0,
         }
     }
 }

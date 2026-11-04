@@ -1,5 +1,7 @@
 //! Desktop policy over the core's background writer. Tests opt in with their own temp directory;
 //! constructing a BimApp by itself never touches recovery files.
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 use bimcraft_core::autosave::{Backup, Notice, Worker, backup_path};
 use bimcraft_core::ids::Guid;
 use bimcraft_core::model::Model;
-use egui::{Context, Id, Modal, RichText};
+use egui::{Context, Id};
 use serde_json::json;
 
 use crate::lang::{t, tf};
@@ -281,30 +283,33 @@ impl BimApp {
         }
         let Some(backup) = self.autosave.candidates.first().cloned() else { return };
         let mut choice = None;
-        let response = Modal::new(Id::new("recover-autosave")).show(ctx, |ui| {
-            ui.set_max_width(520.0);
-            ui.label(RichText::new(t("Recovery copy found")).heading());
-            ui.label(
-                backup
-                    .project
-                    .as_deref()
-                    .and_then(Path::file_name)
-                    .map_or_else(|| t("Untitled project").to_owned(), |n| n.to_string_lossy().into_owned()),
-            );
-            ui.label(t("Recover opens the backup as unsaved work. Discard deletes it. Postpone keeps it for later without replacing it."));
-            ui.label(backup.path.to_string_lossy()).on_hover_text(backup.path.to_string_lossy());
-            if let Some(error) = &self.autosave.recovery_error {
-                ui.colored_label(crate::style::pal().error, error);
-            }
-            ui.add_space(8.0);
-            ui.add_enabled_ui(self.autosave.deleting.is_none(), |ui| {
-                ui.horizontal(|ui| {
-                    for label in [msg!("Recover"), msg!("Discard"), msg!("Postpone")] {
-                        if ui.button(t(label)).clicked() {
-                            choice = Some(label);
+        let response = Modal::new(Id::new("recover-autosave"), t("Recovery copy found")).width(520.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.label(
+                    backup
+                        .project
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .map_or_else(|| t("Untitled project").to_owned(), |n| n.to_string_lossy().into_owned()),
+                );
+                ui.label(t(
+                    "Recover opens the backup as unsaved work. Discard deletes it. Postpone keeps it for later without replacing it.",
+                ));
+                ui.label(backup.path.to_string_lossy()).on_hover_text(backup.path.to_string_lossy());
+                if let Some(error) = &self.autosave.recovery_error {
+                    ui.colored_label(crate::style::pal().error, error);
+                }
+            });
+            crate::popup::footer(ui, |ui| {
+                ui.add_enabled_ui(self.autosave.deleting.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        for label in [msg!("Recover"), msg!("Discard"), msg!("Postpone")] {
+                            if ui.button(t(label)).clicked() {
+                                choice = Some(label);
+                            }
                         }
-                    }
-                })
+                    })
+                });
             });
         });
         match choice {

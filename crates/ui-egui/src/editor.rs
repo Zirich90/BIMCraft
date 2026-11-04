@@ -2,6 +2,8 @@
 //! preview as they're typed, then made the project's, saved to a file or kept in the Favorites.
 //! Every change to the project is a `family` command, so it's checked, and undone, like any other.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::collections::BTreeMap;
@@ -9,12 +11,14 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use bimcraft_core::engine::Session;
-use bimcraft_core::family::{Category, Circle, Curve, Expr, Family, Form, Kind as Holds, Parameter, Plane, Symbol};
-use bimcraft_core::model::Model;
+use bimcraft_core::family::{
+    Align as LabelAlign, Category, Circle, Connector, Curve, Expr, Family, Form, Kind as Holds, Label, Parameter, Plane, Symbol,
+};
+use bimcraft_core::model::{Model, Operation};
 use bimcraft_core::view3d::{AZIMUTH, ELEVATION, Scene};
 use egui::{
-    Align, CollapsingHeader, Color32, ColorImage, ComboBox, Context, Grid, Id as UiId, Layout, Modal, PointerButton, Rect, RichText,
-    ScrollArea, Sense, Stroke, StrokeKind, TextEdit, TextureHandle, TextureOptions, Ui, WidgetInfo, WidgetType, pos2, vec2,
+    Align, CollapsingHeader, Color32, ColorImage, ComboBox, Context, Grid, Id as UiId, Layout, PointerButton, Rect, RichText, ScrollArea,
+    Sense, Stroke, StrokeKind, TextEdit, TextureHandle, TextureOptions, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
 use serde_json::{Value, json};
 
@@ -243,52 +247,89 @@ impl ParamText {
     }
 }
 
-/// A symbol as typed.
+/// Which part a symbol is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Line,
+    Arc,
+    Text,
+    Dot,
+}
+
+/// A symbol as typed. `centre` is an arc's or a dot's centre or a label's point; `radius` an arc's or a dot's radius or a
+/// label's height.
 #[derive(Clone)]
 struct SymbolText {
     /// Its id and GUID, which it keeps wherever it's moved to in the list.
     ident: (bimcraft_core::model::Id, bimcraft_core::model::Guid),
-    arc: bool,
+    part: Part,
     line: String,
     centre: [String; 2],
     radius: String,
     from: String,
     to: String,
+    value: String,
+    align: LabelAlign,
     visible: String,
 }
 
 impl SymbolText {
-    fn of(y: &Symbol) -> SymbolText {
-        let (centre, radius, from, to) = y.arc.as_ref().map_or_else(
-            || (Default::default(), String::new(), String::new(), String::new()),
-            |c| ([expr_text(&c.centre[0]), expr_text(&c.centre[1])], expr_text(&c.radius), expr_text(&c.from), expr_text(&c.to)),
-        );
-        SymbolText {
-            ident: (y.id, y.guid),
-            arc: y.arc.is_some(),
-            line: profile_text(&y.line),
-            centre,
-            radius,
-            from,
-            to,
-            visible: y.visible.as_ref().map(expr_text).unwrap_or_default(),
+    fn blank(part: Part) -> SymbolText {
+        let s = |x: &str| x.to_string();
+        let base = SymbolText {
+            ident: Default::default(),
+            part,
+            line: String::new(),
+            centre: Default::default(),
+            radius: String::new(),
+            from: String::new(),
+            to: String::new(),
+            value: String::new(),
+            align: LabelAlign::Left,
+            visible: String::new(),
+        };
+        match part {
+            Part::Line => SymbolText { line: s("0, 0\n0, 900"), ..base },
+            Part::Arc => SymbolText { centre: [s("0"), s("0")], radius: s("900"), from: s("0"), to: s("90"), ..base },
+            Part::Text => SymbolText { centre: [s("0"), s("0")], radius: s("100"), value: s("A"), ..base },
+            Part::Dot => SymbolText { centre: [s("0"), s("0")], radius: s("20"), ..base },
         }
+    }
+
+    fn of(y: &Symbol) -> SymbolText {
+        let ex = |e: &Expr| expr_text(e);
+        let mut t = SymbolText::blank(Part::Line);
+        t.ident = (y.id, y.guid);
+        t.line = profile_text(&y.line);
+        t.visible = y.visible.as_ref().map(expr_text).unwrap_or_default();
+        if let Some(c) = &y.arc {
+            (t.part, t.centre, t.radius, t.from, t.to) =
+                (Part::Arc, [ex(&c.centre[0]), ex(&c.centre[1])], ex(&c.radius), ex(&c.from), ex(&c.to));
+        } else if let Some(l) = &y.text {
+            (t.part, t.centre, t.radius, t.value, t.align) =
+                (Part::Text, [ex(&l.at[0]), ex(&l.at[1])], ex(&l.height), l.value.clone(), l.align);
+        } else if let Some(c) = &y.dot {
+            (t.part, t.centre, t.radius) = (Part::Dot, [ex(&c.centre[0]), ex(&c.centre[1])], ex(&c.radius));
+        }
+        t
     }
 
     fn symbol(&self) -> Result<Symbol, String> {
         let visible = (!self.visible.trim().is_empty()).then(|| text_expr(&self.visible));
         let (id, guid) = self.ident;
-        Ok(if self.arc {
-            let centre = [text_expr(&self.centre[0]), text_expr(&self.centre[1])];
-            Symbol {
+        let centre = [text_expr(&self.centre[0]), text_expr(&self.centre[1])];
+        let base = Symbol { visible, id, guid, ..Symbol::default() };
+        Ok(match self.part {
+            Part::Arc => Symbol {
                 arc: Some(Curve { centre, radius: text_expr(&self.radius), from: text_expr(&self.from), to: text_expr(&self.to) }),
-                visible,
-                id,
-                guid,
-                ..Symbol::default()
-            }
-        } else {
-            Symbol { line: text_profile(&self.line)?, visible, id, guid, ..Symbol::default() }
+                ..base
+            },
+            Part::Text => Symbol {
+                text: Some(Label { at: centre, height: text_expr(&self.radius), value: self.value.clone(), align: self.align }),
+                ..base
+            },
+            Part::Dot => Symbol { dot: Some(Circle { centre, radius: text_expr(&self.radius) }), ..base },
+            Part::Line => Symbol { line: text_profile(&self.line)?, ..base },
         })
     }
 }
@@ -304,6 +345,10 @@ pub(crate) struct FamilyEditor {
     types: Vec<(String, BTreeMap<String, String>)>,
     forms: Vec<FormText>,
     symbols: Vec<SymbolText>,
+    /// Its connectors, as the family has them: the editor has no tab for them yet, and keeps them as they are.
+    connectors: Vec<Connector>,
+    /// How a door's or a window's leaves open; none, not said.
+    operation: Option<Operation>,
     tab: Tab,
     /// The type shown in Types and on the preview.
     picked: usize,
@@ -340,6 +385,8 @@ impl FamilyEditor {
             types,
             forms: f.forms.iter().map(FormText::of).collect(),
             symbols: f.symbols.iter().map(SymbolText::of).collect(),
+            connectors: f.connectors.clone(),
+            operation: f.operation,
             tab: Tab::Parameters,
             picked: 0,
             look: (AZIMUTH, ELEVATION),
@@ -391,7 +438,8 @@ impl FamilyEditor {
         }
         let forms = self.forms.iter().map(FormText::form).collect::<Result<_, _>>()?;
         let symbols = self.symbols.iter().map(SymbolText::symbol).collect::<Result<_, _>>()?;
-        Ok(Family { category: self.category, parameters, types, forms, symbols })
+        let operation = self.operation.filter(|_| self.category.hosted());
+        Ok(Family { category: self.category, parameters, types, forms, symbols, operation, connectors: self.connectors.clone() })
     }
 
     /// The `family` command's parameters making the project's family what's typed: its name, its own and the type it drops.
@@ -401,6 +449,8 @@ impl FamilyEditor {
         }
         let family = self.family()?;
         let mut p = serde_json::to_value(&family).map_err(|e| e.to_string())?;
+        // Said or not, so one taken off goes from the family too.
+        p["operation"] = json!(family.operation.map_or("", Operation::name));
         match &self.original {
             Some(was) => {
                 p["name"] = json!(was);
@@ -817,38 +867,62 @@ fn forms_tab(ed: &mut FamilyEditor, ui: &mut Ui, materials: &[String]) {
 }
 
 fn symbols_tab(ed: &mut FamilyEditor, ui: &mut Ui) {
-    if !ed.category.hosted() {
-        ui.label(RichText::new(t("Symbols are the lines a door's or a window's plan draws; this family isn't one.")).color(pal().muted));
-        return;
-    }
+    ui.label(
+        RichText::new(t("Symbols are what the plan draws of the family besides its forms: lines, arcs, labels and dots."))
+            .color(pal().muted),
+    );
     let mut remove = None;
     for (i, y) in ed.symbols.iter_mut().enumerate() {
         let n = i + 1;
-        let heading = format!("{n}. {}", if y.arc { t("Arc") } else { t("Line") });
+        let kind = match y.part {
+            Part::Line => t("Line"),
+            Part::Arc => t("Arc"),
+            Part::Text => t("Text"),
+            Part::Dot => t("Dot"),
+        };
+        let heading = format!("{n}. {kind}");
         CollapsingHeader::new(heading).id_salt(("fe-symbol", i)).default_open(true).show(ui, |ui| {
             Grid::new(("fe-symbol-grid", i)).num_columns(2).spacing(vec2(12.0, 5.0)).show(ui, |ui| {
-                if y.arc {
-                    ui.label(t("Centre"));
+                if y.part == Part::Line {
+                    ui.label(t("Points"));
+                    let r = ui.add(TextEdit::multiline(&mut y.line).desired_rows(3).desired_width(300.0).id_salt(("fe-symbol-line", i)));
+                    r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, format!("{} {n}", t("Symbol Points"))));
+                    ui.end_row();
+                } else {
+                    ui.label(t(if y.part == Part::Text { msg!("Middle of the text") } else { msg!("Centre") }));
                     ui.horizontal(|ui| {
                         for (k, what) in [msg!("Symbol Centre X"), msg!("Symbol Centre Y")].into_iter().enumerate() {
                             field(ui, format!("{} {n}", t(what)), &mut y.centre[k], 170.0);
                         }
                     });
                     ui.end_row();
-                    for (label, what, text) in [
-                        (msg!("Radius"), msg!("Symbol Radius"), &mut y.radius),
-                        ("From (degrees)", msg!("Symbol From"), &mut y.from),
-                        ("To (degrees)", msg!("Symbol To"), &mut y.to),
-                    ] {
-                        ui.label(t(label));
-                        field(ui, format!("{} {n}", t(what)), text, 200.0);
+                    let size = if y.part == Part::Text { msg!("Height") } else { msg!("Radius") };
+                    ui.label(t(size));
+                    field(ui, format!("{} {n}", t(msg!("Symbol Radius"))), &mut y.radius, 200.0);
+                    ui.end_row();
+                    if y.part == Part::Arc {
+                        for (label, what, text) in
+                            [("From (degrees)", msg!("Symbol From"), &mut y.from), ("To (degrees)", msg!("Symbol To"), &mut y.to)]
+                        {
+                            ui.label(t(label));
+                            field(ui, format!("{} {n}", t(what)), text, 200.0);
+                            ui.end_row();
+                        }
+                    }
+                    if y.part == Part::Text {
+                        ui.label(t("Text"));
+                        field(ui, format!("{} {n}", t("Symbol Text")), &mut y.value, 300.0);
+                        ui.end_row();
+                        ui.label(t("Align"));
+                        ui.horizontal(|ui| {
+                            for (a, label) in
+                                [(LabelAlign::Left, msg!("Left")), (LabelAlign::Center, msg!("Centre")), (LabelAlign::Right, msg!("Right"))]
+                            {
+                                ui.selectable_value(&mut y.align, a, t(label));
+                            }
+                        });
                         ui.end_row();
                     }
-                } else {
-                    ui.label(t("Points"));
-                    let r = ui.add(TextEdit::multiline(&mut y.line).desired_rows(3).desired_width(300.0).id_salt(("fe-symbol-line", i)));
-                    r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, format!("{} {n}", t("Symbol Points"))));
-                    ui.end_row();
                 }
                 ui.label(t("Visible when"));
                 field(ui, format!("{} {n}", t("Symbol Visible")), &mut y.visible, 200.0);
@@ -863,29 +937,12 @@ fn symbols_tab(ed: &mut FamilyEditor, ui: &mut Ui) {
         ed.symbols.remove(i);
     }
     ui.horizontal(|ui| {
-        if ui.button(t("Add Line")).clicked() {
-            ed.symbols.push(SymbolText {
-                ident: Default::default(),
-                arc: false,
-                line: "0, 0\n0, 900".into(),
-                centre: Default::default(),
-                radius: String::new(),
-                from: String::new(),
-                to: String::new(),
-                visible: String::new(),
-            });
-        }
-        if ui.button(t("Add Arc")).clicked() {
-            ed.symbols.push(SymbolText {
-                ident: Default::default(),
-                arc: true,
-                line: String::new(),
-                centre: ["0".into(), "0".into()],
-                radius: "900".into(),
-                from: "0".into(),
-                to: "90".into(),
-                visible: String::new(),
-            });
+        for (part, label) in
+            [(Part::Line, msg!("Add Line")), (Part::Arc, msg!("Add Arc")), (Part::Text, msg!("Add Text")), (Part::Dot, msg!("Add Dot"))]
+        {
+            if ui.button(t(label)).clicked() {
+                ed.symbols.push(SymbolText::blank(part));
+            }
         }
     });
 }
@@ -927,90 +984,109 @@ impl BimApp {
         ed.refresh(ctx, &base);
         let materials: Vec<String> = base.materials.keys().cloned().collect();
         let (mut apply, mut ok, mut cancel, mut save, mut favorite, mut load) = (false, false, false, false, false, false);
-        let r = Modal::new(UiId::new("family-editor")).show(ctx, |ui| {
-            ui.set_width(1000.0);
-            ui.label(RichText::new(t("Family Editor")).heading());
-            ui.add_space(4.0);
-            Grid::new("fe-head").num_columns(4).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
-                let l = ui.label(t("Family name"));
-                ui.add_sized([220.0, ui.spacing().interact_size.y], TextEdit::singleline(&mut ed.name)).labelled_by(l.id);
-                let l = ui.label(t("Category"));
-                let c = ComboBox::from_id_salt("fe-category").selected_text(category_label(ed.category)).width(150.0).show_ui(ui, |ui| {
-                    for c in CATEGORIES {
-                        if ui.selectable_label(ed.category == c, category_label(c)).clicked() {
-                            ed.category = c;
-                        }
-                    }
-                });
-                c.response.labelled_by(l.id);
-                ui.end_row();
-            });
-            ui.add_space(6.0);
-            // What the tabs leave of the screen, to the buttons below: a small one scrolls them.
-            let room = (ctx.content_rect().height() - 330.0).clamp(160.0, 470.0);
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(620.0);
-                    ui.horizontal(|ui| {
-                        for (tab, label) in [
-                            (Tab::Parameters, msg!("Parameters")),
-                            (Tab::Types, msg!("Types")),
-                            (Tab::Forms, msg!("Forms")),
-                            (Tab::Symbols, msg!("Symbols")),
-                        ] {
-                            if ui.selectable_label(ed.tab == tab, t(label)).clicked() {
-                                ed.tab = tab;
+        let r = Modal::new(UiId::new("family-editor"), t("Family Editor")).width(1000.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(4.0);
+                Grid::new("fe-head").num_columns(4).spacing(vec2(12.0, 6.0)).show(ui, |ui| {
+                    let l = ui.label(t("Family name"));
+                    ui.add_sized([220.0, ui.spacing().interact_size.y], TextEdit::singleline(&mut ed.name)).labelled_by(l.id);
+                    let l = ui.label(t("Category"));
+                    let c =
+                        ComboBox::from_id_salt("fe-category").selected_text(category_label(ed.category)).width(150.0).show_ui(ui, |ui| {
+                            for c in CATEGORIES {
+                                if ui.selectable_label(ed.category == c, category_label(c)).clicked() {
+                                    ed.category = c;
+                                }
                             }
-                        }
-                    });
-                    ui.separator();
-                    ScrollArea::vertical().max_height(room).min_scrolled_height(room).auto_shrink([false, false]).show(ui, |ui| {
-                        match ed.tab {
-                            Tab::Parameters => parameters_tab(&mut ed, ui, &materials),
-                            Tab::Types => types_tab(&mut ed, ui, &materials),
-                            Tab::Forms => forms_tab(&mut ed, ui, &materials),
-                            Tab::Symbols => symbols_tab(&mut ed, ui),
-                        }
-                    });
+                        });
+                    c.response.labelled_by(l.id);
+                    ui.end_row();
+                    if ed.category.hosted() {
+                        let l = ui.label(t("Operation"));
+                        let shown = ed.operation.map_or(t("(none)"), |op| t(op.label()));
+                        let c = ComboBox::from_id_salt("fe-operation").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+                            if ui.selectable_label(ed.operation.is_none(), t("(none)")).clicked() {
+                                ed.operation = None;
+                            }
+                            for op in Operation::ALL {
+                                if ui.selectable_label(ed.operation == Some(op), t(op.label())).clicked() {
+                                    ed.operation = Some(op);
+                                }
+                            }
+                        });
+                        c.response.labelled_by(l.id);
+                        ui.end_row();
+                    }
                 });
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.set_width(340.0);
-                    ui.label(RichText::new(t("Preview")).strong());
-                    let (rect, response) = ui.allocate_exact_size(vec2(340.0, 283.0), Sense::drag());
-                    if let Some((_, tile)) = &ed.preview {
-                        ui.painter().image(tile.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, pal().border), StrokeKind::Inside);
-                    if response.dragged_by(PointerButton::Primary) {
-                        let d = response.drag_delta();
-                        ed.look = (ed.look.0 - f64::from(d.x) * 0.5, (ed.look.1 + f64::from(d.y) * 0.5).clamp(-89.0, 89.0));
-                    }
-                    ui.label(RichText::new(t("Drag the picture to turn it.")).color(pal().muted));
-                    let names: Vec<String> = ed.types.iter().map(|(n, _)| n.clone()).collect();
-                    let now = names.get(ed.picked).cloned().unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        ui.label(t("Previewing"));
-                        if let Some(n) = pick(ui, t("Preview Type").to_string(), &now, &names)
-                            && let Some(i) = names.iter().position(|x| *x == n)
-                        {
-                            ed.picked = i;
+                ui.add_space(6.0);
+                // What the tabs leave of the screen, to the buttons below: a small one scrolls them.
+                let room = (ctx.content_rect().height() - 330.0).clamp(160.0, 470.0);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(620.0);
+                        ui.horizontal(|ui| {
+                            for (tab, label) in [
+                                (Tab::Parameters, msg!("Parameters")),
+                                (Tab::Types, msg!("Types")),
+                                (Tab::Forms, msg!("Forms")),
+                                (Tab::Symbols, msg!("Symbols")),
+                            ] {
+                                if ui.selectable_label(ed.tab == tab, t(label)).clicked() {
+                                    ed.tab = tab;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ScrollArea::vertical().max_height(room).min_scrolled_height(room).auto_shrink([false, false]).show(
+                            ui,
+                            |ui| match ed.tab {
+                                Tab::Parameters => parameters_tab(&mut ed, ui, &materials),
+                                Tab::Types => types_tab(&mut ed, ui, &materials),
+                                Tab::Forms => forms_tab(&mut ed, ui, &materials),
+                                Tab::Symbols => symbols_tab(&mut ed, ui),
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(340.0);
+                        ui.label(RichText::new(t("Preview")).strong());
+                        let (rect, response) = ui.allocate_exact_size(vec2(340.0, 283.0), Sense::drag());
+                        if let Some((_, tile)) = &ed.preview {
+                            ui.painter().image(tile.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                        }
+                        ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, pal().border), StrokeKind::Inside);
+                        if response.dragged_by(PointerButton::Primary) {
+                            let d = response.drag_delta();
+                            ed.look = (ed.look.0 - f64::from(d.x) * 0.5, (ed.look.1 + f64::from(d.y) * 0.5).clamp(-89.0, 89.0));
+                        }
+                        ui.label(RichText::new(t("Drag the picture to turn it.")).color(pal().muted));
+                        let names: Vec<String> = ed.types.iter().map(|(n, _)| n.clone()).collect();
+                        let now = names.get(ed.picked).cloned().unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label(t("Previewing"));
+                            if let Some(n) = pick(ui, t("Preview Type").to_string(), &now, &names)
+                                && let Some(i) = names.iter().position(|x| *x == n)
+                            {
+                                ed.picked = i;
+                            }
+                        });
+                        if let Some(p) = &ed.problem {
+                            ui.label(RichText::new(p).color(pal().error));
                         }
                     });
-                    if let Some(p) = &ed.problem {
-                        ui.label(RichText::new(p).color(pal().error));
-                    }
                 });
             });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                load = ui.button(t("Load Family…")).clicked();
-                save = ui.button(t("Save Family…")).clicked();
-                favorite = ui.button(t("Add to Favorites")).clicked();
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ok = ui.button(t("OK")).clicked();
-                    cancel = ui.button(t("Cancel")).clicked();
-                    apply = ui.button(t("Apply")).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.horizontal(|ui| {
+                    load = ui.button(t("Load Family…")).clicked();
+                    save = ui.button(t("Save Family…")).clicked();
+                    favorite = ui.button(t("Add to Favorites")).clicked();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ok = ui.button(t("OK")).clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
+                        apply = ui.button(t("Apply")).clicked();
+                    });
                 });
             });
         });
@@ -1191,6 +1267,26 @@ mod tests {
             ..Symbol::default()
         };
         assert_eq!(SymbolText::of(&line).symbol().unwrap(), line);
+        // A label and a dot come back as they were typed, and a new one of each is one the family takes.
+        let label = Symbol {
+            text: Some(Label {
+                at: [Expr::Number(0.0), Expr::Number(-150.0)],
+                height: Expr::Number(60.0),
+                value: "C{Circuit}".into(),
+                align: LabelAlign::Center,
+            }),
+            visible: Some(Expr::Formula("Show".into())),
+            ..Symbol::default()
+        };
+        assert_eq!(SymbolText::of(&label).symbol().unwrap(), label);
+        let dot = Symbol {
+            dot: Some(Circle { centre: [Expr::Number(2.0), Expr::Number(3.0)], radius: Expr::Number(20.0) }),
+            ..Symbol::default()
+        };
+        assert_eq!(SymbolText::of(&dot).symbol().unwrap(), dot);
+        for part in [Part::Line, Part::Arc, Part::Text, Part::Dot] {
+            assert_eq!(SymbolText::of(&SymbolText::blank(part).symbol().unwrap()).part, part);
+        }
         let p = Parameter { name: "Legs".into(), kind: Holds::YesNo, instance: true, value: json!(true), formula: None };
         assert_eq!(ParamText::of(&p).parameter().unwrap(), p);
         let area = Parameter {

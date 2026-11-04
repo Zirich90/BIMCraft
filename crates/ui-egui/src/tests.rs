@@ -5,10 +5,11 @@
 mod catalogue;
 mod stage4;
 
+use crate::DimMode;
 use bimcraft_core::element_json;
 use bimcraft_core::engine::Session;
 use bimcraft_core::geom::P2;
-use bimcraft_core::model::{Element, Guid, Id};
+use bimcraft_core::model::{DimKind, Element, Guid, Id};
 use bimcraft_core::pen::Pen;
 use bimcraft_core::sample::SAMPLE;
 use egui::accesskit::Role;
@@ -18,6 +19,7 @@ use egui_kittest::kittest::Queryable;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::context::Action;
 use crate::{BimApp, Sheet, Tab, Tool};
 
 const BOX: &str = r#"wall {"points": [[0,0],[8000,0],[8000,6000],[0,6000]], "closed": true}"#;
@@ -45,6 +47,15 @@ fn press(h: &mut Harness<BimApp>, label: &str) {
     h.run();
 }
 
+/// One of Manage > Annotation Settings' dialogs (Line Weights, Line Styles, Line Patterns, Fill Patterns), from its list.
+fn annotation(h: &mut Harness<BimApp>, item: &str) {
+    if h.query_by_label("Annotation Settings").is_none() {
+        press(h, "Manage");
+    }
+    press(h, "Annotation Settings");
+    press(h, item);
+}
+
 /// A tool from the Architecture tab: a tool's contextual tab takes the ribbon, as in Revit.
 fn tool(h: &mut Harness<BimApp>, label: &str) {
     press(h, "Architecture");
@@ -60,10 +71,13 @@ fn type_into(h: &mut Harness<BimApp>, label: &str, text: &str) {
     h.run();
 }
 
-/// Of the widgets named `name`, the one highest up: a view tab over the browser's entry, a
-/// ribbon tab over the tool of the same name.
+/// Of the widgets named `name`, a view tab, else the one highest up: a view tab over the browser's entry and over what a view
+/// under the tabs draws, a ribbon tab over the tool of the same name.
 fn topmost(h: &mut Harness<BimApp>, name: &str) {
-    let top = h.get_all_by_label(name).min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).map(|n| n.rect().center());
+    let tabs: Vec<egui::Rect> = h.state().tab_rects.iter().map(|(_, r)| *r).collect();
+    let tab = h.get_all_by_label(name).map(|n| n.rect()).find(|r| tabs.iter().any(|t| t.contains(r.center())));
+    let top = tab.map(|r| r.center());
+    let top = top.or_else(|| h.get_all_by_label(name).min_by(|a, b| a.rect().top().total_cmp(&b.rect().top())).map(|n| n.rect().center()));
     let pos = top.unwrap();
     h.hover_at(pos);
     for pressed in [true, false] {
@@ -285,6 +299,22 @@ fn field(h: &Harness<BimApp>, id: Id, key: &str) -> serde_json::Value {
         Ok(g) if v.is_string() => m.elements.id(g).map_or(v, |id| json!(id)),
         _ => v,
     }
+}
+
+/// The eye of a camera as its JSON has it, mm; a point that isn't three numbers reads as far off.
+fn eye_of(camera: &serde_json::Value) -> [f64; 3] {
+    let mut out = [f64::NAN; 3];
+    if let Some(a) = camera["eye"].as_array() {
+        for (slot, v) in out.iter_mut().zip(a) {
+            *slot = v.as_f64().unwrap_or(f64::NAN);
+        }
+    }
+    out
+}
+
+/// Whether two points are the same to a tenth of a millimetre, as the camera commands leave them.
+fn same_point(a: [f64; 3], b: [f64; 3]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.1)
 }
 
 #[test]
@@ -708,7 +738,7 @@ fn typed_shortcuts_pick_tools_like_revit() {
     assert!(matches!(h.state().tool, Tool::Door));
     h.event(Event::Text("DI".into()));
     h.run();
-    assert!(matches!(h.state().tool, Tool::Dimension(_)));
+    assert!(matches!(h.state().tool, Tool::Dimension(..)));
     h.event(Event::Text("tg".into()));
     h.run();
     assert!(matches!(h.state().tool, Tool::Tag));
@@ -1757,7 +1787,7 @@ fn aligned_dimensions_pick_parallel_references_then_place_the_line() {
     click(&mut h, P2(4000.0, -1000.0));
     let dims = ids(&h, "dimension");
     assert_eq!((dims.len(), field(&h, dims[0], "values")), (1, json!([7800.0])));
-    assert_eq!(h.state().tool, Tool::Dimension(Vec::new()), "the tool stays on for the next one");
+    assert_eq!(h.state().tool, Tool::Dimension(DimMode::Aligned, Vec::new()), "the tool stays on for the next one");
     // A wall across the first isn't picked; centre lines are, where the cursor is on them.
     click(&mut h, P2(0.0, 3000.0));
     click(&mut h, P2(4000.0, 0.0));
@@ -1768,7 +1798,7 @@ fn aligned_dimensions_pick_parallel_references_then_place_the_line() {
     // Esc drops the references picked, then leaves the tool.
     click(&mut h, P2(0.0, 3000.0));
     key(&mut h, Key::Escape);
-    assert_eq!(h.state().tool, Tool::Dimension(Vec::new()));
+    assert_eq!(h.state().tool, Tool::Dimension(DimMode::Aligned, Vec::new()));
     key(&mut h, Key::Escape);
     assert_eq!(h.state().tool, Tool::Modify);
 }
@@ -1909,6 +1939,199 @@ fn the_elevation_tool_looks_at_the_building_from_where_it_is_clicked() {
     let made = ids(&h, "elevation");
     assert_eq!((field(&h, made[0], "name"), field(&h, made[0], "looking")), (json!("North"), json!([0.0, -1.0])));
     assert!(h.query_by_label("Elevations (Building Elevation)").is_some());
+}
+
+#[test]
+fn the_camera_tool_makes_a_perspective_3d_view_from_an_eye_and_a_target() {
+    let mut h = app_at(BOX, 0.05);
+    press(&mut h, "View");
+    press(&mut h, "Camera");
+    assert!(h.query_by_label("Modify | Camera").is_some());
+    // The eye west of the box, at a person's height; the target inside it.
+    click(&mut h, P2(-1000.0, 3000.0));
+    click(&mut h, P2(4000.0, 3000.0));
+    let made = ids(&h, "view3d");
+    assert_eq!(made.len(), 1);
+    assert_eq!(field(&h, made[0], "name"), json!("Camera 1"));
+    // The eye and target stand where they were clicked, at the Options Bar's heights over Level 1.
+    assert_eq!(field(&h, made[0], "camera"), json!({"eye": [-1000.0, 3000.0, 1600.0], "target": [4000.0, 3000.0, 1200.0]}));
+    assert_eq!(field(&h, made[0], "perspective"), json!({"lens": 35.0, "on": true}));
+    // It opens in the 3D tab, which now shows that camera view.
+    assert_eq!(h.state().sheet, Sheet::View3D);
+    assert_eq!(h.state().active_3d(), Some(made[0]));
+    // The browser lists it under 3D Views; its entry opens it again.
+    topmost(&mut h, "Level 1");
+    assert_eq!(h.state().sheet, Sheet::Plan(100000));
+    assert!(h.query_by_label("3D Views").is_some());
+    browse_entry(&mut h, "Camera 1");
+    assert_eq!((h.state().sheet, h.state().active_3d()), (Sheet::View3D, Some(made[0])));
+    // Properties shows the camera's Focal Length (its angle of view); typing a new one changes the lens, keeping the view.
+    assert!(h.query_by_label("Focal Length").is_some());
+    type_into(&mut h, "Focal Length", "50");
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(field(&h, made[0], "perspective")["lens"], json!(50.0));
+    assert_eq!(ids(&h, "view3d"), made, "the same view, relensed");
+    // The camera shows on its level's plan: clicking its mark selects it, and the menu opens its view.
+    topmost(&mut h, "Level 1");
+    click(&mut h, P2(-1000.0, 3000.0));
+    assert_eq!(h.state().selection, vec![made[0]], "its mark is picked on the plan");
+    // Dragging the mark on the plan moves the camera as a whole, each point keeping its height.
+    let from = h.state().screen(P2(-1000.0, 3000.0));
+    drag_screen(&mut h, from, from + vec2(60.0, 0.0), PointerButton::Primary);
+    h.run();
+    let dragged = field(&h, made[0], "camera");
+    assert_eq!(dragged["eye"][2], json!(1600.0), "its height stays");
+    assert_ne!(dragged["eye"], json!([-1000.0, 3000.0, 1600.0]), "the mark drags the camera with it");
+    assert_eq!(h.state().selection, vec![made[0]], "the camera stays selected");
+    let items: Vec<_> = h.state().context_items().into_iter().flatten().collect();
+    assert!(items.iter().any(|i| i.action == Action::OpenView && i.enabled), "the menu offers Open Camera View");
+    h.state_mut().act(Action::OpenView);
+    h.run();
+    assert_eq!((h.state().sheet, h.state().active_3d()), (Sheet::View3D, Some(made[0])));
+    // Orbiting writes the camera's eye and target back, so leaving and returning stands it where it was left.
+    let before = field(&h, made[0], "camera");
+    let mid = h.state().orbit.rect.center();
+    drag_screen(&mut h, mid, mid + vec2(90.0, 0.0), PointerButton::Primary);
+    h.run();
+    let after = field(&h, made[0], "camera");
+    assert_ne!(after, before, "the orbit moved the camera's eye and target");
+    topmost(&mut h, "Level 1");
+    browse_entry(&mut h, "Camera 1");
+    assert_eq!((h.state().sheet, h.state().active_3d()), (Sheet::View3D, Some(made[0])));
+    let eye = h.state().orbit.camera.unwrap().eye().unwrap();
+    let stored: Vec<f64> = after["eye"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!(eye.iter().zip(&stored).all(|(a, b)| (a - b).abs() < 0.1), "it comes back to where it was left: {eye:?} vs {stored:?}");
+}
+
+#[test]
+fn a_camera_views_mark_on_the_plan_edits_its_camera_in_properties() {
+    let mut h = app_at(BOX, 0.05);
+    press(&mut h, "View");
+    press(&mut h, "Camera");
+    click(&mut h, P2(-1000.0, 3000.0));
+    click(&mut h, P2(4000.0, 3000.0));
+    let made = ids(&h, "view3d");
+    assert_eq!(made.len(), 1);
+    let id = made[0];
+    // On its level's plan its mark picks the view, and Properties shows the camera itself, not a dead azimuth or elevation.
+    topmost(&mut h, "Level 1");
+    click(&mut h, P2(-1000.0, 3000.0));
+    assert_eq!(h.state().selection, vec![id]);
+    for label in ["View Name", "Eye", "Target", "Focal Length"] {
+        assert!(h.query_by_label(label).is_some(), "Properties shows {label}");
+    }
+    assert!(h.query_by_label("Azimuth (°)").is_none(), "a camera view has no azimuth to edit");
+    assert!(h.query_by_label("Elevation (°)").is_none(), "a camera view has no elevation to edit");
+    // Focal Length is its lens, changed with its points kept.
+    type_into(&mut h, "Focal Length", "50");
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(field(&h, id, "perspective")["lens"], json!(50.0));
+    assert_eq!(field(&h, id, "camera")["eye"], json!([-1000.0, 3000.0, 1600.0]));
+    // Eye and Target are points in the project's units (mm here).
+    type_into(&mut h, "Eye", "-2000, 3000, 2500");
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(field(&h, id, "camera")["eye"], json!([-2000.0, 3000.0, 2500.0]));
+    assert_eq!(field(&h, id, "camera")["target"], json!([4000.0, 3000.0, 1200.0]));
+    type_into(&mut h, "Target", "4000, 2000, 1500");
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!(field(&h, id, "camera")["target"], json!([4000.0, 2000.0, 1500.0]));
+    // Its name: the view keeps its id, and the old name is gone.
+    type_into(&mut h, "View Name", "Camera West");
+    h.key_press(Key::Enter);
+    h.run();
+    assert_eq!((field(&h, id, "name"), ids(&h, "view3d")), (json!("Camera West"), made));
+    // The mark stood where its eye was: it has moved with it, and picks there.
+    click(&mut h, P2(-2000.0, 3000.0));
+    assert_eq!(h.state().selection, vec![id]);
+    // Opened, the same panel shows the same values; changing one there updates the camera on screen and is not written back
+    // over by the settled hand.
+    let items: Vec<_> = h.state().context_items().into_iter().flatten().collect();
+    assert!(items.iter().any(|i| i.action == Action::OpenView && i.enabled));
+    h.state_mut().act(Action::OpenView);
+    h.run();
+    assert_eq!((h.state().sheet, h.state().active_3d()), (Sheet::View3D, Some(id)));
+    assert!(h.query_by_label("Eye").is_some() && h.query_by_label("Target").is_some());
+    type_into(&mut h, "Eye", "-3000, 3000, 2400");
+    h.key_press(Key::Enter);
+    h.run();
+    h.run();
+    h.run();
+    assert_eq!(field(&h, id, "camera")["eye"], json!([-3000.0, 3000.0, 2400.0]), "the settled hand didn't write the old eye back");
+    assert_eq!(field(&h, id, "camera")["target"], json!([4000.0, 2000.0, 1500.0]));
+    let eye = h.state().orbit.camera.unwrap().eye().unwrap();
+    assert!(eye.iter().zip([-3000.0, 3000.0, 2400.0]).all(|(a, b)| (a - b).abs() < 0.1), "the picture stands at the new eye: {eye:?}");
+    type_into(&mut h, "Focal Length", "80");
+    h.key_press(Key::Enter);
+    h.run();
+    h.run();
+    assert_eq!(field(&h, id, "perspective")["lens"], json!(80.0));
+    assert_eq!(h.state().orbit.camera.unwrap().lens, Some(80.0), "the picture is seen through the new lens");
+}
+
+#[test]
+fn a_camera_view_follows_its_mark_dragged_on_the_plan() {
+    let mut h = app_at(BOX, 0.05);
+    press(&mut h, "View");
+    press(&mut h, "Camera");
+    click(&mut h, P2(-1000.0, 3000.0));
+    click(&mut h, P2(4000.0, 3000.0));
+    let made = ids(&h, "view3d");
+    assert_eq!(made.len(), 1);
+    let id = made[0];
+    // The 3D view is open; back on the plan its mark is dragged.
+    topmost(&mut h, "Level 1");
+    assert_eq!(h.state().sheet, Sheet::Plan(100000));
+    assert_eq!(h.state().active_3d(), Some(id), "the camera view is still the one the 3D tab holds");
+    click(&mut h, P2(-1000.0, 3000.0));
+    assert_eq!(h.state().selection, vec![id]);
+    let from = h.state().screen(P2(-1000.0, 3000.0));
+    drag_screen(&mut h, from, from + vec2(80.0, 0.0), PointerButton::Primary);
+    h.run();
+    let dragged = field(&h, id, "camera");
+    let old = [-1000.0, 3000.0, 1600.0];
+    assert!(!same_point(eye_of(&dragged), old), "the mark moves the camera");
+    // Back in the 3D tab: it stands where the camera now is, and the old position it showed isn't written back over the drag.
+    topmost(&mut h, "Camera 1");
+    h.run();
+    h.run();
+    assert_eq!(h.state().sheet, Sheet::View3D);
+    assert_eq!(field(&h, id, "camera"), dragged, "the dragged camera stays");
+    let eye = h.state().orbit.camera.unwrap().eye().unwrap();
+    assert!(same_point(eye, eye_of(&dragged)), "the picture stands at the dragged camera: {eye:?} vs {:?}", eye_of(&dragged));
+}
+
+#[test]
+fn a_camera_view_in_a_window_of_its_own_follows_its_mark_dragged_on_the_plan() {
+    let mut h = app_at(BOX, 0.05);
+    press(&mut h, "View");
+    press(&mut h, "Camera");
+    click(&mut h, P2(-1000.0, 3000.0));
+    click(&mut h, P2(4000.0, 3000.0));
+    let made = ids(&h, "view3d");
+    let id = made[0];
+    // The 3D view floats over the plan, which is then the active view.
+    assert!(h.state().views.len() >= 2 && h.state().views.contains(&Sheet::View3D));
+    h.state_mut().float_view(Sheet::View3D, pos2(900.0, 300.0));
+    h.run();
+    topmost(&mut h, "Level 1");
+    assert_eq!(h.state().sheet, Sheet::Plan(100000));
+    click(&mut h, P2(-1000.0, 3000.0));
+    let from = h.state().screen(P2(-1000.0, 3000.0));
+    drag_screen(&mut h, from, from + vec2(80.0, 0.0), PointerButton::Primary);
+    h.run();
+    let dragged = field(&h, id, "camera");
+    let old = [-1000.0, 3000.0, 1600.0];
+    assert!(!same_point(eye_of(&dragged), old), "the mark moves the camera");
+    // The window of its own follows at once, and writes nothing of its own back over the drag.
+    h.run();
+    h.run();
+    assert_eq!(field(&h, id, "camera"), dragged, "the floating view didn't put the old camera back");
+    let eye = h.state().orbit.camera.unwrap().eye().unwrap();
+    assert!(same_point(eye, eye_of(&dragged)), "the floating picture stands at the dragged camera: {eye:?} vs {:?}", eye_of(&dragged));
 }
 
 #[test]
@@ -2290,9 +2513,11 @@ fn text_notes_go_where_clicked_in_plans_sections_and_sheets() {
     press(&mut h, "Annotate");
     press(&mut h, "Text");
     assert!(h.query_by_label("Modify | Place Text").is_some());
-    // With nothing typed, a click says what's missing.
+    // With nothing typed in the Options Bar, a click opens the note on the canvas; left empty, it makes nothing.
     click(&mut h, P2(2000.0, 2000.0));
-    assert!(ids(&h, "text").is_empty() && h.state().status.error);
+    assert!(h.state().note_edit.is_some());
+    key(&mut h, Key::Escape);
+    assert!(ids(&h, "text").is_empty() && h.state().note_edit.is_none());
     type_into(&mut h, "Text:", "Tiled floor");
     click(&mut h, P2(2000.0, 2000.0));
     let notes = ids(&h, "text");
@@ -2535,6 +2760,25 @@ fn the_interface_speaks_spanish() {
 }
 
 #[test]
+fn the_interface_speaks_dutch() {
+    let mut h = app(BOX);
+    press(&mut h, "View");
+    press(&mut h, "User Interface");
+    press(&mut h, "Nederlands");
+    assert_eq!(h.state().lang, crate::lang::Lang::Dutch);
+    for label in ["Architectuur", "Annoteren", "Beheren", "Wijzigen", "Eigenschappen", "Plattegronden", "Weergavebereik"] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    // A new project, in the interface's language: its levels named in Dutch.
+    key(&mut h, Key::Escape);
+    press(&mut h, "Bestand");
+    h.get_by_label_contains("Nieuw").click();
+    h.run();
+    let levels: Vec<String> = h.state().session.model.levels().iter().map(|(_, l)| l.name.clone()).collect();
+    assert_eq!(levels, ["Niveau 1", "Niveau 2"]);
+}
+
+#[test]
 fn nothing_a_translated_interface_shows_is_left_in_english() {
     use crate::lang::Lang;
     use egui_kittest::kittest::{By, NodeT};
@@ -2570,9 +2814,9 @@ mass {"boundary": [[1000, 1000], [3000, 1000], [3000, 2000], [1000, 2000]], "nam
     h.run();
     // The probe finds what it looks for: in English, the same labels are all English.
     assert!(english(&h, Lang::Spanish).contains(&"Architecture".to_string()));
-    for l in [Lang::Portuguese, Lang::Spanish, Lang::Chinese] {
+    for l in [Lang::Portuguese, Lang::Spanish, Lang::French, Lang::Dutch, Lang::Chinese, Lang::TraditionalChinese] {
         // A machine has the fonts it has: a window is told it has one for Chinese.
-        crate::lang::assume_chinese_font(&h.ctx);
+        crate::lang::assume_cjk_font(&h.ctx);
         h.state_mut().lang = l;
         h.run();
         let tr = |en: &'static str| crate::lang::translated_in(l, en).unwrap_or(en);
@@ -2704,7 +2948,7 @@ mass {"boundary": [[1000, 1000], [3000, 1000], [3000, 2000], [1000, 2000]], "nam
         press(&mut h, tr("Close"));
         shortcut(&mut h, "VT");
         missed.extend(english(&h, l));
-        press(&mut h, tr("Close"));
+        press(&mut h, tr("Cancel"));
         // The detail tools' Options Bars, with a group to place; Linework with its choices.
         for tool in ["Detail Group", "Repeating Detail", "Revision Cloud", "Insulation"] {
             key(&mut h, Key::Escape);
@@ -2717,14 +2961,20 @@ mass {"boundary": [[1000, 1000], [3000, 1000], [3000, 2000], [1000, 2000]], "nam
         press(&mut h, tr("Linework"));
         missed.extend(english(&h, l));
         key(&mut h, Key::Escape);
-        // Manage > Fill Patterns on both tabs, with a pattern's families; Line Styles on both; Edit Type of a region being sketched.
+        // Manage > Annotation Settings' list; Fill Patterns, with a pattern's families and New Pattern's choices; Line Styles on
+        // both tabs; Edit Type of a region being sketched.
         press(&mut h, tr("Manage"));
+        press(&mut h, tr("Annotation Settings"));
+        missed.extend(english(&h, l));
         press(&mut h, tr("Fill Patterns"));
         missed.extend(english(&h, l));
-        topmost(&mut h, tr("Patterns"));
-        press(&mut h, &tr("{}: Edit Lines").replace("{}", "Sand"));
+        press(&mut h, &tr("{}: Edit Lines").replace("{}", "Crosshatch"));
         missed.extend(english(&h, l));
+        press(&mut h, tr("New Pattern"));
+        missed.extend(english(&h, l));
+        press(&mut h, tr("New Pattern"));
         press(&mut h, tr("Cancel"));
+        press(&mut h, tr("Annotation Settings"));
         press(&mut h, tr("Line Styles"));
         missed.extend(english(&h, l));
         topmost(&mut h, tr("Patterns"));
@@ -3115,6 +3365,13 @@ fn the_materials_window_edits_the_projects_library() {
     h.run();
     press(&mut h, "Diagonal");
     assert_eq!(h.state().session.model.materials["Material 1"].cut, Pattern::Diagonal);
+    // How see-through it is, on its slider (a click on the slider's track, then its arrow keys).
+    assert_eq!(h.state().session.model.materials["Material 1"].transparency, 0);
+    h.get_by_label("Transparency").focus();
+    h.run();
+    key(&mut h, Key::ArrowRight);
+    key(&mut h, Key::ArrowRight);
+    assert_eq!(h.state().session.model.materials["Material 1"].transparency, 2);
     type_into(&mut h, "Name", "Oak");
     key(&mut h, Key::Enter);
     let m = &h.state().session.model.materials;
@@ -3404,6 +3661,76 @@ fn manage_snaps_switches_each_snap_and_the_angle_steps() {
     click(&mut h, P2(3470.0, 2020.0));
     key(&mut h, Key::Enter);
     assert_eq!(walls(&h)[0].1, P2(3470.0, 2020.0));
+}
+
+#[test]
+fn walls_drawn_near_alignment_guide_snap_to_other_walls_reference_points() {
+    let mut h = app("");
+    // First wall from (0, 0) to (5000, 0)
+    tool(&mut h, "Wall");
+    click(&mut h, P2(0.0, 0.0));
+    click(&mut h, P2(5000.0, 0.0));
+    key(&mut h, Key::Enter);
+
+    // Second wall starting at (0, 3000)
+    tool(&mut h, "Wall");
+    click(&mut h, P2(0.0, 3000.0));
+    // Click near X = 5000 (e.g. 5005, 3000) within tolerance
+    click(&mut h, P2(5005.0, 3000.0));
+    key(&mut h, Key::Enter);
+
+    let w = walls(&h);
+    assert_eq!(w.len(), 2);
+    assert!(w[1].0.dist(P2(0.0, 3000.0)) < 1e-2);
+    // The second wall's endpoint snapped to exactly X = 5000.0 aligned with the first wall's endpoint
+    assert_eq!(w[1].1.0, 5000.0);
+    assert!((w[1].1.1 - 3000.0).abs() < 1e-2);
+}
+
+#[test]
+fn manage_snaps_toggles_alignment_guides() {
+    let mut h = app("");
+    assert!(h.state().snaps.alignment_guides);
+    press(&mut h, "Manage");
+    press(&mut h, "Snaps");
+    assert!(h.query_by_label("Alignment Guides").is_some());
+    pick(&mut h, Role::CheckBox, "Alignment Guides");
+    press(&mut h, "Close");
+    assert!(!h.state().snaps.alignment_guides);
+}
+
+#[test]
+fn grids_drawn_near_alignment_guide_snap_to_other_grids_reference_points() {
+    let mut h = app("");
+    // First grid from (0, 0) to (0, 5000)
+    tool(&mut h, "Grid");
+    click(&mut h, P2(0.0, 0.0));
+    click(&mut h, P2(0.0, 5000.0));
+
+    // Second grid starting at (3000, 0)
+    tool(&mut h, "Grid");
+    click(&mut h, P2(3000.0, 0.0));
+    // Second point near (3000, 5003) aligned with Y=5000
+    click(&mut h, P2(3000.0, 5003.0));
+
+    let grid = ids(&h, "grid");
+    assert_eq!(grid.len(), 2);
+    assert_eq!(field(&h, grid[1], "start"), json!([3000.0, 0.0]));
+    assert_eq!(field(&h, grid[1], "end"), json!([3000.0, 5000.0]));
+}
+
+#[test]
+fn shortcut_toggles_alignment_guides() {
+    let mut h = app("");
+    assert!(h.state().snaps.alignment_guides);
+    key(&mut h, Key::F8);
+    assert!(!h.state().snaps.alignment_guides);
+    key(&mut h, Key::F8);
+    assert!(h.state().snaps.alignment_guides);
+    shortcut(&mut h, "AG");
+    assert!(!h.state().snaps.alignment_guides);
+    shortcut(&mut h, "OG");
+    assert!(h.state().snaps.alignment_guides);
 }
 
 #[test]
@@ -4216,121 +4543,10 @@ fn filters_are_made_in_their_dialog_and_applied_by_a_view() {
     press(&mut h, "Close");
 }
 
-#[test]
-fn view_templates_are_made_from_a_view_and_followed_from_properties() {
-    let mut h = app(&format!("{BOX}\nroom {{\"point\": [4000, 3000], \"name\": \"Living\"}}"));
-    shortcut(&mut h, "VV");
-    pick(&mut h, Role::CheckBox, "Rooms");
-    press(&mut h, "OK");
-    shortcut(&mut h, "VT");
-    assert!(h.query_by_label("No view templates yet: Create from This View makes one.").is_some());
-    type_into(&mut h, "New template:", "Presentation");
-    press(&mut h, "Create from This View");
-    assert!(h.state().session.model.view_templates["Presentation"].graphics.hides("room"));
-    // What it controls, ticked and unticked.
-    pick(&mut h, Role::CheckBox, "View Range");
-    assert!(!h.state().session.model.view_templates["Presentation"].controls.contains(&bimcraft_core::graphics::Group::Range));
-    press(&mut h, "Close");
-    // Level 2 follows it from its Properties.
-    topmost(&mut h, "Level 2");
-    // It lies at the palette's foot, below where a pointer can reach.
-    h.get_by_role_and_label(Role::ComboBox, "View Template").click_accesskit();
-    h.run();
-    press(&mut h, "Presentation");
-    assert_eq!(plan_graphics(&h, 100001).template.as_deref(), Some("Presentation"));
-    // Its dialog says where the categories are set, and shows them as the template has them.
-    shortcut(&mut h, "VV");
-    assert!(h.query_by_label("Categories, Filters, Design Options follow view template Presentation: change them there.").is_some());
-    use egui_kittest::kittest::NodeT;
-    let rooms = h.get_by_role_and_label(Role::CheckBox, "Rooms").accesskit_node().toggled();
-    assert_eq!(rooms, Some(egui::accesskit::Toggled::False), "hidden, by the template");
-    press(&mut h, "Cancel");
-    // And Stop Following from the templates dialog.
-    shortcut(&mut h, "VT");
-    press(&mut h, "Stop Following in This View");
-    assert!(plan_graphics(&h, 100001).template.is_none());
-    press(&mut h, "Close");
-}
-
 /// Whether the widget of `role` named `label` is greyed out.
 fn is_disabled(h: &Harness<BimApp>, role: Role, label: &str) -> bool {
     use egui_kittest::kittest::NodeT;
     h.get_by_role_and_label(role, label).accesskit_node().is_disabled()
-}
-
-#[test]
-fn view_templates_hold_show_and_hand_on_a_scale_detail_level_and_visual_style() {
-    use bimcraft_core::graphics::{Detail, Group, VisualStyle};
-    let mut h = app(BOX);
-    let run = |h: &mut Harness<BimApp>, id: &str, p: serde_json::Value| h.state_mut().session.execute(id, &p).unwrap();
-    run(&mut h, "scale", json!({"view": 100000, "scale": 50}));
-    run(&mut h, "detail", json!({"view": 100000, "detail": "coarse"}));
-    let template = |h: &Harness<BimApp>| h.state().session.model.view_templates["Plans"].clone();
-    // Made from a view, a template holds what the view has, and says so.
-    shortcut(&mut h, "VT");
-    type_into(&mut h, "New template:", "Plans");
-    press(&mut h, "Create from This View");
-    assert_eq!((template(&h).graphics.scale, template(&h).graphics.detail), (Some(50.0), Detail::Coarse));
-    assert_eq!(
-        (combo_value(&h, "View Scale:"), combo_value(&h, "Detail Level:"), combo_value(&h, "Visual Style:")),
-        ("1 : 50".into(), "Coarse".into(), "Shaded".into())
-    );
-    use egui_kittest::kittest::NodeT;
-    for group in ["View Scale", "Detail Level", "Visual Style"] {
-        let on = h.get_by_role_and_label(Role::CheckBox, group).accesskit_node().toggled();
-        assert_eq!(on, Some(egui::accesskit::Toggled::True), "{group}: it controls them all to start with");
-    }
-    // Set in the dialog, each is one command on the template.
-    let steps = h.state().session.history().len();
-    choose(&mut h, "View Scale:", "1 : 20");
-    choose(&mut h, "Detail Level:", "Medium");
-    choose(&mut h, "Visual Style:", "Wireframe");
-    let t = template(&h);
-    assert_eq!((t.graphics.scale, t.graphics.detail, t.graphics.style), (Some(20.0), Detail::Medium, VisualStyle::Wireframe));
-    assert_eq!(h.state().session.history().len(), steps + 3);
-    // What it controls, one at a time.
-    pick(&mut h, Role::CheckBox, "Visual Style");
-    assert!(!template(&h).controls.contains(&Group::Style) && template(&h).controls.contains(&Group::Scale));
-    pick(&mut h, Role::CheckBox, "Visual Style");
-    assert!(template(&h).controls.contains(&Group::Style));
-    press(&mut h, "Close");
-    // Level 2 follows it: the bar and Properties show the template's, greyed, and say whose they are.
-    topmost(&mut h, "Level 2");
-    assert_eq!(h.state().sheet, Sheet::Plan(100001));
-    assert_eq!(combo_value(&h, "View Scale"), "1 : 100");
-    shortcut(&mut h, "VT");
-    press(&mut h, "Follow in This View");
-    press(&mut h, "Close");
-    assert_eq!(plan_graphics(&h, 100001).template.as_deref(), Some("Plans"));
-    assert_eq!((combo_value(&h, "View Scale"), combo_value(&h, "Detail Level")), ("1 : 20".into(), "Medium".into()));
-    assert!(is_disabled(&h, Role::ComboBox, "View Scale") && is_disabled(&h, Role::ComboBox, "Detail Level"));
-    assert!(is_disabled(&h, Role::TextInput, "Scale Value 1:"));
-    let shown = painted_text(&h);
-    assert!(shown.contains(&"1 : 20".to_string()) && shown.contains(&"Medium".to_string()), "{shown:?}");
-    assert!(is_disabled(&h, Role::Button, "Scale") && is_disabled(&h, Role::Button, "Detail Level"));
-    // Hovering over one says whose it is.
-    let at = h.get_by_role_and_label(Role::Button, "Scale").rect().center();
-    h.hover_at(at);
-    for _ in 0..4 {
-        h.run();
-    }
-    let note = "Set by view template Plans: change the template, or stop following it.";
-    assert!(painted_text(&h).contains(&note.to_string()), "{:?}", painted_text(&h));
-    // Level 1 follows nothing, and keeps its own.
-    topmost(&mut h, "Level 1");
-    assert!(!is_disabled(&h, Role::Button, "Scale"));
-    assert_eq!(combo_value(&h, "View Scale"), "1 : 50");
-    // A template that leaves the scale be leaves it to the view.
-    run(&mut h, "template", json!({"name": "Plans", "controls": ["detail"]}));
-    topmost(&mut h, "Level 2");
-    assert!(!is_disabled(&h, Role::ComboBox, "View Scale") && is_disabled(&h, Role::ComboBox, "Detail Level"));
-    assert!(!is_disabled(&h, Role::Button, "Scale") && is_disabled(&h, Role::Button, "Detail Level"), "the bar too");
-    // Stop following: its own again.
-    shortcut(&mut h, "VT");
-    press(&mut h, "Stop Following in This View");
-    press(&mut h, "Close");
-    assert!(!is_disabled(&h, Role::ComboBox, "Detail Level"));
-    assert_eq!(combo_value(&h, "Detail Level"), "Fine");
 }
 
 #[test]
@@ -4341,15 +4557,21 @@ fn a_templates_controls_are_ticked_and_unticked_one_at_a_time() {
     shortcut(&mut h, "VT");
     let controls = |h: &Harness<BimApp>| h.state().session.model.view_templates["T"].controls.iter().copied().collect::<Vec<_>>();
     assert_eq!(controls(&h), [Group::Categories]);
+    // Each is ticked on its own, the others staying as they were; Apply (the dialog's, over the palette's) sends them.
+    let apply = |h: &mut Harness<BimApp>| {
+        h.get_all_by(|n| n.role() == Role::Button && n.label().as_deref() == Some("Apply")).last().unwrap().click();
+        h.run();
+    };
     pick(&mut h, Role::CheckBox, "Filters");
+    apply(&mut h);
     assert_eq!(controls(&h), [Group::Categories, Group::Filters]);
     pick(&mut h, Role::CheckBox, "Categories");
+    apply(&mut h);
     assert_eq!(controls(&h), [Group::Filters], "the others stay as they were");
     pick(&mut h, Role::CheckBox, "Filters");
-    assert!(controls(&h).is_empty());
     pick(&mut h, Role::CheckBox, "View Range");
+    press(&mut h, "OK");
     assert_eq!(controls(&h), [Group::Range]);
-    press(&mut h, "Close");
 }
 
 #[test]
@@ -4441,7 +4663,8 @@ fn ph_and_do_open_phasing_and_design_options_and_so_do_the_manage_tabs_buttons()
 #[test]
 fn a_ribbon_tab_wider_than_the_window_folds_its_last_panels_to_buttons_that_list_their_tools() {
     let mut h = app(BOX);
-    h.set_size(vec2(1000.0, 800.0));
+    // Narrow enough that Manage folds its last panels; the fit is judged on each tool's average width, a few pixels out.
+    h.set_size(vec2(1020.0, 800.0));
     h.run();
     let window = h.ctx.content_rect().right();
     // Past the window's edge at this size, the tab is out of the reach of a click: opened as the code does.
@@ -4465,6 +4688,7 @@ fn a_tool_with_choices_of_its_own_opens_them_from_a_panels_list() {
     for (tab, panel, tool, choice) in [
         (Tab::Manage, "Settings", "Project Units", "Feet and inches"),
         (Tab::Manage, "Settings", "Project Language", "Español"),
+        (Tab::Manage, "Settings", "Project Language", "Nederlands"),
         (Tab::Manage, "Family Editor", "New Family", "Furniture"),
         (Tab::View, "Create", "Schedules", "Schedule/Quantities…"),
         (Tab::View, "Create", "Duplicate View", "Duplicate with Detailing"),
@@ -4821,34 +5045,6 @@ fn visibility_graphics_picks_the_option_a_view_shows_of_each_set_unless_a_templa
 }
 
 #[test]
-fn a_templates_phase_and_options_are_ticked_like_its_other_controls_and_hold_a_views_phase() {
-    use bimcraft_core::graphics::Group;
-    use egui_kittest::kittest::NodeT;
-    let mut h = app(BOX);
-    h.state_mut()
-        .session
-        .execute("template", &json!({"name": "T", "from": 100000, "controls": ["categories"], "phase": "Existing"}))
-        .unwrap();
-    shortcut(&mut h, "VT");
-    let controls = |h: &Harness<BimApp>| h.state().session.model.view_templates["T"].controls.iter().copied().collect::<Vec<_>>();
-    pick(&mut h, Role::CheckBox, "Phase and Phase Filter");
-    pick(&mut h, Role::CheckBox, "Design Options");
-    assert_eq!(controls(&h), [Group::Categories, Group::Phase, Group::Options]);
-    // Followed, the view shows the template's phase and can't change it.
-    press(&mut h, "Follow in This View");
-    press(&mut h, "Close");
-    assert_eq!(plan_graphics(&h, 100000).template.as_deref(), Some("T"));
-    let phase = h.get_by_role_and_label(Role::ComboBox, "Phase");
-    assert_eq!(phase.accesskit_node().value().as_deref(), Some("Existing"));
-    assert!(phase.accesskit_node().is_disabled());
-    // The view's own, if it follows nothing.
-    shortcut(&mut h, "VT");
-    press(&mut h, "Stop Following in This View");
-    press(&mut h, "Close");
-    assert!(!h.get_by_role_and_label(Role::ComboBox, "Phase").accesskit_node().is_disabled());
-}
-
-#[test]
 fn an_active_option_the_project_no_longer_has_is_dropped() {
     let mut h = app(&format!("{BOX}\n{MASSING}"));
     pick(&mut h, Role::ComboBox, "Active design option:");
@@ -5104,6 +5300,7 @@ fn the_family_editor_edits_a_family_says_what_wont_build_and_starts_a_new_one_of
     // Its top is drawn as an outline: click on its east edge.
     click(&mut h, P2(3800.0, 3000.0));
     assert_eq!(h.state().selection, [table]);
+    h.set_size(vec2(1800.0, 900.0));
     press(&mut h, "Manage");
     press(&mut h, "Edit Family");
     assert!(h.state().family_editor.is_some(), "the window is open on the table's family");
@@ -5238,6 +5435,7 @@ fn the_massing_tab_makes_floors_walls_a_floor_and_a_roof_from_the_selected_mass(
     assert_eq!(h.state().tool, Tool::Mass(Vec::new()));
 }
 
+mod align;
 mod autosave;
 mod browser;
 mod cad;
@@ -5245,31 +5443,43 @@ mod chinese;
 mod clouds;
 mod control;
 mod dialog;
+mod dimensions;
 mod dock;
 mod draw;
+mod electrical;
 mod fills;
 mod filter;
 mod fonts;
 mod gpu;
 mod graphics;
 mod groups;
+mod korean;
 mod light_canvas;
 mod lines;
 mod lineweights;
 mod links;
 mod look;
 mod mep;
+mod notes;
 mod objectstyles;
 mod patterns;
+mod perspective;
 mod planviews;
+mod popup;
 mod purge;
+mod reinforce;
 mod revit;
+mod rooms;
 mod section_box;
 mod sketch;
 mod smallest;
+mod standards;
 mod start;
+mod templates;
 mod titlebar;
 mod tools;
+mod trim;
+mod typeprops;
 mod window;
 
 #[test]
@@ -5891,6 +6101,8 @@ fn select_by_id_finds_elements_by_id_guid_or_ifc_globalid_says_what_it_missed_an
     let walls = ids(&h, "wall");
     let (high, low) = (walls[4], walls[1]);
     let ifc = bimcraft_core::ifc::compress(gid(&h, low).as_u128());
+    // Manage grew with Room Area Computation and Technical Standards: the ribbon folds Inquiry away in a narrower window.
+    h.set_size(vec2(1800.0, 900.0));
     press(&mut h, "Manage");
     press(&mut h, "Select by ID");
     // Live: what the list finds, and what it doesn't, as it is typed.
@@ -6049,3 +6261,25 @@ fn a_view_tabs_close_button_is_part_of_its_tab() {
     press(&mut h, "Close {3D}");
     assert!(!h.state().views.contains(&Sheet::View3D));
 }
+
+/// Manage > Room Area Computation: the button drops the two choices down, a pick sets the project's `room_area` through the command,
+/// and undo puts it back.
+#[test]
+fn room_area_computation_is_set_from_manage_and_undone() {
+    use bimcraft_core::model::RoomArea;
+    let mut h = app(BOX);
+    // Manage grew with Electrical Settings: the ribbon folds Room Area Computation away in a narrower window.
+    h.set_size(vec2(1800.0, 900.0));
+    h.state_mut().tab = Tab::Manage;
+    h.run();
+    assert_eq!(h.state().session.model.room_area, RoomArea::Centre);
+    press(&mut h, "Room Area Computation");
+    assert!(h.query_by_label("At wall centre line").is_some(), "both choices are on screen");
+    press(&mut h, "At wall finish");
+    assert_eq!(h.state().session.model.room_area, RoomArea::Finish);
+    h.state_mut().run("undo", json!({}));
+    h.run();
+    assert_eq!(h.state().session.model.room_area, RoomArea::Centre);
+}
+
+mod background_grid;

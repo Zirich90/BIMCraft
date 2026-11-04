@@ -54,7 +54,7 @@ impl BimApp {
         let mut set = None;
         egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 2, bottom: 6 }).show(ui, |ui| {
             let half = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-            Grid::new("section-box-properties").num_columns(2).striped(true).min_col_width(half).max_col_width(half).show(ui, |ui| {
+            Grid::new("section-box-properties").num_columns(2).min_col_width(half).max_col_width(half).show(ui, |ui| {
                 let name = t("Section Box");
                 let label = ui.label(name);
                 let mut on = b.is_some_and(|b| b.on);
@@ -107,7 +107,8 @@ pub(crate) fn grip_at(b: (P3, P3), at: Pos2, screen: impl Fn(P3) -> Pos2) -> Opt
 /// square for a face square to the screen). `held` is the grip being dragged.
 pub(crate) fn draw(p: &Painter, cam: &Camera, b: (P3, P3), grips: bool, held: Option<usize>, screen: impl Fn(P3) -> Pos2) {
     let edge = Stroke::new(1.0, if held.is_some() { pal().accent } else { pal().muted });
-    for [a, z] in box_edges(b) {
+    // In perspective, what of each edge is in front of the eye.
+    for [a, z] in box_edges(b).into_iter().filter_map(|[a, z]| cam.in_front(a, z)) {
         p.line_segment([screen(a), screen(z)], edge);
     }
     if !grips {
@@ -115,6 +116,9 @@ pub(crate) fn draw(p: &Painter, cam: &Camera, b: (P3, P3), grips: bool, held: Op
     }
     for (k, g) in box_grips(b).into_iter().enumerate() {
         let at = screen(g);
+        if !at.is_finite() {
+            continue;
+        }
         let mut out = g;
         out[k / 2] += if k.is_multiple_of(2) { -1.0 } else { 1.0 } / cam.scale.max(1e-12);
         let d = screen(out) - at;

@@ -2,6 +2,8 @@
 //! project. What it shows it reads from the favorites file itself; every change to the project goes
 //! through a `favorite` command, so it's checked and undone like any other.
 
+use crate::popup::Modal;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
@@ -9,7 +11,7 @@ use bimcraft_core::favorites::{self, Favorites};
 use bimcraft_core::model::Material;
 use bimcraft_core::texture::{Picture, Sampler};
 use egui::{
-    Align, Color32, ColorImage, Context, Id as UiId, Layout, Modal, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle,
+    Align, Color32, ColorImage, Context, Id as UiId, Layout, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, pos2, vec2,
 };
 use serde_json::json;
@@ -107,74 +109,75 @@ impl BimApp {
                 }
             }
         }
-        let r = Modal::new(UiId::new("favorites")).show(ctx, |ui| {
-            ui.set_width(540.0);
-            ui.label(RichText::new(t("Favorites")).heading());
-            ui.label(RichText::new(t("Kept for every project: add one to this project with a click.")).color(pal().muted));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (tab, label) in [(Tab::Materials, "Materials"), (Tab::Families, "Families")] {
-                    if ui.selectable_label(d.tab == tab, t(label)).clicked() {
-                        d.tab = tab;
+        let r = Modal::new(UiId::new("favorites"), t("Favorites")).width(540.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.label(RichText::new(t("Kept for every project: add one to this project with a click.")).color(pal().muted));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (tab, label) in [(Tab::Materials, "Materials"), (Tab::Families, "Families")] {
+                        if ui.selectable_label(d.tab == tab, t(label)).clicked() {
+                            d.tab = tab;
+                        }
                     }
-                }
+                });
+                ui.separator();
+                ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| match (&d.kept, d.tab) {
+                    (Err(e), _) => {
+                        ui.label(RichText::new(e).color(pal().error));
+                    }
+                    (Ok(f), Tab::Materials) => {
+                        if f.materials.is_empty() {
+                            ui.label(RichText::new(t("No favorite materials yet: save one from Manage > Materials.")).color(pal().muted));
+                        }
+                        for (name, e) in &f.materials {
+                            ui.horizontal(|ui| {
+                                paint_swatch(ui, 40.0, e.material.color, d.swatches.get(name));
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(name).strong());
+                                    let what =
+                                        e.material.texture.as_ref().map_or(t("No texture"), |x| t(crate::properties::texture_name(x.kind)));
+                                    ui.label(RichText::new(what).color(pal().muted));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button(t("Remove")).clicked() {
+                                        act = Some(("delete", "material", name.clone()));
+                                    }
+                                    if ui.button(t("Add to Project")).clicked() {
+                                        act = Some(("load", "material", name.clone()));
+                                    }
+                                });
+                            });
+                            ui.add_space(2.0);
+                        }
+                    }
+                    (Ok(f), Tab::Families) => {
+                        if f.families.is_empty() {
+                            ui.label(RichText::new(t("No favorite families yet: save one from the Family Editor.")).color(pal().muted));
+                        }
+                        for (name, e) in &f.families {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(name).strong());
+                                    let types = e.family.types.keys().cloned().collect::<Vec<_>>().join(", ");
+                                    ui.label(RichText::new(tf("{}: {}", &[&category_name(e.family.category), &types])).color(pal().muted));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.button(t("Remove")).clicked() {
+                                        act = Some(("delete", "family", name.clone()));
+                                    }
+                                    if ui.button(t("Add to Project")).clicked() {
+                                        act = Some(("load", "family", name.clone()));
+                                    }
+                                });
+                            });
+                            ui.add_space(2.0);
+                        }
+                    }
+                });
             });
-            ui.separator();
-            ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| match (&d.kept, d.tab) {
-                (Err(e), _) => {
-                    ui.label(RichText::new(e).color(pal().error));
-                }
-                (Ok(f), Tab::Materials) => {
-                    if f.materials.is_empty() {
-                        ui.label(RichText::new(t("No favorite materials yet: save one from Manage > Materials.")).color(pal().muted));
-                    }
-                    for (name, e) in &f.materials {
-                        ui.horizontal(|ui| {
-                            paint_swatch(ui, 40.0, e.material.color, d.swatches.get(name));
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(name).strong());
-                                let what =
-                                    e.material.texture.as_ref().map_or(t("No texture"), |x| t(crate::properties::texture_name(x.kind)));
-                                ui.label(RichText::new(what).color(pal().muted));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(t("Remove")).clicked() {
-                                    act = Some(("delete", "material", name.clone()));
-                                }
-                                if ui.button(t("Add to Project")).clicked() {
-                                    act = Some(("load", "material", name.clone()));
-                                }
-                            });
-                        });
-                        ui.add_space(2.0);
-                    }
-                }
-                (Ok(f), Tab::Families) => {
-                    if f.families.is_empty() {
-                        ui.label(RichText::new(t("No favorite families yet: save one from the Family Editor.")).color(pal().muted));
-                    }
-                    for (name, e) in &f.families {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(name).strong());
-                                let types = e.family.types.keys().cloned().collect::<Vec<_>>().join(", ");
-                                ui.label(RichText::new(tf("{}: {}", &[&category_name(e.family.category), &types])).color(pal().muted));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(t("Remove")).clicked() {
-                                    act = Some(("delete", "family", name.clone()));
-                                }
-                                if ui.button(t("Add to Project")).clicked() {
-                                    act = Some(("load", "family", name.clone()));
-                                }
-                            });
-                        });
-                        ui.add_space(2.0);
-                    }
-                }
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
             });
-            ui.add_space(6.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
         });
         if let Some((action, kind, name)) = act {
             let mut p = self.favorite_params(action, kind, &name);

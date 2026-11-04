@@ -109,6 +109,13 @@ New and Open (`BimApp::reopened`) keep the look: a new `BimApp` would run `style
 preference back to the system's (and `keep_settings` would then write that over the user's choice), so `reopened` carries
 `styled`, `theme_wanted` and `light_canvas` over.
 
+Application dialogs use `popup.rs`: a shared modal frame with a draggable title bar and a corner × button. Each dialog keeps its own
+position while the application is open; dragging is constrained to the application window. The × button follows Cancel/Close, so it never
+applies a draft; so does Escape. A click beside a dialog, on the dimmed window behind it, does nothing: only its buttons, its × and Escape
+close it. Nested dialogs keep their own positions and close independently. The dialog body scrolls separately from its footer;
+OK, Cancel, Apply and other closing actions stay at the bottom, including on shorter windows and when tabs have different amounts of content.
+Imports and installations keep their close button disabled while they replace the project or application. Native file dialogs keep their system frames.
+
 The system's file dialogs (Open, Save As, the exports, Load Family, Link Model, a material's picture) are asked for through
 `BimApp::ask_file` (`dialog.rs`), never with a blocking `rfd::FileDialog`: a native dialog run inside the window's event
 handler nests a run loop in it, and on macOS a drag reaching the window meanwhile re-enters the handler and aborts the app
@@ -155,6 +162,29 @@ door or window lands on it (`Model::centred`): the click sends that `offset`, th
 A selected column or component, and the Column and Component tools' sketches, show up to four: how far it stands from the nearest wall centre
 line or grid east, north, west and south (`Model::clearances`, which finds them in the core; `standing_dimensions` draws them); a typed one runs
 `move` by the difference along that way.
+
+Align (AL) highlights the exact edge or axis under the cursor before either pick, leaving the selected reference as an
+extended dashed line. It searches the candidates under the pointer for a usable line rather than letting annotation mask
+one. `align::lines` in the core supplies wall faces and ends, opening jambs, grids, column faces and axes, structural and
+MEP runs, components, slab and roof boundaries, stairs, ramps, railings and detail geometry. Straight segments of a
+polyline or sketch are usable; curved edges are not replaced with straight chords. The `align` command turns the target
+by the smaller angle about the picked line's midpoint and translates it onto the reference, as one undo step through the
+usual transform and validation path. Hosted doors/windows can slide along their wall, and hosted railings follow their
+stair or ramp. A refusal keeps the reference selected. On the second pick a floor's or region's model pattern remains
+alignable when its line is closer than the boundary; picking the boundary aligns the element instead.
+
+While a sketch is active, Align takes its reference from either model geometry or another sketch line, with a coincident
+draft line taking priority over the saved boundary. Its second pick edits a sketch line. The same exact segment highlights
+on hover before either pick, including straight segments of polylines. `align::sketch_lines` applies the rigid alignment to
+the draft curve, keeps its id, GUID and style, and moves joined endpoints so a closed boundary stays connected. A sketch
+reference stays fixed. Changes use the sketch's Ctrl+Z history and reach the model only through Finish Edit Mode; Cancel
+leaves the model as it was. Invalid geometry leaves the draft and reference intact, and undo or Escape drops stale picks.
+
+The sketch's contextual ribbon includes Align, Trim/Extend to Corner, Trim/Extend Single/Multiple Elements, Split and
+Offset. Trim highlights sketch candidates and keeps its first pick lit; its prompt says which line to pick and to click
+the part to keep. A failed trim leaves that first pick available for another target; a successful edit clears the error.
+Multiple Trim keeps the boundary across successive target edits while that indexed line is unchanged, and drops it if
+another edit removes, renumbers or changes it. Escape clears the first pick; Ctrl+Z takes back each trim as one draft step.
 
 A point picked in a plan lands where `snap::snap` says, the core's so every front end agrees: on the end, middle or centre of
 what's drawn (`Scene::of`), a round detail line's quadrants (`rounds`: a circle's, an ellipse's or an arc's points along its axes),
@@ -203,6 +233,37 @@ is drawn in plans only (a door's in a box, a window's in a hexagon, any other's 
 with it. The Tag tool picks whatever `anchor` finds a point for, and the Options Bar's Label field is the `label` the click passes on; Tag All (`tag` without `ids`)
 still takes doors and windows unless given a `category`.
 
+Type Properties (`typeprops.rs`). Every kind of type opens in one dialog, after Revit's: the shared title bar, then `head` (Family, shown and not picked, and
+Type, with Duplicate… and Rename… beside it; either opens a Name row under it, Enter or its button doing it), then `table` (Parameter and Value
+under group bars that fold, `Table::row` and its helpers for a field, a check box, a drop-down, a dragged number, a colour, a value worked out, and
+`Table::full` for what spans both columns, a type's layers or a sample), then `foot` (what stopped it, and OK, Cancel and Apply). Each dialog keeps its
+state and its commands: the project's own types and a family's in `properties.rs` (`type`, `family`, and `rename_type` for Rename), text types in
+`notes.rs` (`text_type`, with `rename`), filled region types in `fillpatterns.rs`, where Duplicate and Rename change the draft OK applies and a
+pattern's … opens the Patterns tab. The dialogs are one width, and the table's body one height where the window has room, known from the first frame:
+a body that fitted its rows grew over a few frames, and a click meant for one row landed on the next. A refusal is said in the dialog.
+
+View Templates (`templates.rs`). VT and View > View Templates open it as Revit's does, in the look Type Properties has: on the left a tab for each
+kind of view (`ViewKind`: Plan, Elevation/Section, 3D; a template of no kind is on every tab), the templates of the one showing, and Duplicate…,
+Rename… and Delete, with New from This View… (enabled on the tab of the active view's kind) under them, each opening a Name row; they run at once
+(`template` with `like`, `rename`, `delete`, `from`). On the right the template picked: a table of Parameter, Value and Include, its rows the groups
+its kind holds (`ViewKind::groups`), each group's Include box named for the group. Its settings edit a draft (`TemplatesDialog::drafts`, one per
+template, kept through Duplicate and Rename); OK and Apply send each template's difference as one `template` command, Cancel drops them.
+V/G Overrides, V/G Filters and Design Options open Visibility/Graphics on the template's draft (`VgDialog::for_template`: no Elements tab nor a
+drawing's layers, which are a view's own; its OK puts the categories, filters and options back in the draft), View Range a small dialog of
+its four offsets, and Background Grids the grid editor. A view's Properties name its template on a button (`properties::wide_button`, as wide as the drop-downs, as Edit… is), which
+opens the same dialog as Assign View Template: <None> first, the view's kind's tab showing, and OK also sets the template the view follows.
+
+The palette's rows are not striped: a stripe is `bar`, the group headers' colour. Buttons and drop-downs fill with `Palette::control`, a step past
+`bar` (darker on light, lighter on dark), so a control never reads as a heading beside it.
+
+The camera (`camera.rs`). The 3D view's Properties have a Camera group: Projection, a drop-down of Axonometric and Perspective that runs
+`perspective` (off or on), and in perspective the Focal Length (a camera's mm, whatever the project's units) and the Eye Elevation, a length in the project's units. Focal
+Length runs `perspective` with its `lens`; Eye Elevation is the camera's on screen, not the project's, and moves `Orbit::camera` by
+`Camera::with_eye_elevation`. Each frame `orbit.rs` sizes the camera to the view through the view's lens (`orbit::lens_of`,
+`Camera::sized`), so the eye stays where it stood as the lens or the window changes, and Home View and Zoom to Fit fit through it
+(`Scene::fit_from`). Picking, Modify, the level grips and the section box grips work in perspective as they do parallel; a grip or an edge of
+the box behind the eye isn't drawn.
+
 The section box (`section_box.rs`). The 3D view's Properties have an Extents group: Section Box, a checkbox, and while it's on the
 West, East, South, North, Bottom and Top faces as lengths in the project's units; BX turns it on or off (opening the 3D view). They run
 `section_box`. In the view, `orbit.rs` draws the box's edges and, in Modify, an arrow on each face pointing out along its axis (a square
@@ -236,13 +297,19 @@ card frame (`style::card`: 8 px corners, a hairline border and a soft shadow, st
 and Mono (`assets/fonts`, SIL OFL 1.1; built into the executable, so `NOTICE` names them with their versions and sha256 and every package
 carries it and both OFL.txt, as `copy_docs` in `packaging/env.sh`, `bimcraft.wxs` and `portable.ps1` do: `tests/fonts.rs` checks), with
 `style::semibold` for titles and tabs (the body's face until the window has loaded it, a frame after `apply`). The semibold face is a
-family of its own, and egui does not fall back across families, so the Chinese font joins every family in `style::families` (`lang::use_chinese_font`). `BimApp::show` paints the active view's ground (`backdrop`) under everything, then the app bar (Home, File, the
+family of its own, and egui does not fall back across families, so the fonts with the hanzi and the Hangul join every family in
+`style::families` (`lang::use_cjk_font`), whatever language the window speaks. `BimApp::show` paints the active view's ground (`backdrop`) under everything, then the app bar (Home, File, the
 Quick Access Toolbar and the title, light on dark, `style::on_app_bar`), and the ribbon, the Options Bar, the status bar and each docked
-palette stack as cards, so the gaps between them read as the view going on beneath; the view control bar is a small card in the view's
-corner. The Options Bar (`BimApp::options_bar`) floats over the view's top left, an `Area` above it, while there's something on it (a
+palette stack as cards, so the gaps between them read as the view going on beneath. A drawn view (a plan, a section, the 3D view, a
+sheet) fills its pane from the top of the pane to its foot: its tabs float over its top left on a card of their own and the view control
+bar over its bottom left, each drawn after the view in a child `Ui` that takes no room of it (`Ui::new_child`; `scope_builder` would
+allocate it, and an auto-sized floating view window would grow a little every frame), so they are over it for the hand too. A schedule
+keeps its tab strip, so its first rows aren't under the tabs. A plan or a section is fitted into what the two cards leave clear
+(`Canvas::room`, `FLOATING_CARD`), the Options Bar comes below the tabs (`BimApp::tabs_foot`), and a palette docks along the view only below
+them. The Options Bar (`BimApp::options_bar`) floats over the view's top left, an `Area` above it, while there's something on it (a
 contextual tab's name, a tool's options): coming and going it takes no room, so the view never moves under a drag when a selection
 fills it, and a click on it never reaches the view. File > Settings > Layout picks Floating (the cards) or Compact (`BimApp::compact`, kept in `settings.json` as
-`layout`): the same pieces flush to the edges and square, `style::gap` and `style::card` reading it each frame (`style::follow`, given the `Look` the user kept: Compact and the Light Canvas).
+`layout`): the same pieces flush to the edges and square, the view's tabs and its control bar strips above and below it, `style::gap` and `style::card` reading it each frame (`style::follow`, given the `Look` the user kept: Compact and the Light Canvas).
 Text holds 4.5:1 and a focus ring or an icon 3:1 on what it sits on, in both themes (`style::tests` computes WCAG's ratio for every pair the
 window draws): `accent` is for fills, strokes and the drawing, `accent_ink` for the accent as text, an icon or a focus ring
 (`style::focus_ring`, which on the app bar is the bar's lettering colour), `on_context` for the open contextual tab's lettering. A new pair of
@@ -289,21 +356,22 @@ a description is an action only by its whole name in one of the interface's lang
 is another action's is skipped and counted in the message. Custom shortcuts last while the window is open. Match Properties (MA) is the `match_properties`
 command; with one element selected the window remembers its type for the next one drawn, with several it gives the others of the first's category its type.
 
-Annotation dialogs and draw tools. Manage > Fill Patterns (`fillpatterns.rs`, also Edit Type of a filled region) and Manage > Line Styles
+Annotation dialogs and draw tools. Manage > Annotation Settings lists Line Weights, Line Styles, Line Patterns (Line Styles on its
+Patterns tab) and Fill Patterns. Fill Patterns (`fillpatterns.rs`, also Edit Type of a filled region) and Line Styles
 (`linestyles.rs`) edit a draft of the project's entries and send it as one transaction: what is deleted and made again under its name is changed in
 place, and renames go through `renames::plan`, which runs a chain from its end and a swap through a spare name (the core refuses a rename onto a name
 that is taken). A draft keeps the entries the project held when it opened and is refused over a project that has changed since (an agent's command),
 so Apply never undoes or deletes what the draft never saw. A blank or repeated name is refused in the dialog. What an import or an export says
 (`note`) is said in the dialog, not in the status bar, which can lie over its buttons. A PAT file is read by the `import_fill_patterns` command on a scratch
-project that holds the draft's names, so the command's keep or replace rule and its caps are the dialog's too (Replace Same Name is the command's
+project that holds the draft's names, so the command's keep or replace rule and its caps are the dialog's too (Replace imported by same name is the command's
 `replace`); an export to a name without `.pat` does not write over a file of that name with `.pat`. The preview draws a type as the plan does, in the canvas colours.
 The note belongs to the Patterns tab (the types do not show it), a file's patterns are told in the singular for one, and a left-out pattern is named with its reason (the
 core's message without the pattern's name it begins with), each cut at a word. In a test a file dialog is answered through `dialog::BEGUN`; no system dialog opens.
 
-A dialog that holds a long list (these two, Edit Type, and Line Styles) never runs off the window: the list, and a pattern's families or segments open under it, scroll in
+A dialog that holds a long list (these two, Edit Type, and Line Styles) never runs off the window: the list, and a fill pattern's families open under it, scroll in
 the height the window has left (`style::dialog_room`: the window's height less the dialog's frame, what is drawn above the list, and what is drawn under it, the notes
 and the row of buttons), so OK, Cancel and Apply stay in reach down to the least window, and the note and the error are boxes that scroll (`style::boxed_text`). When a
-pattern's families (or a line pattern's segments) are open they share the room with the list, half each. `tests/smallest.rs` opens each with forty of everything and a long
+fill pattern's families are open they share the room with the list, half each. Line pattern segments scroll in their separate creator. `tests/smallest.rs` opens each with forty of everything and a long
 note at the least window and asks that every button lie inside it. The room is worked out from the heights of the rows, not measured after layout, so a label that wraps
 in a language with long words can take a row or two more than it reserved: the dialog then scrolls a little instead of fitting exactly.
 
@@ -315,7 +383,7 @@ blues were 2.5:1 on white; `style`'s tests keep the two told apart and 3:1 on th
 second time.
 
 The Draw panel's tools leave nothing behind: `set_tool` drops Insulation and Revision Cloud (the Detail Line tool's) and the lines picked for Fillet Arc and
-Trim/Extend (`forget_picks`), a sketch's picks are dropped when its lines change (`track_sketch`, once a frame) and when it ends, and a shape's typed numbers are
+Trim/Extend (`forget_picks`), a sketch's picks are dropped when its lines change (`track_sketch`, once a frame), except an unchanged Multiple Trim boundary, and when it ends, and a shape's typed numbers are
 dropped when the shape changes. A fillet that does not fit keeps its two lines picked and spends the digits; a click that sizes the arc clears them. A number of the
 Options Bar that the shape in hand takes and cannot read (`options_error`) is red and makes nothing. A sketch keeps the lines as they were before each change
 (`Sketch::track`), so Ctrl+Z takes back a fillet, a trim or a grip move whole; it belongs to the plan it began in, and the window comes back to that plan until Finish or
@@ -336,3 +404,51 @@ For a desktop screenshot, call MCP `inspect_model` and pass its `revision` to `c
 The result includes the completed main-window PNG plus its revision, pixel dimensions,
 encoded byte count and SHA-256. A model change before capture completes requires a
 new inspection. Capture leaves undo history untouched.
+
+The Line Styles Patterns tab opens a separate Line Pattern Creator for New Pattern and Edit. Its preview uses the core
+pattern geometry (including font outlines) and can follow a curve. The creator saves into the parent draft, with its own
+Cancel, so OK/Apply remains one undoable Line Styles transaction. See [views and graphics](views-and-graphics.md) for the
+seven segment kinds, paper units, text fitting and centerline semantics.
+
+Annotate > Dimension has Aligned (DI) and Linear, and Angular, Radial, Diameter, Arc Length and Spot Elevation small beside them
+(`BimApp::dimension_panel`). Aligned and Linear are one tool, `Tool::Dimension(mode, refs)`: a click near an endpoint picks it before the line
+it ends (`canvas::dimension_pick`), marked with a square; after two, a click away places the dimension the Options Bar's Place says (Auto,
+Aligned, Horizontal, Vertical; Space steps them), drawn as it would be while the cursor moves. `Tool::Round(kind, picked)` is Radial, Diameter
+and Arc Length; after its arc, Arc Length takes two ends on it to measure between (`dims::arc_point`), or a click places the whole arc's. A new dimension takes the type the Type Selector names, else its kind's (`dimtypes::dimension_type_for`); Edit Type on one opens
+Dimension Type Properties (`dimtypes.rs`), and Properties edits its prefix, suffix, text above and below, Replace With Text and Equality Display.
+A double click on one of its numbers opens Dimension Text for that segment (`DimensionTextDialog`). Selected, an aligned or linear one shows
+a padlock under each segment and, over a string of two or more, EQ past its end (`dimension_constraints`): a click locks or unlocks, or makes
+it equal or not.
+
+## Background grids
+
+Each plan, section and elevation keeps its canvas grid in its `Graphics::background_grid`, saved with the project, copied
+with independent view duplicates, and edited through the undoable `graphics` command. Reflected ceiling plans use their
+plan key's graphics, like their scale and other view settings; dependent plans follow their parent's graphics.
+The Graphics group in a view's instance properties has a Background Grids Edit… button. The grid menu beside Temporary
+Hide/Isolate (the glasses) keeps Show grids, independent Main grid and Subgrid checkboxes, Grid snapping and Grid settings….
+The editor uses a draft: Apply/OK save one undo step, Cancel discards unapplied changes. File > Settings has no grid page;
+application settings files from the earlier global implementation no longer affect views.
+
+View templates can control Background Grids as a group (`Group::BackgroundGrid`, JSON `background_grid`), for plans and
+elevations and sections. New from This View copies the effective grid. View Templates has a Background Grids row whose Edit… opens
+the grid editor on the template's draft (`open_template_background_grid`; its OK hands the grid back, the templates' OK sends it). Followers use the
+template's values and gray out their instance Edit button, bottom menu grid settings and any open editor; removing template
+control restores each view's own grid. The engine rejects bypasses through `graphics` and `modify` too.
+
+`core::background_grid` owns the lattice geometry, shared by painting and snapping. Both lattices start at the fixed view
+origin (0, 0), with one counter-clockwise rotation in degrees. Main spacing X/Y is entered in the project's actual units;
+subgrid divisions X/Y divide that spacing independently. Each grid has its own colour and pen (0–16), with default colours [230,230,230] for main and [245,245,245] for subgrid,
+following the project's line weights and the Thin Lines display toggle. Main lines take precedence over coincident subgrid lines.
+Dense subgrids disappear below four screen pixels; main grids thin by whole multiples without moving the origin. Drawing
+is bounded to 4096 lines. Section/elevation textures expose empty paper behind the model while retaining opaque model faces.
+Grids are canvas aids; they do not create elements or appear in sheet/export drawings.
+
+Grid snapping is a global application preference (`BimApp::grid_snapping`, saved as `Settings::grid_snapping`), available
+in Manage > Snaps and the bottom grid menu. It is not part of view graphics or view templates: the checkbox stays editable
+when a template controls the active view's grid, and changing it creates no project undo step. New/Open retain the setting.
+It uses intersections of the active view's enabled subgrid, or main grid when the subgrid is disabled; with neither enabled,
+there is nothing to snap to. Show grids only controls display: snapping can remain on while the grid is hidden. Object snaps, one-point snap overrides and Shift
+constraints keep priority; grid snapping replaces the free-point fallback and automatic angle guides. Sections and
+elevations snap annotation placement in their local horizontal/height coordinates. Model validation rejects invalid
+spacing, divisions, pens or rotation, and commands roll back the whole edit.

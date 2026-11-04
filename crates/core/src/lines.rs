@@ -1,6 +1,6 @@
 //! Line patterns, line styles and detail lines, as Revit's Manage > Additional Settings and Annotate > Detail Line.
 //!
-//! A [`LinePattern`] is dashes, dots and spaces in millimetres of paper, so it reads the same at any scale; a [`LineStyle`]
+//! A [`LinePattern`] is a sequence of graphic segments in millimetres of paper, so it reads the same at any scale; a [`LineStyle`]
 //! is a pen, a colour and a pattern (or none, solid); a [`DetailLine`] is a line drawn in one view, in a style. Both are
 //! entries of the project's library: a style names its pattern, a line its style, and a file holds their GUIDs.
 
@@ -15,16 +15,40 @@ use crate::ids::Guid;
 use crate::language::Language;
 use crate::pen::{MAX_PEN, Pen};
 
-/// A piece of a line pattern: a dash or a space, so many mm long on paper, or a dot.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// A piece of a line pattern. Lengths, spacing, amplitude and text size are millimetres on paper.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Segment {
     Dash(f64),
     Space(f64),
     Dot,
+    /// A dot centered in a segment of this length; its diameter is the pen width.
+    #[serde(rename = "dot_length")]
+    DotLength(f64),
+    Offset {
+        length: f64,
+        count: u8,
+        distance: f64,
+    },
+    /// Frequency is the number of cycles over this segment's full length.
+    Wave {
+        length: f64,
+        frequency: f64,
+        amplitude: f64,
+    },
+    Zigzag {
+        length: f64,
+        frequency: f64,
+        amplitude: f64,
+    },
+    Text {
+        length: f64,
+        size: f64,
+        text: String,
+    },
 }
 
-/// A line pattern: its segments in order, a dash or a dot then a space, again and again.
+/// A repeating, freely ordered sequence of graphic segments along an unchanged centerline.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LinePattern(pub Vec<Segment>);
@@ -44,48 +68,79 @@ const DOT: f64 = 0.01;
 const SMALLEST_REPEAT: f32 = 2.0;
 
 impl LinePattern {
-    /// An error saying what to fix, unless it is a dash or a dot then a space, each pair once or more, every length a
-    /// length.
+    /// Validate lengths and the bounded parameters of each segment in one place.
     pub fn check(&self, name: &str) -> Result<(), String> {
         let who = format!("line pattern `{name}`");
-        let n = self.0.len();
-        if !(2..=MAX_SEGMENTS).contains(&n) || !n.is_multiple_of(2) {
-            return Err(format!("{who}: a pattern is pairs of a dash or a dot then a space, 2 to {MAX_SEGMENTS} segments, not {n}"));
+        if !(1..=MAX_SEGMENTS).contains(&self.0.len()) {
+            return Err(format!("{who}: a pattern needs 1 to {MAX_SEGMENTS} segments"));
         }
         for (i, s) in self.0.iter().enumerate() {
-            let mark = i % 2 == 0;
-            let len = match (s, mark) {
-                (Segment::Dash(l), true) | (Segment::Space(l), false) => Some(*l),
-                (Segment::Dot, true) => None,
-                _ => {
-                    let want = if mark { "a dash or a dot" } else { "a space" };
-                    return Err(format!("{who}: segment {} is to be {want}: a dash or a dot then a space, again and again", i + 1));
+            let valid = |v: f64| v.is_finite() && (MIN_SEGMENT..=MAX_SEGMENT).contains(&v);
+            if !matches!(s, Segment::Dot) && !valid(s.length()) {
+                return Err(format!(
+                    "{who}: segment {} is {} mm; a segment is {MIN_SEGMENT} to {MAX_SEGMENT} mm on paper",
+                    i + 1,
+                    s.length()
+                ));
+            }
+            let bad = match s {
+                Segment::Offset { count, distance, .. } => !(2..=9).contains(count) || !valid(*distance),
+                Segment::Wave { frequency, amplitude, .. } | Segment::Zigzag { frequency, amplitude, .. } => {
+                    !(frequency.is_finite() && (0.1..=100.0).contains(frequency) && valid(*amplitude))
                 }
+                Segment::Text { size, text, .. } => {
+                    !valid(*size) || text.trim().is_empty() || text.chars().count() > 256 || text.chars().any(char::is_control)
+                }
+                _ => false,
             };
-            if let Some(l) = len
-                && !(l.is_finite() && (MIN_SEGMENT..=MAX_SEGMENT).contains(&l))
-            {
-                return Err(format!("{who}: segment {} is {l} mm; a segment is {MIN_SEGMENT} to {MAX_SEGMENT} mm on paper", i + 1));
+            if bad {
+                return Err(format!(
+                    "{who}: segment {}: offsets need 2–9 lines and positive spacing; waves need 0.1–100 cycles and positive amplitude; text needs 1–256 characters on one line and a size of {MIN_SEGMENT}–{MAX_SEGMENT} mm",
+                    i + 1
+                ));
             }
         }
         Ok(())
     }
 
+    /// Whether the native dash renderer can draw this unchanged (including legacy dots).
+    pub fn is_dash(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len().is_multiple_of(2)
+            && self.0.iter().enumerate().all(|(i, s)| matches!((i % 2, s), (0, Segment::Dash(_) | Segment::Dot) | (1, Segment::Space(_))))
+    }
+
     /// Its on and off lengths, px, where a mm of paper is `px_per_mm` pixels: none when its repeat is too small to see, so
     /// it draws solid.
     pub fn dash(&self, px_per_mm: f32) -> Option<Vec<f32>> {
+        if !self.is_dash() {
+            return None;
+        }
         let px: Vec<f32> = self
             .0
             .iter()
             .map(|s| match s {
                 Segment::Dash(l) | Segment::Space(l) => *l as f32 * px_per_mm,
-                Segment::Dot => DOT as f32 * px_per_mm,
+                _ => DOT as f32 * px_per_mm,
             })
             .collect();
         let repeat: f32 = px.iter().sum();
         (repeat.is_finite() && repeat >= SMALLEST_REPEAT).then_some(px)
     }
 }
+
+impl Segment {
+    /// The centerline distance reserved for this segment, mm on paper.
+    pub fn length(&self) -> f64 {
+        match self {
+            Self::Dash(l) | Self::Space(l) | Self::DotLength(l) => *l,
+            Self::Dot => DOT,
+            Self::Offset { length, .. } | Self::Wave { length, .. } | Self::Zigzag { length, .. } | Self::Text { length, .. } => *length,
+        }
+    }
+}
+
+mod pattern;
 
 /// A line style: the pen it draws in, its colour, and its pattern by name (none, solid).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -474,8 +529,6 @@ mod tests {
         let before = s.model.clone();
         for (cmd, p, says) in [
             ("line_pattern", json!({"name": "Solid", "segments": [{"dash": 1}, {"space": 1}]}), "Solid"),
-            ("line_pattern", json!({"name": "X", "segments": [{"dash": 1}]}), "pairs"),
-            ("line_pattern", json!({"name": "X", "segments": [{"space": 1}, {"dash": 1}]}), "segment 1 is to be a dash or a dot"),
             ("line_pattern", json!({"name": "X", "segments": [{"dash": 0}, {"space": 1}]}), "0.05 to 100"),
             ("line_pattern", json!({"name": "X", "segments": [{"dash": 1e300}, {"space": 1}]}), "0.05 to 100"),
             ("line_pattern", json!({"name": "X", "segments": [{"dash": 1}, {"gap": 1}]}), "segments"),
@@ -621,3 +674,6 @@ mod tests {
         assert_eq!(p.dash(f32::INFINITY), None);
     }
 }
+
+#[cfg(test)]
+mod pattern_tests;

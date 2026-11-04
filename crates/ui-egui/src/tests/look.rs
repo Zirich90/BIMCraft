@@ -52,6 +52,36 @@ fn a_click_on_a_card_or_between_cards_is_no_click_on_the_view() {
 }
 
 #[test]
+fn the_views_tabs_and_its_control_bar_float_over_it_and_a_click_on_them_is_no_click_on_the_view() {
+    let mut h = app(BOX);
+    let view = h.state().view_rect;
+    let tab = h.state().tab_rects.first().map(|(_, r)| *r).unwrap();
+    let bar = h.get_by_label("Temporary Hide/Isolate").rect().union(h.get_by_label("Reveal Hidden Elements").rect());
+    // The view runs under both: no band of its own above or below it.
+    assert!(view.contains_rect(tab) && view.contains_rect(bar), "{tab:?} and {bar:?} in {view:?}");
+    assert!(view.bottom() - bar.bottom() < 20.0 && tab.top() - view.top() < 20.0);
+    // Clicks on them are theirs: the wall tool starts no wall from the tab or the bar.
+    tool(&mut h, "Wall");
+    for at in [tab.center(), bar.center()] {
+        click_at(&mut h, at);
+        click_at(&mut h, at + vec2(0.0, 2.0));
+    }
+    assert_eq!(ids(&h, "wall").len(), 4);
+    key(&mut h, Key::Escape);
+    key(&mut h, Key::Escape);
+    // A fitted plan keeps clear of them: the house is between the tabs and the bar.
+    let (south, north) = (h.state().screen(P2(4000.0, 0.0)), h.state().screen(P2(4000.0, 6000.0)));
+    assert!(north.y > tab.bottom() && south.y < bar.top(), "{north:?} {south:?}");
+    // Compact, they are bars round the view again.
+    press(&mut h, "Settings");
+    pick(&mut h, Role::RadioButton, "Compact");
+    press(&mut h, "Close");
+    let view = h.state().view_rect;
+    let tab = h.state().tab_rects.first().map(|(_, r)| *r).unwrap();
+    assert!(tab.bottom() <= view.top() && h.get_by_label("Reveal Hidden Elements").rect().top() >= view.bottom());
+}
+
+#[test]
 fn the_options_bar_floats_over_the_view_while_it_has_something_on_it_and_the_view_never_moves() {
     let mut h = app(BOX);
     let view = h.state().view_rect;

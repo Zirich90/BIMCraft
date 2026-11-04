@@ -22,8 +22,8 @@ use crate::library::Kind;
 use crate::model::{
     Ceiling, CeilingType, Column, ColumnType, Component, Element, Extrusion, FIRST_ID, Floor, FloorType, Function, Grid, Guid, Id, Justify,
     Landing, Layer, Level, MAX_COORD, MAX_LAYERS, MAX_POINTS, MAX_PROJECT_PARAMETERS, MAX_TEXT, Mass, Model, Opening, OpeningType,
-    PARAMETER_CATEGORIES, ParameterKind, ProjectParameter, Railing, RailingType, Ramp, Roof, RoofType, Room, RoomSeparator, Run, RunType,
-    Shaft, Side, Stair, TOL, Wall, WallType, culprit, heading,
+    PARAMETER_CATEGORIES, ParameterKind, ProjectParameter, Railing, RailingType, Ramp, Rebar, Roof, RoofType, Room, RoomSeparator, Run,
+    RunType, Shaft, Side, Stair, TOL, Wall, WallType, culprit, heading,
 };
 use crate::phasing;
 use crate::stairs;
@@ -106,6 +106,16 @@ fn indices(v: Option<&V>) -> Vec<usize> {
 /// `text` cut to what a name may hold.
 fn clip(text: &str) -> String {
     text.trim().chars().take(MAX_TEXT).collect()
+}
+
+/// The categories whose products a structural program names with marks (V1, P1, L1). Not a stair: BIMCraft names its own
+/// "Stair", with no type behind the name to tell it by.
+const MARKED: [&str; 6] = ["beam", "column", "structuralcolumn", "footing", "stripfooting", "floor"];
+
+/// A property's name as a project parameter's: what a formula can say, each character it can't made a space.
+fn parameter_name(raw: &str) -> Option<String> {
+    let spaced: String = raw.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { ' ' }).collect();
+    Some(spaced.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|n| crate::family::nameable(n))
 }
 
 /// A number as a name shows it: to the hundredth, without trailing zeros.
@@ -300,33 +310,39 @@ struct Found {
     round: bool,
 }
 
-/// The run `pts` make: its centre line along the direction they spread furthest in (the covariance's dominant axis, by
-/// power iteration), its section the box round them across it, square to it, with `width` level and `depth` square to that;
-/// round where the section's corners are many and all as far out. An axis that stands has its width along east. None for too
-/// few points.
-fn run_in(pts: &[P3]) -> Option<Found> {
+/// The run `pts` make: its centre line along `axis`, if the body says which way it runs, else the direction they spread
+/// furthest in (the covariance's dominant axis, by power iteration), its section the box round them across it, square to it,
+/// with `width` level and `depth` square to that; round where the section's corners are many and all as far out. An axis that
+/// stands has its width along east. None for too few points.
+fn run_in(pts: &[P3], axis: Option<P3>) -> Option<Found> {
     use crate::view3d::{add, cross, dot, mul, sub, unit};
     if pts.len() < 4 {
         return None;
     }
     let c = mul(pts.iter().fold([0.0; 3], |a, p| add(a, *p)), 1.0 / pts.len() as f64);
-    let mut cov = [[0.0; 3]; 3];
-    for p in pts {
-        let q = sub(*p, c);
-        for (i, row) in cov.iter_mut().enumerate() {
-            for (j, x) in row.iter_mut().enumerate() {
-                *x += q[i] * q[j];
+    let mut d = match axis {
+        Some(a) => a,
+        None => {
+            let mut cov = [[0.0; 3]; 3];
+            for p in pts {
+                let q = sub(*p, c);
+                for (i, row) in cov.iter_mut().enumerate() {
+                    for (j, x) in row.iter_mut().enumerate() {
+                        *x += q[i] * q[j];
+                    }
+                }
             }
+            let mut d = unit([1.0, 0.7, 0.3]);
+            for _ in 0..64 {
+                let next = [0, 1, 2].map(|i| (0..3).map(|j| cov[i][j] * d[j]).sum::<f64>());
+                if dot(next, next) < 1e-18 {
+                    return None;
+                }
+                d = unit(next);
+            }
+            d
         }
-    }
-    let mut d = unit([1.0, 0.7, 0.3]);
-    for _ in 0..64 {
-        let next = [0, 1, 2].map(|i| (0..3).map(|j| cov[i][j] * d[j]).sum::<f64>());
-        if dot(next, next) < 1e-18 {
-            return None;
-        }
-        d = unit(next);
-    }
+    };
     // Toward the east, else the north, so a run reads the same whichever end the file starts at; an upright one points up, as the
     // iteration's first direction (z positive) leaves it.
     let upright = d[0].hypot(d[1]) < 1e-6;
@@ -644,6 +660,11 @@ impl<'a> Reader<'a> {
             // as if solid.
             "IFCSWEPTDISKSOLID" => {
                 let (Some(line), Some(r)) = (self.curve(reference(a(0)), depth + 1), self.len(a(1))) else { return };
+                // A tube is 26 faces a segment, so a curve of millions of points would fill the memory: past MAX_POINTS segments'
+                // worth of faces in the item, the disk is left out.
+                if out.len() + 26 * line.len().saturating_sub(1) > 26 * MAX_POINTS {
+                    return;
+                }
                 for w in line.windows(2) {
                     let &[p, q] = w else { continue };
                     let along = sub(q, p);
@@ -783,6 +804,43 @@ impl<'a> Reader<'a> {
     }
 
     /// A product's Axis representation, in model coordinates.
+    /// The disk a product's body sweeps along a line: the line's points in the world and the disk's radius, mm. A body of
+    /// several disks of one radius, each starting where the last ended, is one line bent between them, as BIMCraft writes a
+    /// bar; any other is no one line.
+    fn sweep(&self, product: &Entity) -> Option<(Vec<P3>, f64)> {
+        let (_, items) = self.reps(product).into_iter().find(|(i, _)| i.eq_ignore_ascii_case("Body"))?;
+        let f = self.frame(product);
+        let (mut path, mut radius): (Vec<P3>, Option<f64>) = (Vec::new(), None);
+        for disk in items.iter().filter_map(|i| self.get(*i)).filter(|d| d.name == "IFCSWEPTDISKSOLID") {
+            let r = self.len(disk.args.get(1))?;
+            if radius.is_some_and(|q| (q - r).abs() > 1e-6) {
+                return None;
+            }
+            radius = Some(r);
+            let mut line = self.curve(reference(disk.args.first()), 0)?.into_iter().map(|p| f.at(p));
+            match (path.last(), line.next()) {
+                (None, Some(p)) => path.push(p),
+                (Some(last), Some(p)) if dot(sub(*last, p), sub(*last, p)) < 1e-6 => {}
+                _ => return None,
+            }
+            path.extend(line);
+            if path.len() > MAX_POINTS {
+                return None;
+            }
+        }
+        Some((path, radius?))
+    }
+
+    /// The direction a product's body is extruded along, in the world, when the body is one extruded area solid.
+    fn extrusion(&self, product: &Entity) -> Option<P3> {
+        let items: Vec<u64> =
+            self.reps(product).into_iter().filter(|(i, _)| i.eq_ignore_ascii_case("Body")).flat_map(|(_, it)| it).collect();
+        let [item] = items.as_slice() else { return None };
+        let solid = self.get(*item).filter(|s| matches!(s.name.as_str(), "IFCEXTRUDEDAREASOLID" | "IFCEXTRUDEDAREASOLIDTAPERED"))?;
+        let along = self.direction(reference(solid.args.get(2))).unwrap_or([0.0, 0.0, 1.0]);
+        Some(self.frame(product).dir(self.axes(reference(solid.args.get(1))).dir(along)))
+    }
+
     fn axis(&self, product: &Entity) -> Option<Vec<P3>> {
         let (_, items) = self.reps(product).into_iter().find(|(i, _)| i.eq_ignore_ascii_case("Axis"))?;
         let f = self.frame(product);
@@ -1046,8 +1104,8 @@ fn layers_of(r: &Reader, l: &Links, id: u64, t: f64) -> Vec<Layer> {
     layers
 }
 
-/// The colours a file shades its materials in, by their names: each material's surface style's.
-fn material_colours(r: &Reader, ids: &[u64]) -> HashMap<String, [u8; 3]> {
+/// The colours a file shades its materials in, by their names, and how see-through (percent): each material's surface style's.
+fn material_colours(r: &Reader, ids: &[u64]) -> HashMap<String, ([u8; 3], u8)> {
     let mut out = HashMap::new();
     // Surface styles by their own names, which name materials as BIMCraft and Revit write them;
     // then the materials' styles, over them.
@@ -1068,9 +1126,10 @@ fn material_colours(r: &Reader, ids: &[u64]) -> HashMap<String, [u8; 3]> {
     out
 }
 
-/// The colour `styles` shade with: in IFC2x3 through style assignments; a surface style's, its
+/// The colour `styles` shade with, and how see-through they make it, percent (a shading's or rendering's second argument, 1 for
+/// clear): in IFC2x3 through style assignments; a surface style's, its
 /// shading's or its rendering's.
-fn colour(r: &Reader, mut styles: Vec<u64>) -> Option<[u8; 3]> {
+fn colour(r: &Reader, mut styles: Vec<u64>) -> Option<([u8; 3], u8)> {
     let mut seen = HashSet::new();
     while let Some(id) = styles.pop() {
         let Some(x) = r.get(id).filter(|_| seen.insert(id)) else { continue };
@@ -1081,7 +1140,8 @@ fn colour(r: &Reader, mut styles: Vec<u64>) -> Option<[u8; 3]> {
                 if let Some(c) = r.at(x.args.first()).filter(|c| c.name == "IFCCOLOURRGB") {
                     let byte = |i: usize| real(c.args.get(i)).map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
                     if let (Some(red), Some(green), Some(blue)) = (byte(1), byte(2), byte(3)) {
-                        return Some([red, green, blue]);
+                        let clear = real(x.args.get(1)).filter(|v| v.is_finite()).map_or(0, |v| (v.clamp(0.0, 1.0) * 100.0).round() as u8);
+                        return Some(([red, green, blue], clear));
                     }
                 }
             }
@@ -1515,6 +1575,7 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
             location: Default::default(),
             attach_top: None,
             attach_base: None,
+            room_bounding: true,
         };
         let id = m.insert(Element::Wall(wall));
         from.insert(id, who(w.ifc));
@@ -1567,16 +1628,10 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         if in_whole(id, &["IFCROOF", "IFCSTAIR", "IFCRAMP"]) {
             continue;
         }
-        match enumeration(s.args.get(8)) {
-            Some("ROOF") => {
-                roofs.push(id);
-                continue;
-            }
-            Some("LANDING") => {
-                leave(&mut skipped, &mut seen, id, "landings aren't supported");
-                continue;
-            }
-            _ => {}
+        // A landing of a stair is the stair's, above; one on its own is a slab like any, read as a floor.
+        if enumeration(s.args.get(8)) == Some("ROOF") {
+            roofs.push(id);
+            continue;
         }
         let faces = r.body(s);
         let Some((z0, z1)) = span(faces.iter().flatten().map(|p| p[2])) else {
@@ -1909,6 +1964,7 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         let (top_level, height) = if footing { (None, z1 - z0) } else { topped(level, z0, z1) };
         let angle = if round { 0.0 } else { (u.1.atan2(u.0).to_degrees() * 1e6).round() / 1e6 };
         let column = Column {
+            room_bounding: true,
             params: Default::default(),
             type_name,
             level,
@@ -1934,7 +1990,10 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         let declared = run_props.get(&id).and_then(|(_, c)| c.as_deref());
         let Some(category) = crate::runs::from_ifc(&b.name, enumeration(b.args.get(8)), declared) else { continue };
         let pts: Vec<P3> = r.body(b).into_iter().flatten().collect();
-        let Some(found) = run_in(&pts) else {
+        // A body extruded along anything but up runs along it, however short that is for its section (a beam between two columns
+        // may be shallower than it is deep); one extruded up is read by its shape, as a strip footing's outline stood up is.
+        let along = r.extrusion(b).filter(|d| d[0].hypot(d[1]) > 1e-6);
+        let Some(found) = run_in(&pts, along) else {
             leave(&mut skipped, &mut seen, id, "it has no body BIMCraft can read, or it stands (a column) or lies flat");
             continue;
         };
@@ -2348,7 +2407,9 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         elements_from.entry(id).or_default().push(rid);
     }
 
-    // Room separation lines: virtual elements BIMCraft wrote, a line per segment of their axis.
+    // Room separation lines: virtual elements BIMCraft wrote, a line per segment of their axis, MAX_POINTS of them at most
+    // between all, since an axis of millions of points would be millions of elements.
+    let mut separations = 0;
     for id in named(&["IFCVIRTUALELEMENT"]) {
         let Some(x) = e(id).filter(|x| text(x.args.get(4)) == Some(crate::ifc::SEPARATION)) else { continue };
         seen.insert(id);
@@ -2356,6 +2417,16 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
             leave(&mut skipped, &mut seen, id, "its room separation line has no axis");
             continue;
         };
+        if separations + axis.len() - 1 > MAX_POINTS {
+            leave(
+                &mut skipped,
+                &mut seen,
+                id,
+                &format!("its room separation line would pass the {MAX_POINTS} segments the lines of a project may have"),
+            );
+            continue;
+        }
+        separations += axis.len() - 1;
         let level = level_for(id, axis.first().map_or(0.0, |p| p[2]));
         for w in axis.windows(2) {
             let (start, end) = (micron(r.flat(w[0])), micron(r.flat(w[1])));
@@ -2369,8 +2440,64 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         }
     }
 
+    // Reinforcing bars: a disk swept along a line, each a part of the beam, column, footing or floor it reinforces, in its level.
+    for id in named(&["IFCREINFORCINGBAR"]) {
+        let Some(x) = e(id) else { continue };
+        seen.insert(id);
+        let (thin, thick) = crate::rebar::DIAMETERS;
+        let milli = |v: f64| (v * 1e3).round() / 1e3 + 0.0;
+        let Some((world, radius)) = r.sweep(x) else {
+            leave(&mut skipped, &mut seen, id, "its body is no disk swept along a line");
+            continue;
+        };
+        let diameter = milli(radius * 2.0);
+        let sound = (2..=MAX_POINTS).contains(&world.len())
+            && (thin..=thick).contains(&diameter)
+            && world.iter().flatten().all(|c| c.is_finite() && c.abs() <= MAX_COORD)
+            && crate::rebar::length(&world) > TOL;
+        if !sound {
+            leave(&mut skipped, &mut seen, id, &format!("its bar is not 2 to {MAX_POINTS} points of {thin} to {thick} mm"));
+            continue;
+        }
+        let level = level_for(id, world[0][2]);
+        let base = elevation(level);
+        let path: Vec<P3> = world.iter().map(|p| [milli(p[0]), milli(p[1]), milli(p[2] - base)]).collect();
+        let host = l.whole.get(&id).and_then(|h| origin.get(h)).filter(|h| {
+            matches!(
+                m.elements.get(**h),
+                Some(
+                    Element::Beam(_)
+                        | Element::StripFooting(_)
+                        | Element::Column(_)
+                        | Element::StructuralColumn(_)
+                        | Element::Footing(_)
+                        | Element::Floor(_)
+                )
+            )
+        });
+        let grade = text(x.args.get(8)).map(str::trim).filter(|g| !g.is_empty()).map_or_else(|| crate::rebar::GRADE.to_string(), clip);
+        let rid =
+            m.insert(Element::Rebar(Rebar { level, host: host.map(|h| Guid::of_id(*h)), path, diameter, grade, layer: String::new() }));
+        from.insert(rid, who(id));
+        origin.entry(id).or_insert(rid);
+        elements_from.entry(id).or_default().push(rid);
+    }
+
+    // Doors' and windows' marks: their tags, unless a tag is only the element's id (Revit names a
+    // door `Family:Type:123456` and tags it `123456`) or another door or window took it first.
+    // The rest are numbered on in the series the tags are numbered in.
+    let mut marks: [BTreeSet<String>; 2] = Default::default();
+    let mut tags: HashMap<u64, String> = HashMap::new();
+    for id in named(OPENINGS) {
+        let Some(o) = e(id) else { continue };
+        let Some(tag) = text(o.args.get(7)) else { continue };
+        let id_only = text(o.args.get(2)).and_then(|n| n.rsplit_once(':')).is_some_and(|(_, last)| last.trim() == tag);
+        if !id_only && marks[usize::from(o.name.starts_with("IFCDOOR"))].insert(tag.to_string()) {
+            tags.insert(id, tag.to_string());
+        }
+    }
+
     // Doors and windows: where their openings cut their walls.
-    let (mut doors, mut windows) = (0u32, 0u32);
     for id in named(OPENINGS) {
         let Some(o) = e(id) else { continue };
         let is_door = o.name.starts_with("IFCDOOR");
@@ -2397,13 +2524,31 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         let sill = size((z0 - base).max(0.0));
         let fallback = format!("Imported {} x {}", num(width), num(height));
         let base_name = label(id).unwrap_or(fallback);
-        let same = |k: &OpeningType| (k.width - width).abs() < 0.05 && (k.height - height).abs() < 0.05;
-        let new = OpeningType { width, height, sill: if is_door { 0.0 } else { sill } };
+        // How a door opens: its own operation type (IFC4), else its type's (IfcDoorType, IFC4) or its style's
+        // (IfcDoorStyle, IFC2x3); which side its leaf is on comes along.
+        let typed = l.typed.get(&id).and_then(|t| e(*t));
+        let operated = enumeration(o.args.get(11))
+            .filter(|_| is_door)
+            .or_else(|| {
+                typed.filter(|_| is_door).and_then(|t| match t.name.as_str() {
+                    "IFCDOORTYPE" => enumeration(t.args.get(10)),
+                    "IFCDOORSTYLE" => enumeration(t.args.get(8)),
+                    _ => None,
+                })
+            })
+            .and_then(crate::model::Operation::from_ifc_door);
+        let operation = operated.map(|(op, _)| op);
+        let same = |k: &OpeningType| (k.width - width).abs() < 0.05 && (k.height - height).abs() < 0.05 && k.operation == operation;
+        let new = OpeningType { width, height, sill: if is_door { 0.0 } else { sill }, operation };
         let types = if is_door { &mut m.types.door } else { &mut m.types.window };
         let type_name = kind(types, &base_name, same, new);
-        let count = if is_door { &mut doors } else { &mut windows };
-        *count += 1;
-        let flip_hand = enumeration(o.args.get(11)).is_some_and(|op| op.contains("RIGHT"));
+        let mark = tags.remove(&id).unwrap_or_else(|| {
+            let taken = &mut marks[usize::from(is_door)];
+            let next = next_number(taken.iter().map(String::as_str));
+            taken.insert(next.clone());
+            next
+        });
+        let flip_hand = operated.map_or_else(|| enumeration(o.args.get(11)).is_some_and(|op| op.contains("RIGHT")), |(_, right)| right);
         let op = Opening {
             params: Default::default(),
             family: None,
@@ -2411,7 +2556,7 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
             host: Guid::of_id(host),
             offset: micron(P2((s0 + s1) / 2.0, 0.0)).0,
             sill,
-            mark: count.to_string(),
+            mark,
             flip_facing: false,
             flip_hand,
         };
@@ -2455,13 +2600,7 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
             }
         };
         let level = level_for(id, floor.unwrap_or(0.0));
-        let rid = m.insert(Element::Room(Room {
-            params: Default::default(),
-            level,
-            point: micron(point),
-            name: clip(&room_name),
-            number: clip(&number),
-        }));
+        let rid = m.insert(Element::Room(Room::new(level, micron(point), clip(&room_name), clip(&number))));
         from.insert(rid, who(id));
         origin.entry(id).or_insert(rid);
         elements_from.entry(id).or_default().push(rid);
@@ -2489,17 +2628,73 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
         }
     }
 
-    // The project's parameters, from the property sets BIMCraft writes them in: each one's kind
-    // from its first value's, for the categories of the elements holding one; up to as many as a
-    // project holds, and as many values as `MAX_VALUES`.
+    // The project's parameters: a mark for what a structural program has named (its name, where that is no one's type), and
+    // a parameter for each single value in the property sets, the project's own as BIMCraft writes them and any other
+    // program's, named for the property (less what a formula can't say, as the brackets of "Cargas (G2)"). Each one's kind from
+    // its first value's, for the categories of the elements holding one; up to as many as a project holds, and as many values
+    // as `MAX_VALUES`.
     let (mut over, mut values) = (BTreeSet::new(), 0);
+    // Puts `value` as `name` on the elements the products `on` made; false once a project can hold no more values.
+    let mut put = |m: &mut Model, skipped: &mut Vec<String>, on: &[u64], name: &str, kind: ParameterKind, value: &serde_json::Value| {
+        for id in on.iter().filter_map(|x| elements_from.get(x)).flatten() {
+            let Some(el) = m.elements.get(id) else { continue };
+            let cat = el.category();
+            let theirs = |f: &str| m.families.get(f).is_some_and(|f| f.parameters.iter().any(|p| p.name == name));
+            let fits = PARAMETER_CATEGORIES.contains(&cat)
+                && !crate::schedule::own_field(cat, name)
+                && !matches!(el, Element::Component(c) if theirs(&c.family))
+                && m.parameters.get(name).is_none_or(|p| p.kind == kind);
+            let p = ProjectParameter { kind, categories: vec![cat.to_string()] };
+            if !fits || !p.holds(value) {
+                continue;
+            }
+            if !m.parameters.contains_key(name) && m.parameters.len() >= MAX_PROJECT_PARAMETERS {
+                over.insert(name.to_string());
+                continue;
+            }
+            if values >= MAX_VALUES {
+                skipped.push(format!("project parameter values past the {MAX_VALUES} BIMCraft reads"));
+                return false;
+            }
+            values += 1;
+            let p = m.parameters.entry(name.to_string()).or_insert(p);
+            if !p.categories.iter().any(|c| c == cat) {
+                p.categories.push(cat.to_string());
+                p.categories.sort();
+            }
+            if let Some(params) = m.elements.get_mut(id).and_then(Element::params_mut) {
+                params.insert(name.to_string(), value.clone());
+            }
+        }
+        true
+    };
+    // Eberick names a beam V1 and a column P1, and BIMCraft names a product by its type (and says so as its object type too).
+    for &pid in &ids {
+        let Some(x) = e(pid) else { continue };
+        let mark = text(x.args.get(2)).map(clip).filter(|n| {
+            !n.is_empty() && text(x.args.get(4)).map(str::trim) != Some(n.as_str()) && l.type_name.get(&pid).is_none_or(|t| t != n)
+        });
+        let marked =
+            elements_from.get(&pid).into_iter().flatten().any(|id| m.elements.get(id).is_some_and(|el| MARKED.contains(&el.category())));
+        if let (Some(mark), true) = (mark, marked)
+            && !put(&mut m, &mut skipped, &[pid], "Mark", ParameterKind::Text, &json!(mark))
+        {
+            break;
+        }
+    }
     'sets: for rel in named(&["IFCRELDEFINESBYPROPERTIES"]).into_iter().filter_map(e) {
         let Some(set) = reference(rel.args.get(5)).and_then(e).filter(|x| x.name == "IFCPROPERTYSET") else { continue };
-        if text(set.args.get(2)) != Some(crate::ifc::PARAMETERS) {
+        // What BIMCraft writes in sets of its own, other than the parameters, it reads into fields.
+        let called = text(set.args.get(2)).unwrap_or("");
+        let ours = called == crate::ifc::PARAMETERS;
+        if !ours && (called.starts_with("BIMCraft_") || called == crate::ifc::SEPARATION) {
             continue;
         }
         for prop in refs(set.args.get(4)).into_iter().filter_map(e).filter(|x| x.name == "IFCPROPERTYSINGLEVALUE") {
-            let Some(name) = text(prop.args.first()).filter(|n| crate::family::nameable(n)) else { continue };
+            let Some(raw) = text(prop.args.first()) else { continue };
+            // `LoadBearing` is what makes a column or a floor structural, read above.
+            let name = if ours { Some(raw.to_string()).filter(|n| crate::family::nameable(n)) } else { parameter_name(raw) };
+            let Some(name) = name.filter(|n| ours || n != "LoadBearing") else { continue };
             let (kind, value) = match prop.args.get(2) {
                 Some(V::Typed(t, v)) => match (t.as_str(), &**v) {
                     ("IFCTEXT" | "IFCLABEL" | "IFCIDENTIFIER", V::Str(s)) => (ParameterKind::Text, json!(clip(s))),
@@ -2516,35 +2711,8 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
                 },
                 _ => continue,
             };
-            for id in refs(rel.args.get(4)).iter().filter_map(|x| elements_from.get(x)).flatten() {
-                let Some(el) = m.elements.get(id) else { continue };
-                let cat = el.category();
-                let theirs = |f: &str| m.families.get(f).is_some_and(|f| f.parameters.iter().any(|p| p.name == name));
-                let fits = PARAMETER_CATEGORIES.contains(&cat)
-                    && !crate::schedule::own_field(cat, name)
-                    && !matches!(el, Element::Component(c) if theirs(&c.family))
-                    && m.parameters.get(name).is_none_or(|p| p.kind == kind);
-                let p = ProjectParameter { kind, categories: vec![cat.to_string()] };
-                if !fits || !p.holds(&value) {
-                    continue;
-                }
-                if !m.parameters.contains_key(name) && m.parameters.len() >= MAX_PROJECT_PARAMETERS {
-                    over.insert(name.to_string());
-                    continue;
-                }
-                if values >= MAX_VALUES {
-                    skipped.push(format!("project parameter values past the {MAX_VALUES} BIMCraft reads"));
-                    break 'sets;
-                }
-                values += 1;
-                let p = m.parameters.entry(name.to_string()).or_insert(p);
-                if !p.categories.iter().any(|c| c == cat) {
-                    p.categories.push(cat.to_string());
-                    p.categories.sort();
-                }
-                if let Some(params) = m.elements.get_mut(id).and_then(Element::params_mut) {
-                    params.insert(name.to_string(), value.clone());
-                }
+            if !put(&mut m, &mut skipped, &refs(rel.args.get(4)), &name, kind, &value) {
+                break 'sets;
             }
         }
     }
@@ -2634,9 +2802,10 @@ pub fn ifc(bytes: &[u8], name: &str) -> Result<Imported, String> {
 
     // The materials the layers are made of, in the library, shaded as the file shades them.
     m.adopt_materials();
-    for (name, colour) in material_colours(&r, &ids) {
+    for (name, (colour, clear)) in material_colours(&r, &ids) {
         if let Some(x) = m.materials.get_mut(&name) {
             x.color = colour;
+            x.transparency = clear;
         }
     }
     // Each element's GUID is the GlobalId of what it was made of, where that's one; what points at an element points at it.
@@ -3106,6 +3275,98 @@ ENDSEC;END-ISO-10303-21;";
         assert!(t.round && (t.width - 7.4).abs() < 0.05, "{} x {}", t.width, t.depth);
     }
 
+    #[test]
+    fn a_swept_disk_along_a_curve_of_too_many_segments_is_left_out_not_built() {
+        // The cable above with a centre line of `n` points, a millimetre apart: each segment is 26 faces.
+        let cable = |n: usize| {
+            let points: Vec<String> = (0..n).map(|i| format!("({i}.,0.,0.)")).collect();
+            let index: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+            format!(
+                "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCUNITASSIGNMENT((#1));
+#3=IFCPROJECT('p',$,'Cables',$,$,$,$,$,#2);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCLOCALPLACEMENT($,#5);
+#7=IFCBUILDINGSTOREY('s',$,'Level 0',$,$,#6,$,$,.ELEMENT.,0.);
+#10=IFCCARTESIANPOINTLIST3D(({}));
+#11=IFCINDEXEDPOLYCURVE(#10,(IFCLINEINDEX(({}))),$);
+#12=IFCSWEPTDISKSOLID(#11,3.7,$,$,$);
+#13=IFCSHAPEREPRESENTATION($,'Body','AdvancedSweptSolid',(#12));
+#18=IFCPRODUCTDEFINITIONSHAPE($,$,(#13));
+#22=IFCCABLESEGMENT('k',$,'Cable',$,$,#6,#18,$,.CABLESEGMENT.);
+#30=IFCRELCONTAINEDINSPATIALSTRUCTURE('r',$,$,$,(#22),#7);
+ENDSEC;END-ISO-10303-21;",
+                points.join(","),
+                index.join(",")
+            )
+        };
+        // MAX_POINTS segments are read; one more is a body BIMCraft will not build, and the cable is left out.
+        let within = ifc(cable(MAX_POINTS + 1).as_bytes(), "x").unwrap();
+        assert_eq!((only(&within.model, "wire").len(), within.skipped.len()), (1, 0), "{:?}", within.skipped);
+        let past = ifc(cable(MAX_POINTS + 2).as_bytes(), "x").unwrap();
+        assert!(only(&past.model, "wire").is_empty());
+        assert_eq!(past.skipped.len(), 1);
+        assert!(past.skipped[0].contains("no body BIMCraft can read"), "{:?}", past.skipped);
+    }
+
+    #[test]
+    fn room_separation_lines_past_what_a_project_may_hold_are_left_out_not_made() {
+        // A storey with a room separation line for each count of `points`, along the x axis 100 mm a point.
+        let lines = |points: &[usize]| {
+            let mut file = String::from(
+                "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;
+#1=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);
+#2=IFCUNITASSIGNMENT((#1));
+#3=IFCPROJECT('p',$,'Lines',$,$,$,$,$,#2);
+#4=IFCCARTESIANPOINT((0.,0.,0.));
+#5=IFCAXIS2PLACEMENT3D(#4,$,$);
+#6=IFCLOCALPLACEMENT($,#5);
+#7=IFCBUILDINGSTOREY('s',$,'Level 0',$,$,#6,$,$,.ELEMENT.,0.);
+",
+            );
+            let mut held = Vec::new();
+            for (k, &n) in points.iter().enumerate() {
+                let b = 100 + 10 * k;
+                let xyz: Vec<String> = (0..n).map(|i| format!("({}.,0.,0.)", i * 100)).collect();
+                let index: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+                file += &format!(
+                    "#{b}=IFCCARTESIANPOINTLIST3D(({}));
+#{}=IFCINDEXEDPOLYCURVE(#{b},(IFCLINEINDEX(({}))),$);
+#{}=IFCSHAPEREPRESENTATION($,'Axis','Curve2D',(#{}));
+#{}=IFCPRODUCTDEFINITIONSHAPE($,$,(#{}));
+#{}=IFCVIRTUALELEMENT('v{k}',$,'Room Separation Line',$,'RoomSeparation',#6,#{},$);
+",
+                    xyz.join(","),
+                    b + 1,
+                    index.join(","),
+                    b + 2,
+                    b + 1,
+                    b + 3,
+                    b + 2,
+                    b + 4,
+                    b + 3
+                );
+                held.push(format!("#{}", b + 4));
+            }
+            file + &format!("#30=IFCRELCONTAINEDINSPATIALSTRUCTURE('r',$,$,$,({}),#7);\nENDSEC;END-ISO-10303-21;", held.join(","))
+        };
+        let read = |points: &[usize]| {
+            let i = ifc(lines(points).as_bytes(), "x").unwrap();
+            (only(&i.model, "roomseparator").len(), i.skipped)
+        };
+        // MAX_POINTS segments of one line are made, one more is left out with its reason.
+        assert_eq!(read(&[MAX_POINTS + 1]), (MAX_POINTS, Vec::<String>::new()));
+        let (made, skipped) = read(&[MAX_POINTS + 2]);
+        assert_eq!(made, 0);
+        assert!(skipped.len() == 1 && skipped[0].contains("room separation"), "{skipped:?}");
+        // Nor do all the lines together pass MAX_POINTS: the second of two long ones is left out.
+        let (made, skipped) = read(&[6000, 6000]);
+        assert_eq!(made, 5999);
+        assert!(skipped.len() == 1 && skipped[0].contains("room separation"), "{skipped:?}");
+    }
+
     /// An IFC4 file in mm with a 6 x 4 m slab 200 mm thick, its profile round two holes, an
     /// opening element voiding it through the east one, as a mesh would carry it: `slab` makes the
     /// slab #35, and what it's part of; the storey holds `within`.
@@ -3218,7 +3479,9 @@ ENDSEC;END-ISO-10303-21;",
             s.execute("modify", &json!({"id": id, "params": values})).unwrap();
         }
         let file = crate::ifc::export(&s.model);
-        assert_eq!(file.matches("IFCRELDEFINESBYPROPERTIES(").count(), 4);
+        // One property set for each element with values; the elements' quantities are defined by properties too.
+        let (sets, quantities) = (file.matches("IFCPROPERTYSET(").count(), file.matches("IFCELEMENTQUANTITY(").count());
+        assert_eq!((sets, file.matches("IFCRELDEFINESBYPROPERTIES(").count()), (4, sets + quantities));
         assert!(file.contains("IFCPROPERTYSINGLEVALUE('Finish Height',$,IFCLENGTHMEASURE(2400.),$)"), "{file}");
         assert!(file.contains("IFCPROPERTYSINGLEVALUE('Accessible',$,IFCBOOLEAN(.T.),$)"));
         let i = ifc(file.as_bytes(), "x").unwrap();
@@ -3475,9 +3738,19 @@ ENDSEC;END-ISO-10303-21;",
         })
     }
 
-    /// What each element of `m` holds in its parameters, by category and where it stands.
+    /// What each element of `m` holds of its phase and its option, by category and where it stands: a mark, or a property
+    /// another program wrote, is no part of what these tests are about.
     fn held(m: &Model) -> BTreeMap<(&'static str, (i64, i64)), serde_json::Value> {
-        m.elements.values().filter_map(|e| Some(((e.category(), spot(m, e)?), json!(e.params()?)))).collect()
+        use crate::phasing::{CREATED, DEMOLISHED, OPTION};
+        let phased = |e: &Element| -> BTreeMap<String, serde_json::Value> {
+            e.params()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| [CREATED, DEMOLISHED, OPTION].contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        m.elements.values().filter(|e| e.params().is_some()).filter_map(|e| Some(((e.category(), spot(m, e)?), json!(phased(e))))).collect()
     }
 
     /// What each element of `m` that can be phased is in phase `phase`, keyed as `held` keys them.

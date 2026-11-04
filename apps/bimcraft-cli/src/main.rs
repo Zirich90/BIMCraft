@@ -8,6 +8,7 @@ mod window;
 use std::io::Write;
 use std::process::ExitCode;
 
+use bimcraft_core::cad::DwgReader;
 use bimcraft_core::engine::{Session, catalog};
 use bimcraft_core::sample::SAMPLE;
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ fn print_pretty(out: &mut impl Write, v: &Value) -> Result<(), String> {
 
 fn cli(args: &[String], out: &mut impl Write) -> Result<(), String> {
     let mut s = Session::new();
+    s.dwg = dwg_reader();
     match args {
         [cmd, rest @ ..] if cmd == "run" => {
             let mut rest = rest.iter();
@@ -94,8 +96,34 @@ fn connect_option(args: &[String]) -> Result<Option<Option<u16>>, String> {
     }
 }
 
+/// The DWG reader a session is given: `bimcraft-dwg`'s, which reads a drawing in a child process of this program, behind the
+/// `dwg` feature. A build without it hands none, and a DWG says to save it as DXF.
+#[cfg(feature = "dwg")]
+fn dwg_reader() -> Option<DwgReader> {
+    bimcraft_dwg::reader()
+}
+
+#[cfg(not(feature = "dwg"))]
+fn dwg_reader() -> Option<DwgReader> {
+    None
+}
+
+/// What this program does when it's started as the child that reads a DWG (`bimcraft_dwg::CHILD_ARG`): none when it isn't.
+#[cfg(feature = "dwg")]
+fn dwg_child(args: &[String]) -> Option<ExitCode> {
+    bimcraft_dwg::child_main(args)
+}
+
+#[cfg(not(feature = "dwg"))]
+fn dwg_child(_: &[String]) -> Option<ExitCode> {
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = dwg_child(&args) {
+        return code;
+    }
     if args.first().is_some_and(|a| a == "mcp") {
         let mut server = match connect_option(&args[1..]).and_then(|port| port.map(window::Window::connect).transpose()) {
             Ok(Some(window)) => mcp::Server::attached(window),

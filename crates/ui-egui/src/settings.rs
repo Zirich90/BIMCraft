@@ -5,11 +5,13 @@
 //! window's size, the background autosave interval, and the colour High Contrast Point Clouds draws scans in.
 //! The pages for what is still to come (performance and graphics) show what they will hold, greyed out.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::path::{Path, PathBuf};
 
-use egui::{Align, ComboBox, Context, Id as UiId, Layout, Modal, RichText, ScrollArea, ThemePreference, Ui, vec2};
+use egui::{Align, ComboBox, Context, Id as UiId, Layout, RichText, ScrollArea, ThemePreference, Ui, vec2};
 use serde_json::{Value, json};
 
 use crate::BimApp;
@@ -91,6 +93,8 @@ pub struct Settings {
     pub window: Window,
     /// What High Contrast Point Clouds fills a view's scans with.
     pub high_contrast: [u8; 3],
+    /// Grid snapping applies to every view, using the active view's enabled lattice.
+    pub grid_snapping: bool,
     /// The system's title bar rather than the window's own, where the window can draw its own.
     pub system_title_bar: bool,
 }
@@ -114,6 +118,7 @@ impl Settings {
             "gpu_3d": self.gpu_3d,
             "window": self.window.to_json(),
             "high_contrast": self.high_contrast,
+            "grid_snapping": self.grid_snapping,
             "system_title_bar": self.system_title_bar,
         })
     }
@@ -147,6 +152,7 @@ impl Settings {
             gpu_3d: v["gpu_3d"].as_bool().unwrap_or(base.gpu_3d),
             window: Window::from_json(&v["window"], base.window),
             high_contrast: colour(&v["high_contrast"]).unwrap_or(base.high_contrast),
+            grid_snapping: v["grid_snapping"].as_bool().unwrap_or(base.grid_snapping),
             system_title_bar: v["system_title_bar"].as_bool().unwrap_or(base.system_title_bar),
         }
     }
@@ -206,10 +212,11 @@ impl Page {
 }
 
 impl BimApp {
-    /// Puts the interface in `lang`. Chinese needs a font with its glyphs: where the system has none the language stays as it was, and
-    /// the status says why.
+    /// Puts the interface in `lang`. The fonts with the hanzi and the Hangul are already behind the window's own, whatever it
+    /// speaks. Chinese needs its glyphs: where the system has none the language stays as it was, and the status says why.
     pub(crate) fn set_lang(&mut self, ctx: &Context, lang: Lang) {
-        if lang == Lang::Chinese && !crate::lang::use_chinese_font(ctx, self.font_finder) {
+        let hanzi = crate::lang::use_cjk_font(ctx, self.font_finder);
+        if lang.is_chinese() && !hanzi {
             self.status = failed(t(crate::lang::NO_CHINESE_FONT).to_string());
         } else {
             self.lang = lang;
@@ -229,6 +236,7 @@ impl BimApp {
         self.card.wanted = kept.gpu_3d;
         self.window.kept = kept.window;
         self.scan_contrast = kept.high_contrast;
+        self.grid_snapping = kept.grid_snapping;
         self.system_title_bar = kept.system_title_bar;
         self.settings_kept = Some(kept);
         self.settings_path = Some(path);
@@ -252,6 +260,7 @@ impl BimApp {
             gpu_3d: self.card.wanted,
             window: self.window.kept,
             high_contrast: self.scan_contrast,
+            grid_snapping: self.grid_snapping,
             system_title_bar: self.system_title_bar,
         }
     }
@@ -276,33 +285,34 @@ impl BimApp {
     pub(crate) fn settings_window(&mut self, ctx: &Context) {
         let Some(mut page) = self.settings_page else { return };
         let mut close = false;
-        let r = Modal::new(UiId::new("settings")).show(ctx, |ui| {
-            ui.set_width(660.0);
-            ui.label(RichText::new(t("Settings")).heading());
-            ui.add_space(6.0);
-            // A fixed size, so the window doesn't grow or move under the pointer from one frame or page to the next.
-            ui.allocate_ui_with_layout(vec2(660.0, 380.0), Layout::left_to_right(Align::Min), |ui| {
-                ui.vertical(|ui| {
-                    ui.set_width(150.0);
-                    for p in Page::ALL {
-                        if ui.selectable_label(page == p, t(p.name())).clicked() {
-                            page = p;
+        let r = Modal::new(UiId::new("settings"), t("Settings")).width(660.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                // A fixed size, so the window doesn't grow or move under the pointer from one frame or page to the next.
+                ui.allocate_ui_with_layout(vec2(660.0, 380.0), Layout::left_to_right(Align::Min), |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(150.0);
+                        for p in Page::ALL {
+                            if ui.selectable_label(page == p, t(p.name())).clicked() {
+                                page = p;
+                            }
                         }
-                    }
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ScrollArea::vertical().id_salt("settings-page").auto_shrink([false, false]).show(ui, |ui| match page {
-                        Page::Interface => self.interface_page(ui, ctx),
-                        Page::Performance => self.performance_page(ui),
-                        Page::Graphics => self.graphics_page(ui),
-                        Page::Files => self.files_page(ui),
-                        Page::Updates => self.updates_page(ui),
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ScrollArea::vertical().id_salt("settings-page").auto_shrink([false, false]).show(ui, |ui| match page {
+                            Page::Interface => self.interface_page(ui, ctx),
+                            Page::Performance => self.performance_page(ui),
+                            Page::Graphics => self.graphics_page(ui),
+                            Page::Files => self.files_page(ui),
+                            Page::Updates => self.updates_page(ui),
+                        });
                     });
                 });
             });
-            ui.separator();
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
         });
         self.settings_page = if close || r.should_close() { None } else { Some(page) };
     }

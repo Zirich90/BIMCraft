@@ -173,6 +173,8 @@ enum From {
     Flag(&'static str),
     /// A value among the element's parameters, under the field's own name (its phases, its design option).
     Param,
+    /// How a door or a window opens, in the project's language.
+    Operation,
 }
 
 type Own = (&'static str, Kind, From);
@@ -190,6 +192,7 @@ const DEPTH: Own = ("Depth", Kind::Length, From::Key("depth"));
 const SYSTEM: Own = (ui_msg!("System"), Kind::Text, From::Key("system"));
 const OFFSET: Own = (msg!("Offset"), Kind::Length, From::Key("offset"));
 const MARK: Own = ("Mark", Kind::Text, From::Key("mark"));
+const OPERATION: Own = (msg!("Operation"), Kind::Text, From::Operation);
 const NAME: Own = ("Name", Kind::Text, From::Key("name"));
 const HOST: Own = ("Wall", Kind::Number, From::Ref("host"));
 const COUNT: Own = (msg!("Count"), Kind::Number, From::Count);
@@ -211,12 +214,14 @@ const OWN: &[(&str, usize, &[Own])] = &[
             AREA,
             (msg!("Perimeter"), Kind::Length, From::Metres("perimeter_m")),
             COUNT,
+            (msg!("Unbounded Height"), Kind::Length, From::Key("unbounded_height")),
+            VOLUME,
             PHASE_CREATED,
             PHASE_DEMOLISHED,
             DESIGN_OPTION,
         ],
     ),
-    ("door", 6, &[MARK, TYPE, WIDTH, HEIGHT, LEVEL, HOST, FAMILY, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
+    ("door", 6, &[MARK, TYPE, WIDTH, HEIGHT, LEVEL, HOST, FAMILY, OPERATION, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
     (
         "window",
         7,
@@ -229,6 +234,7 @@ const OWN: &[(&str, usize, &[Own])] = &[
             LEVEL,
             HOST,
             FAMILY,
+            OPERATION,
             COUNT,
             PHASE_CREATED,
             PHASE_DEMOLISHED,
@@ -304,6 +310,21 @@ const OWN: &[(&str, usize, &[Own])] = &[
         ],
     ),
     ("beam", 6, &[ID, TYPE, LEVEL, LENGTH, WIDTH, DEPTH, SYSTEM, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
+    (
+        "rebar",
+        7,
+        &[
+            ID,
+            LEVEL,
+            ("Grade", Kind::Text, From::Key("grade")),
+            ("Diameter", Kind::Length, From::Key("diameter")),
+            LENGTH,
+            COUNT,
+            (msg!("Weight"), Kind::Number, From::Key("weight_kg")),
+            ("Host", Kind::Number, From::Ref("host")),
+            ("Layer", Kind::Text, From::Key("layer")),
+        ],
+    ),
     ("stripfooting", 6, &[ID, TYPE, LEVEL, LENGTH, WIDTH, DEPTH, SYSTEM, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
     (
         "pipe",
@@ -339,6 +360,8 @@ const OWN: &[(&str, usize, &[Own])] = &[
             (msg!("Diameter"), Kind::Length, From::Key("width")),
         ],
     ),
+    ("cabletray", 7, &[ID, TYPE, LEVEL, SYSTEM, LENGTH, WIDTH, DEPTH, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
+    ("duct", 7, &[ID, TYPE, LEVEL, SYSTEM, LENGTH, WIDTH, DEPTH, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION]),
     (
         "cable",
         6,
@@ -843,6 +866,11 @@ impl Row<'_> {
                     _ => Value::Null,
                 },
                 From::Flag(k) => Value::Bool(j.get(k).and_then(Value::as_bool).unwrap_or(false)),
+                From::Operation => j
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .and_then(crate::model::Operation::parse)
+                    .map_or(Value::Null, |op| Value::String(m.language.word(op.label()).to_string())),
                 // Its parameter of that name, or its wall's for a door or window with none; a phase it holds none of
                 // is the project's first.
                 From::Param => match phasing::value(m, self.e, name) {
@@ -1114,6 +1142,28 @@ pub fn to_csv(t: &Table) -> String {
     out
 }
 
+/// The table as a workbook of one sheet named `name`: its headings (in metric) in bold, its rows, then its totals. Numbers
+/// go in as numbers, so the spreadsheet sums them; text as text, never a formula.
+pub fn to_xlsx(t: &Table, name: &str) -> Vec<u8> {
+    use crate::xlsx::Cell;
+    let headings: Vec<String> = t.columns.iter().map(|c| heading(Units::Millimetres, c)).collect();
+    let rows: Vec<Vec<Cell>> = t
+        .rows
+        .iter()
+        .chain(&t.totals)
+        .map(|row| {
+            row.iter()
+                .map(|v| match v {
+                    Value::Number(x) => x.as_f64().map_or(Cell::Empty, Cell::Number),
+                    Value::Null => Cell::Empty,
+                    v => Cell::Text(cell(v)),
+                })
+                .collect()
+        })
+        .collect();
+    crate::xlsx::workbook(name, &headings, &rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,6 +1253,16 @@ mod tests {
             totals: None,
         };
         assert_eq!(to_csv(&t), "Name,Offset\n'=1+1,-5.0\n'@SUM(A1),5.0\n");
+    }
+
+    #[test]
+    fn a_schedule_goes_to_a_workbook_with_its_numbers_as_numbers() {
+        let t = table(&house().model, &of("rooms")).unwrap();
+        let parts = crate::xlsx::unzip(&to_xlsx(&t, "Room Schedule"));
+        assert!(parts["xl/workbook.xml"].contains(r#"name="Room Schedule""#));
+        let sheet = &parts["xl/worksheets/sheet1.xml"];
+        assert!(sheet.contains(r#"<t xml:space="preserve">Area (m²)</t>"#), "{sheet}");
+        assert!(sheet.contains(r#"<t xml:space="preserve">Kitchen</t></is></c><c r="C2" t="inlineStr"><is><t xml:space="preserve">Level 1</t></is></c><c r="D2"><v>18</v></c><c r="E2"><v>18000</v></c>"#), "{sheet}");
     }
 
     #[test]

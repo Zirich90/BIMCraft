@@ -75,6 +75,8 @@ pub struct Drawing {
     pub cloud: Option<(String, String)>,
     /// While sketching, Trim/Extend's first line (or boundary) picked, and where.
     pub trim: Option<(usize, P2)>,
+    /// Align's reference owner: a model element or a line of the active sketch.
+    pub align_reference: Option<Picked>,
     /// The Options Bar's Show Centre: new detail arcs and circles take a centre mark.
     pub centre_mark: bool,
     /// Which of a shape's numbers is being typed (a rectangle's width, 0, or height, 1), and what's typed in the other.
@@ -96,6 +98,7 @@ impl Default for Drawing {
             fillet: Vec::new(),
             grip: None,
             trim: None,
+            align_reference: None,
             insulation: None,
             cloud: None,
             centre_mark: false,
@@ -472,6 +475,7 @@ impl BimApp {
     pub(crate) fn forget_picks(&mut self) {
         self.drawing.fillet.clear();
         self.drawing.trim = None;
+        self.drawing.align_reference = None;
     }
 
     /// What's typed dropped: a length, or a shape's numbers.
@@ -948,7 +952,7 @@ impl BimApp {
                 }
                 None => status = Some(msg!("Split between the line's ends.")),
             },
-            Tool::Trim(_) => match self.drawing.trim.take() {
+            Tool::Trim(_) => match self.drawing.trim {
                 Some((first, keep)) if first != i => match sk.lines.get(first).and_then(|f| draw::corner(&f.curve, keep, &l.curve, raw)) {
                     Some((a, b)) => {
                         if let Some(line) = sk.lines.get_mut(first) {
@@ -958,6 +962,8 @@ impl BimApp {
                             line.curve = b;
                         }
                         sk.changed();
+                        self.drawing.trim = None;
+                        self.status = Status::default();
                     }
                     None => status = Some("The lines don't meet: they're parallel, or an arc's circle misses the other."),
                 },
@@ -973,11 +979,12 @@ impl BimApp {
                                 line.curve = c;
                             }
                             sk.changed();
+                            self.status = Status::default();
+                            if !many {
+                                self.drawing.trim = None;
+                            }
                         }
                         None => status = Some("The lines don't meet: they're parallel, or an arc's circle misses the other."),
-                    }
-                    if !many {
-                        self.drawing.trim = None;
                     }
                 }
                 Some(_) => {}

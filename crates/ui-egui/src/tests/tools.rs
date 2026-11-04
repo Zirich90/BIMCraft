@@ -354,6 +354,7 @@ fn edit_type_from_a_regions_edit_boundary_opens_the_type_the_region_has() {
     press(&mut h, "Edit Boundary");
     assert!(matches!(h.state().sketch.as_ref().map(|s| s.of), Some(crate::sketch::Of::Edit(id)) if id == region));
     press(&mut h, "Edit Type");
-    assert_eq!(field_text(&h, "Type Name"), "Sand");
+    let shown = h.get_by_role_and_label(Role::ComboBox, "Type:").value();
+    assert_eq!(shown.as_deref(), Some("Sand"));
     assert!(h.query_by_label("Type Properties").is_some());
 }

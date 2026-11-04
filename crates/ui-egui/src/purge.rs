@@ -1,10 +1,12 @@
 //! Manage > Purge Unused: what nothing in the project uses, listed by what it is, to take out together; the commands are
 //! `purge` and `delete_type`. A checked kind's unused entries are listed as a dry run finds them, and Purge runs the same.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use bimcraft_core::library::PURGE_KINDS;
-use egui::{Context, Id as UiId, Modal, RichText, ScrollArea};
+use egui::{Context, Id as UiId, RichText, ScrollArea};
 use serde_json::{Value, json};
 
 use crate::BimApp;
@@ -43,36 +45,37 @@ impl BimApp {
     pub(crate) fn purge_window(&mut self, ctx: &Context) {
         let Some(mut d) = self.purge_dialog.take() else { return };
         let (mut close, mut purge, mut changed) = (false, false, false);
-        let r = Modal::new(UiId::new("purge-unused")).show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui.label(RichText::new(t("Purge Unused")).heading());
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(t("Takes out what nothing in the project uses. Each category keeps a type; Undo brings it back."))
-                    .color(pal().muted),
-            );
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                for (on, label) in d.kinds.iter_mut().zip(LABELS) {
-                    changed |= ui.checkbox(on, t(label)).changed();
-                }
+        let r = Modal::new(UiId::new("purge-unused"), t("Purge Unused")).width(520.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(t("Takes out what nothing in the project uses. Each category keeps a type; Undo brings it back."))
+                        .color(pal().muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (on, label) in d.kinds.iter_mut().zip(LABELS) {
+                        changed |= ui.checkbox(on, t(label)).changed();
+                    }
+                });
+                ui.add_space(6.0);
+                ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+                    if d.listed.is_empty() {
+                        ui.label(RichText::new(t("Nothing is unused.")).color(pal().muted));
+                    }
+                    for (kind, name) in &d.listed {
+                        ui.label(format!("{}: {name}", t(kind)));
+                    }
+                });
             });
-            ui.add_space(6.0);
-            ScrollArea::vertical().max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
-                if d.listed.is_empty() {
-                    ui.label(RichText::new(t("Nothing is unused.")).color(pal().muted));
-                }
-                for (kind, name) in &d.listed {
-                    ui.label(format!("{}: {name}", t(kind)));
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let count = d.listed.len();
-                if ui.add_enabled(count > 0, egui::Button::new(tf("Purge {}", &[&count.to_string()]))).clicked() {
-                    purge = true;
-                }
-                close = ui.button(t("Cancel")).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let count = d.listed.len();
+                    if ui.add_enabled(count > 0, egui::Button::new(tf("Purge {}", &[&count.to_string()]))).clicked() {
+                        purge = true;
+                    }
+                    close = ui.button(t("Cancel")).clicked();
+                });
             });
         });
         if changed {

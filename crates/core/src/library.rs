@@ -51,6 +51,16 @@ pub enum Kind {
     FillPattern,
     FilledRegionType,
     DetailGroup,
+    TextType,
+    /// A named set of parameters for `reinforce`, for one kind of host.
+    ReinforcementPreset,
+    DimensionType,
+    /// A voltage the electrical settings define, with the band a device may read within.
+    Voltage,
+    /// A distribution system, which names the voltages it supplies.
+    DistributionSystem,
+    /// A wire type, with the ampacity of each section.
+    WireType,
 }
 
 impl Kind {
@@ -77,6 +87,12 @@ impl Kind {
             Kind::FillPattern => "fill pattern".into(),
             Kind::FilledRegionType => "filled region type".into(),
             Kind::DetailGroup => "detail group".into(),
+            Kind::TextType => "text type".into(),
+            Kind::ReinforcementPreset => "reinforcement preset".into(),
+            Kind::DimensionType => "dimension type".into(),
+            Kind::Voltage => "voltage".into(),
+            Kind::DistributionSystem => "distribution system".into(),
+            Kind::WireType => "wire type".into(),
         }
     }
 
@@ -101,6 +117,12 @@ impl Kind {
             "fill-pattern" => Kind::FillPattern,
             "filled-region-type" => Kind::FilledRegionType,
             "detail-group" => Kind::DetailGroup,
+            "text-type" => Kind::TextType,
+            "reinforcement-preset" => Kind::ReinforcementPreset,
+            "dimension-type" => Kind::DimensionType,
+            "voltage" => Kind::Voltage,
+            "distribution-system" => Kind::DistributionSystem,
+            "wire-type" => Kind::WireType,
             _ => Kind::Type(s.strip_prefix("type:")?.to_string()),
         })
     }
@@ -129,6 +151,12 @@ impl fmt::Display for Kind {
             Kind::FillPattern => f.write_str("fill-pattern"),
             Kind::FilledRegionType => f.write_str("filled-region-type"),
             Kind::DetailGroup => f.write_str("detail-group"),
+            Kind::TextType => f.write_str("text-type"),
+            Kind::ReinforcementPreset => f.write_str("reinforcement-preset"),
+            Kind::DimensionType => f.write_str("dimension-type"),
+            Kind::Voltage => f.write_str("voltage"),
+            Kind::DistributionSystem => f.write_str("distribution-system"),
+            Kind::WireType => f.write_str("wire-type"),
         }
     }
 }
@@ -181,7 +209,7 @@ pub struct Entry {
 }
 
 /// A part of a library entry, with an id and a GUID of its own that it holds itself, kept while it stays where it is
-/// in its list: a type's layer, a family's form or plan symbol. `what` it is, what it's `of` and its place there.
+/// in its list: a type's layer, a family's form, plan symbol or connector. `what` it is, what it's `of` and its place there.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Part {
     pub what: &'static str,
@@ -211,6 +239,12 @@ impl HasPart for crate::model::Layer {
 }
 
 impl HasPart for crate::family::Form {
+    fn ident(&mut self) -> (&mut Id, &mut Guid) {
+        (&mut self.id, &mut self.guid)
+    }
+}
+
+impl HasPart for crate::family::Connector {
     fn ident(&mut self) -> (&mut Id, &mut Guid) {
         (&mut self.id, &mut self.guid)
     }
@@ -480,6 +514,42 @@ impl Model {
         }
     }
 
+    /// Entry `from` of `kind` held as `to` now, for a rename: a type of a category or a family's (`family: type`). Whether there
+    /// was one to move; what names it is left to the caller.
+    pub fn move_entry(&mut self, kind: &Kind, from: &str, to: &str) -> bool {
+        use crate::model::RUN_CATEGORIES;
+        fn mv<T>(map: &mut BTreeMap<String, T>, from: &str, to: &str) -> bool {
+            match map.remove(from) {
+                Some(t) => {
+                    map.insert(to.to_string(), t);
+                    true
+                }
+                None => false,
+            }
+        }
+        match kind {
+            Kind::Type(category) => match category.as_str() {
+                "wall" => mv(&mut self.types.wall, from, to),
+                "floor" => mv(&mut self.types.floor, from, to),
+                "door" => mv(&mut self.types.door, from, to),
+                "window" => mv(&mut self.types.window, from, to),
+                "column" => mv(&mut self.types.column, from, to),
+                "roof" => mv(&mut self.types.roof, from, to),
+                "ceiling" => mv(&mut self.types.ceiling, from, to),
+                "railing" => mv(&mut self.types.railing, from, to),
+                "structuralcolumn" => mv(&mut self.types.structural_column, from, to),
+                "footing" => mv(&mut self.types.footing, from, to),
+                run if RUN_CATEGORIES.contains(&run) => self.types.runs.get_mut(run).is_some_and(|t| mv(t, from, to)),
+                _ => false,
+            },
+            Kind::FamilyType => match (from.split_once(": "), to.split_once(": ")) {
+                (Some((f, old)), Some((g, new))) if f == g => self.families.get_mut(f).is_some_and(|fam| mv(&mut fam.types, old, new)),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The entries of `kinds` (see [`PURGE_KINDS`]) nothing names, as one pass of Purge Unused would take them out. Each
     /// category keeps a type (its default's, else its first) and each family a type, so that a tool still has one to place; a
     /// family that goes takes its types with it. What a pass takes out may leave more unused, which the next pass finds.
@@ -587,6 +657,12 @@ impl Model {
         add(Kind::FillPattern, &mut self.fill_patterns.keys());
         add(Kind::FilledRegionType, &mut self.region_types.keys());
         add(Kind::DetailGroup, &mut self.detail_groups.keys());
+        add(Kind::TextType, &mut self.text_types.keys());
+        add(Kind::ReinforcementPreset, &mut self.reinforcement.keys());
+        add(Kind::DimensionType, &mut self.dimension_types.keys());
+        add(Kind::Voltage, &mut self.voltages.keys());
+        add(Kind::DistributionSystem, &mut self.distribution_systems.keys());
+        add(Kind::WireType, &mut self.wire_types.keys());
         out
     }
 
@@ -623,6 +699,7 @@ impl Model {
         for (n, f) in &self.families {
             add("form", "family", n, f.forms.iter().map(|x| (x.id, x.guid)).collect());
             add("symbol", "family", n, f.symbols.iter().map(|x| (x.id, x.guid)).collect());
+            add("connector", "family", n, f.connectors.iter().map(|x| (x.id, x.guid)).collect());
         }
         for (n, g) in &self.detail_groups {
             add("member", "detail group", n, g.members.iter().map(|x| (x.id, x.guid)).collect());
@@ -746,6 +823,7 @@ impl Model {
         for f in self.families.values_mut() {
             f.forms.iter_mut().for_each(|x| give(&mut x.id, &mut x.guid));
             f.symbols.iter_mut().for_each(|x| give(&mut x.id, &mut x.guid));
+            f.connectors.iter_mut().for_each(|x| give(&mut x.id, &mut x.guid));
         }
         for g in self.detail_groups.values_mut() {
             g.members.iter_mut().for_each(|x| give(&mut x.id, &mut x.guid));
@@ -815,6 +893,7 @@ impl Model {
         for f in self.families.values_mut() {
             f.forms.iter_mut().for_each(|x| (x.id, x.guid) = (0, Guid::default()));
             f.symbols.iter_mut().for_each(|x| (x.id, x.guid) = (0, Guid::default()));
+            f.connectors.iter_mut().for_each(|x| (x.id, x.guid) = (0, Guid::default()));
         }
         for g in self.detail_groups.values_mut() {
             g.members.iter_mut().for_each(|x| (x.id, x.guid) = (0, Guid::default()));
@@ -978,6 +1057,8 @@ impl crate::model::Element {
                 }
             }
             Element::CadImport(ci) => f(&Kind::Cad, &mut ci.cad),
+            Element::Text(n) => f(&Kind::TextType, &mut n.type_name),
+            Element::Dimension(d) => f(&Kind::DimensionType, &mut d.type_name),
             Element::Schedule(sc) => {
                 let mut fields: Vec<&mut String> =
                     sc.fields.iter_mut().map(|x| &mut x.name).chain(sc.sort.iter_mut().map(|x| &mut x.field)).collect();
@@ -1013,7 +1094,7 @@ impl Model {
     /// Each name the model holds of a library entry, given to `f` with what it names, which may put another in its place:
     /// its elements' ([`Element::lib_refs_mut`](crate::model::Element::lib_refs_mut)), its types' layers' and runs'
     /// materials, its materials' pictures, its view filters' rules, its view templates' graphics, its option sets'
-    /// primaries. (A family's forms name their materials themselves.)
+    /// primaries, its distribution systems' voltages. (A family's forms name their materials themselves.)
     pub fn lib_refs_mut(&mut self, f: &mut dyn FnMut(&Kind, &mut String)) {
         if let Some(p) = &mut self.carrier_settings
             && !p.default_type.is_empty()
@@ -1073,6 +1154,11 @@ impl Model {
         for x in self.materials.values_mut() {
             for p in [&mut x.cut_pattern, &mut x.surface_pattern].into_iter().flatten() {
                 f(&Kind::FillPattern, p);
+            }
+        }
+        for d in self.distribution_systems.values_mut() {
+            for v in d.voltages_mut() {
+                f(&Kind::Voltage, v);
             }
         }
     }

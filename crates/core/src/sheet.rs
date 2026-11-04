@@ -19,8 +19,6 @@ use crate::{font, schedule, view3d};
 pub const DENSITY: f64 = 5.0;
 /// Room around what a view shows, on paper, for grid bubbles and the like: mm.
 const ROOM: f64 = 12.0;
-/// The title box in the bottom right corner, inside the border: mm.
-const TITLE: P2 = P2(180.0, 40.0);
 const INK: Rgb = Rgb(25, 25, 25);
 /// A schedule's lettering and its title's, px: 2.5 mm and 3.5 mm on paper.
 const CELL_TEXT: f32 = 12.5;
@@ -85,8 +83,11 @@ pub fn frame(m: &Model, id: impl Key) -> Option<(View, (f32, f32))> {
 /// in the paper's top right corner.
 pub fn spot(m: &Model, sheet: impl Key, view: impl Key, scale: f64) -> P2 {
     let sheet = m.guid(sheet);
-    let paper = m.sheet(sheet).and_then(|s| paper(&s.size)).unwrap_or(P2(420.0, 297.0));
-    let middle = P2((20.0 + paper.0 - 10.0) / 2.0, (10.0 + TITLE.1 + paper.1 - 10.0) / 2.0);
+    let sh = m.sheet(sheet);
+    let size_name = sh.map(|s| s.size.as_str()).unwrap_or("A3");
+    let paper = sh.and_then(|s| paper(&s.size)).unwrap_or(P2(420.0, 297.0));
+    let margins = m.standard().sheet_margins(size_name);
+    let middle = P2((margins.left + paper.0 - margins.right) / 2.0, (margins.bottom + margins.title_height + paper.1 - margins.top) / 2.0);
     let taken = size(m, view, scale).unwrap_or(P2(0.0, 0.0));
     let right = m
         .elements
@@ -97,7 +98,7 @@ pub fn spot(m: &Model, sheet: impl Key, view: impl Key, scale: f64) -> P2 {
         })
         .fold(None, |r: Option<f64>, x| Some(r.map_or(x, |r| r.max(x))));
     // Inside the border, 5 mm clear of it.
-    let (east, north) = (paper.0 - 15.0, paper.1 - 15.0);
+    let (east, north) = (paper.0 - margins.right - 5.0, paper.1 - margins.top - 5.0);
     match right {
         None => middle,
         Some(r) if r + 10.0 + taken.0 <= east => P2(r + 10.0 + taken.0 / 2.0, middle.1),
@@ -112,13 +113,45 @@ fn left(d: &mut Drawing, text: &str, at: P2, height: f64) {
     d.text(text, (x + font::width(text, h) / 2.0, y), h, INK);
 }
 
-/// The border, 20 mm in on the left (for binding) and 10 mm on the other sides, and the title
-/// box in the bottom right corner: the project, the sheet's name, its scale, and its number.
-fn title_block(d: &mut Drawing, project: &str, sheet: &Sheet, paper: P2, scale: &str) {
+/// Draw standard folding marks (marcas de dobramento) as specified in NBR 17067.
+fn draw_folding_marks(d: &mut Drawing, paper: P2, size: &str, margins: crate::standards::SheetMargins) {
+    let s = size.trim().to_ascii_uppercase();
+    let x_folds: &[f64] = match s.as_str() {
+        "A3" => &[210.0],
+        "A2" => &[210.0, 402.0],
+        "A1" => &[210.0, 395.0, 580.0, 765.0],
+        "A0" => &[210.0, 395.0, 580.0, 765.0, 950.0, 1135.0],
+        _ => &[],
+    };
+    for &dist_from_right in x_folds {
+        let x = paper.0 - dist_from_right;
+        if x > margins.left && x < paper.0 - margins.right {
+            d.line(&[P2(x, 0.0), P2(x, margins.bottom)], Pen::FINE, INK, false);
+            d.line(&[P2(x, paper.1 - margins.top), P2(x, paper.1)], Pen::FINE, INK, false);
+        }
+    }
+    let y_folds: &[f64] = match s.as_str() {
+        "A2" | "A1" => &[297.0],
+        "A0" => &[297.0, 594.0],
+        _ => &[],
+    };
+    for &y in y_folds {
+        if y < paper.1 - margins.top {
+            d.line(&[P2(0.0, y), P2(margins.left, y)], Pen::FINE, INK, false);
+            d.line(&[P2(paper.0 - margins.right, y), P2(paper.0, y)], Pen::FINE, INK, false);
+        }
+    }
+}
+
+/// The border, filing margin on the left and borders on the other sides, and the title
+/// box in the bottom right corner, adapted to `std`: the project, the sheet's name, its scale, and its number.
+fn title_block(d: &mut Drawing, project: &str, sheet: &Sheet, paper: P2, scale: &str, std: crate::standards::TechnicalStandard) {
+    let margins = std.sheet_margins(&sheet.size);
     let rect = |a: P2, b: P2| vec![a, P2(b.0, a.1), b, P2(a.0, b.1)];
-    d.line(&rect(P2(20.0, 10.0), P2(paper.0 - 10.0, paper.1 - 10.0)), Pen::BORDER, INK, true);
-    let width = TITLE.0.min(paper.0 - 30.0);
-    let (x0, x1, y0, y1) = (paper.0 - 10.0 - width, paper.0 - 10.0, 10.0, 10.0 + TITLE.1);
+    d.line(&rect(P2(margins.left, margins.bottom), P2(paper.0 - margins.right, paper.1 - margins.top)), Pen::BORDER, INK, true);
+    let width = margins.title_width.min(paper.0 - margins.left - margins.right);
+    let height = margins.title_height;
+    let (x0, x1, y0, y1) = (paper.0 - margins.right - width, paper.0 - margins.right, margins.bottom, margins.bottom + height);
     d.line(&rect(P2(x0, y0), P2(x1, y1)), Pen::BORDER, INK, true);
     d.line(&[P2(x0, y0 + 26.0), P2(x1, y0 + 26.0)], Pen::PROJECTION, INK, false);
     d.line(&[P2(x1 - 50.0, y0), P2(x1 - 50.0, y0 + 26.0)], Pen::PROJECTION, INK, false);
@@ -128,6 +161,10 @@ fn title_block(d: &mut Drawing, project: &str, sheet: &Sheet, paper: P2, scale: 
     let number = (7.0 * DENSITY) as f32;
     let at = d.view.px(P2(x1 - 25.0, y0 + 13.0));
     d.text(&sheet.number, at, number, INK);
+
+    if margins.folding_marks {
+        draw_folding_marks(d, paper, &sheet.size, margins);
+    }
 }
 
 /// A schedule's table: its headings; its rows' cells as shown, its totals' last; each column's
@@ -236,7 +273,7 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
     // Schedules keep their own size: no scale of theirs.
     let scaled: Vec<&Viewport> =
         views.iter().filter(|(_, v)| !matches!(m.elements.get(v.view), Some(Element::Schedule(_)))).map(|(_, v)| *v).collect();
-    title_block(&mut d, &m.name, sheet, paper, &scale_note(&scaled, m.language, m.units));
+    title_block(&mut d, &m.name, sheet, paper, &scale_note(&scaled, m.language, m.units), m.standard());
     let mut scene = None;
     for (vid, vp) in views {
         let Some((view, (ox, oy))) = frame(m, vid) else { continue };
@@ -265,8 +302,9 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
                 continue;
             }
             Some(Element::View3D(v)) => {
-                let cam = view3d::camera_in(m, v.azimuth, v.elevation, view.scale, ROOM * DENSITY, &Look::of(m, vp.view));
-                let img = scene.get_or_insert_with(|| view3d::Scene::new(m)).render_in(&cam, &[], &Look::of(m, vp.view));
+                let look = Look::of(m, vp.view);
+                let cam = view3d::camera_of(m, v, view.scale, ROOM * DENSITY, &look);
+                let img = scene.get_or_insert_with(|| view3d::Scene::new(m)).render_in(&cam, &[], &look);
                 d.push(Prim::Image { at: (ox, oy), width: img.width, height: img.height, rgba: img.rgba, ink: false });
                 Drawing::new(view)
             }
@@ -319,7 +357,7 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
             && n.view == guid
         {
             d.own(Some(nid));
-            render::note(&mut d, n);
+            render::note(&mut d, m, n);
         }
         if let Element::DetailLine(l) = e
             && l.view == guid

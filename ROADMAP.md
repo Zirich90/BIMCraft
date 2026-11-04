@@ -33,7 +33,8 @@ The README lists what the engine, the desktop, the CLI and the MCP server do. Wh
   measures how it scales.
 - **CI:** the release workflow runs the tests on Windows, Linux and macOS, but only for tags and manual runs. Pull
   requests aren't tested.
-- **3D** is drawn in software and is orthographic: no perspective, shadows or sun.
+- **3D** is parallel or in perspective (a lens and an eye height, on the processor and the card), but has no shadows or sun,
+  and no walk-through yet.
 - **Agents** reach the engine through the CLI and an MCP server over stdio. They can't attach to a running desktop.
 
 ---
@@ -51,7 +52,8 @@ The README lists what the engine, the desktop, the CLI and the MCP server do. Wh
 5. **Clean room.** File formats come from public specifications (IFC, DXF, gbXML, BCF, glTF), and a format with no public
    specification (Revit's `.rvt` and `.rfa`) may be read only under the fence in [docs/rvt-provenance.md](docs/rvt-provenance.md).
    Content is original or openly licensed, a library's licence must suit MIT or Apache (the one exception is the
-   Apache-2.0-only Revit reader, `crates/rvt`, which holds ported code), and Revit's name only describes the workflow.
+   Apache-2.0-only Revit reader, `crates/rvt`, which holds ported code; acadrust, the DWG reader, is MPL-2.0, whose copyleft
+   covers only its own files, used unmodified), and Revit's name only describes the workflow.
 
 ---
 
@@ -83,12 +85,12 @@ The goal is the editing tools a working architect reaches for every hour.
 | Arrays, linear and radial, optionally kept as a group | M |
 | Groups (model groups) with group types, edit group, and exclude a member | L |
 | Pin and unpin; a selection filter; match type properties | S |
-| Locked and equal dimension constraints (a small constraint solver over references) | L |
+| Locked and equal dimension constraints: done (`constraints.rs`: padlocks and EQ on aligned and linear dimensions, kept after every command); left: dimensions bound to parameters (labels) | M |
 | Copy to the clipboard, and paste aligned to the same place, to selected levels or to the current view | M |
 | Join and cut geometry (wall to floor, column to wall cleanups in plan and section) | M |
 | Wall openings (rectangular cuts) and wall profile editing (an elevation sketch) | M |
 | Wall sweeps and reveals as profiles along a wall | M |
-| ~~Room separation lines~~; room bounding on and off per element | S | Room separation lines done (`room_separator`, an `IfcVirtualElement` in IFC) |
+| ~~Room separation lines~~; ~~room bounding on and off per wall~~ | S | Room separation lines done (`room_separator`, an `IfcVirtualElement` in IFC); a wall's `room_bounding` turns off. Columns don't bound rooms yet |
 | **Curtain walls**: grid lines, mullion types, panel types (glass, solid, door panel); curtain systems on faces later | XL |
 
 Not scheduled yet: stacked walls as a type, in-place elements, and floor and roof shape editing by sub-element.
@@ -110,9 +112,9 @@ The goal is a printable, coordinated drawing set.
 | Draw tools, from trying them: done (typed numbers for shapes with Tab, Show Centre, Fillet and Offset previews, picks lit, Trim/Extend to Corner on the selection, double click and right-click Finish Drawing, the Offset bugs in sketches, icons) | S |
 | Fill patterns: `.pat` import and export, an editor for patterns of many line families, and model patterns aligned and rotated on regions and floors (Align, Pattern Angle): done; left: aligning them on walls' faces in sections and elevations; a `.pat` file is read up to 2,000 patterns and the reply names 100 of those left out | M |
 | Detail annotation: done (insulation along any curve; Linework in plans; Detail Groups, placed, turned, mirrored and ungrouped; repeating details along a line); left: Edit Group in place, model groups, group types renamed, deleted or edited on the desktop (the `group_type` command does), groups placed outside plans | M |
-| Better than Revit: line patterns and fill patterns made from lines drawn on a plan (select them, then Create Line Pattern or Create Fill Pattern), as Archicad and pyRevit's pattern maker do | M |
+| Better than Revit: line patterns and fill patterns made from lines drawn on a plan, as Archicad and pyRevit's pattern maker do: fill patterns done (Fill Patterns > New Pattern > Custom, `make_fill_pattern`); left: line patterns | M |
 | Drafting views, detail components (2D families), legends | L |
-| Annotation types: text, dimension and tag styles; room tags with fields and tag families that look like Revit's (`tag` names any element with a field of its schedule, drawn as plain text, a door's in a box and a window's in a hexagon) | M |
+| Annotation types: tag styles (text types and dimension types are done); room tags with fields and tag families that look like Revit's (`tag` names any element with a field of its schedule, drawn as plain text, a door's in a box and a window's in a hexagon) | M |
 | Area plans, area schemes (gross, rentable) and colour-fill legends by parameter | L |
 | Plan regions (a local view range) and depth cueing in elevations | M |
 | Revisions and a revision schedule on title blocks (revision clouds: done, as a detail line drawn as scallops, with its revision as a label that `elements` lists; nothing else reads it) | M |
@@ -151,14 +153,14 @@ The goal is that BIMCraft fits into a mixed-software office.
 
 | Item | Size | Notes |
 |---|---|---|
-| ~~DXF import (as a link or underlay in a view)~~ and DXF export of views and sheets | L | Import done: `import_cad`, `cad_layers`, `reload_cad` and `cad_query`, Insert > Import CAD and Link CAD, Visibility/Graphics' Imported Categories ([docs/areas/cad-import.md](docs/areas/cad-import.md)). Export, exploding an import into detail lines, and images and PDFs as underlays are still to come. Use the public DXF reference. Native DWG needs a licensed SDK or a GPL library, which conflicts with MIT or Apache, so DXF comes first and DWG is decided separately |
+| ~~DXF import (as a link or underlay in a view)~~ and DXF export of views and sheets | L | Import done: `import_cad`, `cad_layers`, `reload_cad` and `cad_query`, Insert > Import CAD and Link CAD, Visibility/Graphics' Imported Categories ([docs/areas/cad-import.md](docs/areas/cad-import.md)). Export, exploding an import into detail lines, and images and PDFs as underlays are still to come. DWG comes in through acadrust (MPL-2.0, unmodified; section 6). Use the public DXF reference |
 | Revit `.rvt` reader, in three parts, all done: the container, metadata and element inventory (`bimcraft-cli info`); the elements into the model (levels, walls, floors, ceilings, doors, windows, columns, rooms and roofs, through `run`, `convert` and the MCP `open`); File > Open in the desktop (a thread of its own, a report of what was left out) | L | Read only under the fence in [docs/rvt-provenance.md](docs/rvt-provenance.md); `crates/rvt`, Apache-2.0 only. IFC stays the way out. Left in the import: curtain walls, sloped floors and roofs by footprint, roofs by extrusion that are not a straight-line profile, a column's section shape, stairs and railings, groups, door swings, the join lists, and names for the categories `info` prints as bare ids (no table of Autodesk's `BuiltInCategory` values to check against a file was found). The desktop cannot cancel an import in flight |
 | ~~Linked models: other `.bimcraft` and IFC files as references, positioned shared or origin to origin~~ | L | Done, origin to origin: `link` and `reload`, Manage > Link Model, a Linked Models group in the Project Browser. Shared coordinates, links in sections' cut poché by category, a link's own view overrides, hiding or unloading one in a view, and nested links are still to come (issue #36) |
-| IFC export completeness: `Pset_*Common`, `Qto_*BaseQuantities`, space boundaries, classification references, an IFC4x3 option | L | Keep validating with IfcOpenShell |
+| IFC export completeness: the rest of `Pset_*Common` (`LoadBearing` and a phased project's `Status` are written), `Qto_*BaseQuantities` of the rest (spaces, walls, slabs, doors and windows have theirs), space boundaries, classification references, an IFC4x3 option | L | Keep validating with IfcOpenShell |
 | glTF 2.0 and OBJ export (for visualisation and the web) | M | |
 | gbXML export (rooms and spaces, surfaces, openings) for energy tools | M | |
 | BCF 3.0 import and export: issues with viewpoints, opened in views | M | |
-| Schedules to XLSX; CSV import of parameters (schedules export to CSV today) | S | |
+| CSV import of parameters (schedules export to CSV and XLSX today) | S | |
 | Clash detection between categories (solid intersection), reported as BCF | M | High value once the geometry is there |
 | Point clouds: PTS, XYZ, PLY, LAS and E57 import, shown in 3D, plans and sections, with snaps to their points | L | Public specifications only (ASPRS LAS 1.2 to 1.4, ASTM E2807). A cloud is project data placed by an element, capped and thinned on import, its origin moved so survey coordinates fit. LAZ needs a LASzip port and ReCap's RCP/RCS are closed, so neither comes in. IFC4 has no point cloud in common use, so export leaves them out and says so |
 
@@ -171,7 +173,7 @@ The goal is that someone could run a real small project on it.
 
 | Item | Size |
 |---|---|
-| GPU renderer (wgpu) for 3D: shaded views draw on the card since 0.7 (opt-in), and surfaces seen through; still to come there are hidden line and wireframe, and then plans, perspective cameras, a section box, walkthroughs, shadows and sun, silhouettes | L |
+| GPU renderer (wgpu) for 3D: shaded views draw on the card since 0.7 (opt-in), and surfaces seen through; still to come there are hidden line and wireframe, and then plans, a section box, walkthroughs, shadows and sun, silhouettes | L |
 | A navigation gizmo, steering and orbit around the selection; tiled windows (views already float in windows of their own, and palettes dock and float). Not Revit's ViewCube, which is Autodesk's trademark and design: an original one in the manner of Blender's open-source navigation gizmo (axis balls to click to look along an axis, drag to orbit), drawn in code | M |
 | Editable keyboard shortcuts; project templates of BIMCraft's own on the start page | S |
 | Accessibility: keyboard reach for every dialog and screen-reader labels (egui's AccessKit) | M |
@@ -231,7 +233,7 @@ incremental validation (0.5), and links (0.9).
 | **Structure** | First slice done: beams, structural columns, isolated and wall footings, structural floors, with types, schedules, IFC and the Structure tab ([design](docs/disciplines.md)). Left: braces (a sloped run, `IfcMember`), joins and framing types, slab foundations, beam systems, an analytical model exported to open formats | L |
 | **Site** | Toposolids from points or contours (and imported DXF or LandXML), pads, property lines with bearings, cut and fill quantities | L |
 | **Massing** | Extruded and lofted masses (a top outline, or a lean for a sloped one), mass floors you can run again, gross floor area, Show Mass, and walls, floors and roofs by face that follow the mass on Update to Face are in. Left: blends between outlines of different corner counts, revolved masses, curtain systems by face, and elements that follow the mass by themselves | M |
-| **MEP** | First slice done: the Plumbing, Electrical, SPDA (lightning protection) and Data tabs, designed with Structure's in [docs/disciplines.md](docs/disciplines.md): pipes, conduits, cable trays, wires, conductors and cabling as runs in systems (`IfcSystem`), fixtures, fittings, boards, devices, terminals, outlets and racks as family categories with starter families of their own drawing, schedules, IFC out and back. Left: fittings and connectors (a pipe network that knows where it ends), auto-routing, sizing, circuits and panel schedules, a family kind for IFC predefined types (a basin from a WC), Visibility/Graphics by fixture category | XL+ |
+| **MEP** | First slice done: the Plumbing, Electrical, SPDA (lightning protection) and Data tabs, designed with Structure's in [docs/disciplines.md](docs/disciplines.md): pipes, conduits, cable trays, wires, conductors and cabling as runs in systems (`IfcSystem`), fixtures, fittings, boards, devices, terminals, outlets and racks as family categories with starter families of their own drawing, schedules, IFC out and back. Electrical devices carry connectors (voltage, poles, load and power factor for each type). Left: fittings and pipe connectors (a pipe network that knows where it ends), auto-routing, sizing, circuits and panel schedules, a family kind for IFC predefined types (a basin from a WC), Visibility/Graphics by fixture category | XL+ |
 
 Structure and site come before MEP: they are smaller, they reuse the existing solids and hosting, and architects need
 them sooner.
@@ -244,8 +246,10 @@ them sooner.
   existing `Scene` abstraction, as an opt-in path with the processor as its reference and its fallback; see [performance](docs/performance.md).
 - **Whole-model rebuilds** after every command are simple and safe, but they set the ceiling on model size. The
   incremental work in 0.5 must keep the "validate in one place" rule: still one `check`, just scoped.
-- **DWG.** No permissively licensed DWG library exists. Decide between DXF only, an optional commercial SDK plug-in, and
-  a separately licensed GPL helper process.
+- **DWG.** Read through acadrust (pure Rust, MPL-2.0, its DWG code ported from ACadSharp, MIT, after the Open Design
+  Alliance's published specification), used unmodified as a separate library behind the apps' `dwg` feature (`crates/dwg`):
+  MPL-2.0's copyleft covers its own files only, so it suits MIT or Apache. Its decoder can't be interrupted, so the apps run it
+  in a child process; a file that brings it down takes only the child. Writing DWG is still open.
 - **The family editor's sketch mode** is as big as a small CAD program. Keep text, JSON and form-defined families working
   throughout, so agents and power users never wait on it.
 - **egui** suits a thin UI, but dense dialogs (schedules, V/G, the family editor) push it. Keep the core UI-free so a

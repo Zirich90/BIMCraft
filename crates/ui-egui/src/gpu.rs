@@ -24,7 +24,7 @@ const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// A vertex (see [`Vertex`]) as the card takes it: its position as three floats, its two normals as four 16-bit signed fractions
 /// each (the fourth 0), and its four words. 44 bytes, not the 52 of floats.
 const STRIDE: u64 = 44;
-const GLOBALS: u64 = 7 * 16;
+const GLOBALS: u64 = 8 * 16;
 /// An owner's edge and tint colours, a skin's parts and a segment's ends and colour: 2, 3 and 3 vec4s.
 const OWNER: u64 = 32;
 const SKIN: u64 = 48;
@@ -429,14 +429,19 @@ impl Gpu {
         let (width, height) = (w as f32, h as f32);
         let through = up.clear_from < up.count;
         let mut globals = Words::new();
-        put(&mut globals, &[view.right[0], view.right[1], view.right[2], 2.0 * view.scale / width]);
-        put(&mut globals, &[view.up[0], view.up[1], view.up[2], 2.0 * view.scale / height]);
+        // In perspective, a mm a mm in front of the eye: the focal length.
+        let across = view.perspective.map_or(view.scale, |p| p.focal);
+        put(&mut globals, &[view.right[0], view.right[1], view.right[2], 2.0 * across / width]);
+        put(&mut globals, &[view.up[0], view.up[1], view.up[2], 2.0 * across / height]);
         put(&mut globals, &[view.back[0], view.back[1], view.back[2], 0.5 / view.depth]);
         put(&mut globals, &[view.target[0], view.target[1], view.target[2], view.scale]);
         put(&mut globals, &[mesh.origin[0] as f32, mesh.origin[1] as f32, mesh.origin[2] as f32, 0.0]);
         put(&mut globals, &[rgb(ground)[0], rgb(ground)[1], rgb(ground)[2], 0.0]);
         // 1.5 px, as the processor lets a line show through a surface that near.
-        put(&mut globals, &[width, height, 1.5 / view.scale * 0.5 / view.depth, if through { 1.0 } else { 0.0 }]);
+        let slack = view.perspective.map_or(1.5 / view.scale * 0.5 / view.depth, |p| 1.5 / p.focal);
+        put(&mut globals, &[width, height, slack, if through { 1.0 } else { 0.0 }]);
+        let lens = view.perspective.map_or([0.0; 4], |p| [p.focal, p.eye, p.a, p.b]);
+        put(&mut globals, &lens);
         write(&self.globals, &globals);
         let bind = up.bind.get_or_insert_with(|| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -690,8 +695,13 @@ mod tests {
     /// than six levels of a channel from it.
     fn draws_as_the_processor(gpu: &mut Gpu, s: &Session, tints: &[(Id, Rgb)]) {
         let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
+        draws_through(gpu, s, tints, scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look));
+    }
+
+    /// [`draws_as_the_processor`] through `cam`.
+    fn draws_through(gpu: &mut Gpu, s: &Session, tints: &[(Id, Rgb)], cam: Camera) {
+        let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
         let mesh = Arc::new(Mesh::new(&scene, &look).unwrap());
-        let cam = scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look);
         let cpu = scene.render_in(&cam, tints, &look);
         gpu.draw(&mesh, &cam, tints, PAPER).unwrap();
         let pixels = read(gpu);
@@ -730,6 +740,26 @@ mod tests {
         draws_as_the_processor(&mut gpu, &s, &[(level, Rgb(0, 120, 215)), (*wall, Rgb(255, 160, 0))]);
     }
 
+    fn inside(s: &Session, cam: Camera) -> Camera {
+        bimcraft_core::view3d::inside(&s.model, cam)
+    }
+
+    #[test]
+    fn the_card_draws_in_perspective_what_the_processor_does_from_afar_and_from_among_the_walls() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no graphics adapter here: the card's picture is not compared");
+            return;
+        };
+        let s = sample();
+        let (scene, look) = (Scene::new(&s.model), Look::of_3d(&s.model));
+        let flat = scene.fit_in(AZIMUTH, ELEVATION, 640, 480, &look);
+        let cam = scene.fit_from(Camera { lens: Some(bimcraft_core::view3d::LENS), ..flat }, &look);
+        let level = s.model.levels().first().unwrap().0;
+        draws_through(&mut gpu, &s, &[(level, Rgb(0, 120, 215))], cam);
+        // The eye inside the house, 1.6 m up, through a wide lens: what is behind it is cut away alike.
+        draws_through(&mut gpu, &s, &[], inside(&s, cam));
+    }
+
     #[test]
     fn the_card_draws_what_the_view_sees_through_as_the_processor_does() {
         let Some(mut gpu) = headless() else {
@@ -746,6 +776,22 @@ mod tests {
         // A mass is seen through unless the view says otherwise.
         s.execute("mass", &serde_json::json!({"level": "Level 1", "boundary": [[-3000, -3000], [3000, -3000], [3000, 3000], [-3000, 3000]], "height": 9000}))
             .unwrap();
+        draws_as_the_processor(&mut gpu, &s, &[]);
+    }
+
+    #[test]
+    fn the_card_draws_a_glass_layer_as_the_processor_does() {
+        let Some(mut gpu) = headless() else {
+            eprintln!("no graphics adapter here: the card's glass is not compared");
+            return;
+        };
+        let mut s = sample();
+        s.script(
+            r#"type {"category": "wall", "name": "Curtain", "layers": [{"material": "Glass", "thickness": 50}, {"material": "Concrete block", "thickness": 100}]}
+               wall {"points": [[-6000,-6000],[6000,-6000]], "type": "Curtain"}
+               column {"at": [0, -7000]}"#,
+        )
+        .unwrap();
         draws_as_the_processor(&mut gpu, &s, &[]);
     }
 

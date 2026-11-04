@@ -9,8 +9,9 @@
 // Lengths are mm. A colour is 0 to 255 in each channel, as the processor keeps it, and is divided down only on its way out.
 
 struct Globals {
-    // xyz: the picture's right, up and toward the camera (unit). w: how far a mm goes in clip space across and up, and how
-    // far in depth (0.5 over the depth the mesh reaches, which is half the clip volume, so depths are 0 to 1).
+    // xyz: the picture's right, up and toward the camera (unit). w: how far a mm goes in clip space across and up (at a mm in
+    // front of the eye, in perspective), and how far in depth (0.5 over the depth the mesh reaches, which is half the clip
+    // volume, so depths are 0 to 1).
     right: vec4<f32>,
     up: vec4<f32>,
     back: vec4<f32>,
@@ -20,9 +21,26 @@ struct Globals {
     origin: vec4<f32>,
     // rgb: the ground the surfaces stand on.
     ground: vec4<f32>,
-    // xy: the picture's size, px. z: how much nearer a surface may be than a line and still leave it showing, in depth.
-    // w: 1 where the view sees through something.
+    // xy: the picture's size, px. z: how much nearer a surface may be than a line and still leave it showing, in depth (in
+    // perspective, that over the depth a line is past the far end, 1.5 px over the focal length). w: 1 where the view sees
+    // through something.
     size: vec4<f32>,
+    // In perspective (x above 0), as the core's `Camera` projects: x the lens's focal length, px; y how far the eye is from
+    // the aim, mm; and the depth (larger nearer, 1 at the near plane and 0 at the far one) z + w / ahead, for a point ahead mm
+    // in front of the eye.
+    lens: vec4<f32>,
+}
+
+// A point `d` from the aim in clip space: parallel, or seen from the eye.
+fn to_clip(d: vec3<f32>) -> vec4<f32> {
+    let x = dot(d, g.right.xyz);
+    let y = dot(d, g.up.xyz);
+    let z = dot(d, g.back.xyz);
+    if g.lens.x > 0.0 {
+        let ahead = g.lens.y - z;
+        return vec4<f32>(x * g.right.w, y * g.up.w, g.lens.z * ahead + g.lens.w, ahead);
+    }
+    return vec4<f32>(x * g.right.w, y * g.up.w, 0.5 + z * g.back.w, 1.0);
 }
 
 struct Owner {
@@ -134,9 +152,8 @@ struct SceneOut {
 
 @vertex
 fn vs_scene(v: SceneIn) -> SceneOut {
-    let d = v.position - g.aim.xyz;
     var o: SceneOut;
-    o.clip = vec4<f32>(dot(d, g.right.xyz) * g.right.w, dot(d, g.up.xyz) * g.up.w, 0.5 + dot(d, g.back.xyz) * g.back.w, 1.0);
+    o.clip = to_clip(v.position - g.aim.xyz);
     let n = normalize(v.normal.xyz);
     o.light = vec2<f32>(lit(n), lit(-n));
     o.base = vec3<f32>(f32(v.color & 255u), f32((v.color >> 8u) & 255u), f32((v.color >> 16u) & 255u));
@@ -262,6 +279,15 @@ struct LineOut {
 // Where a model point is in the picture: its pixel, and its depth (0 to 1; larger is nearer).
 fn to_pixel(p: vec3<f32>) -> vec3<f32> {
     let d = p - g.aim.xyz;
+    if g.lens.x > 0.0 {
+        let ahead = g.lens.y - dot(d, g.back.xyz);
+        let k = g.lens.x / ahead;
+        return vec3<f32>(
+            g.size.x * 0.5 + dot(d, g.right.xyz) * k,
+            g.size.y * 0.5 - dot(d, g.up.xyz) * k,
+            g.lens.z + g.lens.w / ahead,
+        );
+    }
     return vec3<f32>(
         g.size.x * 0.5 + dot(d, g.right.xyz) * g.aim.w,
         g.size.y * 0.5 - dot(d, g.up.xyz) * g.aim.w,
@@ -296,7 +322,11 @@ fn vs_line(@builtin(vertex_index) i: u32, @builtin(instance_index) k: u32) -> Li
 @fragment
 fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     let behind = textureLoad(scene_depth, vec2<i32>(in.clip.xy), 0);
-    if behind > 0.0 && behind > in.depth + g.size.z {
+    var slack = g.size.z;
+    if g.lens.x > 0.0 {
+        slack = g.size.z * (in.depth - g.lens.z);
+    }
+    if behind > 0.0 && behind > in.depth + slack {
         discard;
     }
     return vec4<f32>(in.color / 255.0, 1.0);

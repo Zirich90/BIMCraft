@@ -1,9 +1,11 @@
 //! Point clouds: Insert > Point Cloud asks for scan files, then a box for how to bring them in (name, units, spacing,
 //! positioning, as Revit's Link Point Cloud asks), and runs `point_cloud`.
 
+use crate::popup::Modal;
+
 use std::path::PathBuf;
 
-use egui::{Align, Button, Context, Grid, Id as UiId, Layout, Modal, RichText, TextEdit};
+use egui::{Align, Button, Context, Grid, Id as UiId, Layout, RichText, TextEdit};
 use serde_json::json;
 
 use crate::BimApp;
@@ -44,46 +46,47 @@ impl BimApp {
     pub(crate) fn point_cloud_window(&mut self, ctx: &Context) {
         let Some(b) = self.cloud_box.as_mut() else { return };
         let (mut ok, mut close) = (false, false);
-        let r = Modal::new(UiId::new("point-cloud")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.label(RichText::new(t("Point Cloud")).heading());
-            ui.add_space(6.0);
-            let what = match b.paths.as_slice() {
-                [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                all => tf("{} files, brought in as one scan's stations", &[&all.len().to_string()]),
-            };
-            ui.label(what);
-            ui.add_space(6.0);
-            Grid::new("point-cloud-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                let l = ui.label(t("Name"));
-                ui.add_sized([220.0, 20.0], TextEdit::singleline(&mut b.name)).labelled_by(l.id);
-                ui.end_row();
-                let l = ui.label(t("Units"));
-                let c = egui::ComboBox::from_id_salt("point-cloud-units").selected_text(b.units).show_ui(ui, |ui| {
-                    for u in UNITS {
-                        ui.selectable_value(&mut b.units, u, u);
-                    }
-                });
-                c.response.labelled_by(l.id);
-                ui.end_row();
-                let l = ui.label(t("Spacing (mm)"));
-                ui.add_sized([220.0, 20.0], TextEdit::singleline(&mut b.spacing).hint_text(t("all the points"))).labelled_by(l.id);
-                ui.end_row();
-            });
-            ui.add_space(6.0);
-            ui.label(t("Positioning"));
-            ui.radio_value(&mut b.by_file, false, t("Auto - Center to Center"))
-                .on_hover_text(t("Its middle on the project's origin and its foot on the level"));
-            ui.radio_value(&mut b.by_file, true, t("Auto - Origin to Origin"))
-                .on_hover_text(t("Where its file's coordinates put it, as the survey placed it"));
-            if let Some(e) = &b.error {
+        let r = Modal::new(UiId::new("point-cloud"), t("Point Cloud")).width(440.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
                 ui.add_space(6.0);
-                ui.label(RichText::new(e).color(pal().error));
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                close = ui.button(t("Cancel")).clicked();
-                ok = ui.add_enabled(!b.name.trim().is_empty(), Button::new(t("OK"))).clicked();
+                let what = match b.paths.as_slice() {
+                    [one] => one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    all => tf("{} files, brought in as one scan's stations", &[&all.len().to_string()]),
+                };
+                ui.label(what);
+                ui.add_space(6.0);
+                Grid::new("point-cloud-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    let l = ui.label(t("Name"));
+                    ui.add_sized([220.0, 20.0], TextEdit::singleline(&mut b.name)).labelled_by(l.id);
+                    ui.end_row();
+                    let l = ui.label(t("Units"));
+                    let c = egui::ComboBox::from_id_salt("point-cloud-units").selected_text(b.units).show_ui(ui, |ui| {
+                        for u in UNITS {
+                            ui.selectable_value(&mut b.units, u, u);
+                        }
+                    });
+                    c.response.labelled_by(l.id);
+                    ui.end_row();
+                    let l = ui.label(t("Spacing (mm)"));
+                    ui.add_sized([220.0, 20.0], TextEdit::singleline(&mut b.spacing).hint_text(t("all the points"))).labelled_by(l.id);
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.label(t("Positioning"));
+                ui.radio_value(&mut b.by_file, false, t("Auto - Center to Center"))
+                    .on_hover_text(t("Its middle on the project's origin and its foot on the level"));
+                ui.radio_value(&mut b.by_file, true, t("Auto - Origin to Origin"))
+                    .on_hover_text(t("Where its file's coordinates put it, as the survey placed it"));
+                if let Some(e) = &b.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).color(pal().error));
+                }
+            });
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    close = ui.button(t("Cancel")).clicked();
+                    ok = ui.add_enabled(!b.name.trim().is_empty(), Button::new(t("OK"))).clicked();
+                });
             });
         });
         if ok {
