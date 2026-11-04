@@ -3593,6 +3593,20 @@ impl BimApp {
     }
 
     fn manage_tab(&mut self, ui: &mut Ui) {
+        panel(ui, msg!("Units"), |ui| {
+            let now = self.session.model.units;
+            let tip = tf("Project Units (UN): how lengths show and read; now {}", &[&t(now.label()).to_lowercase()]);
+            let r = big_button(ui, Icon::Units, msg!("Project Units"), false, &tip);
+            let asked = self.open_units;
+            let opened = ribbon::choices(ui, &r, asked, |ui| {
+                for u in Units::ALL {
+                    if ui.selectable_label(u == now, t(u.label())).clicked() {
+                        self.run("units", json!({"length": u.name()}));
+                    }
+                }
+            });
+            self.open_units &= !opened;
+        });
         panel(ui, msg!("Links"), |ui| {
             if big_button(
                 ui,
@@ -3611,6 +3625,12 @@ impl BimApp {
             }
         });
         panel(ui, "Settings", |ui| {
+            let tip = msg!(
+                "Electrical Settings: the voltages, distribution systems and wire types circuits and panels refer to; sections in mm²"
+            );
+            if big_button(ui, Icon::Wire, "Electrical Settings", self.electrical_dialog.is_some(), tip).clicked() {
+                self.electrical_dialog = Some(electrical::ElectricalDialog::new(&self.session.model));
+            }
             let tip = msg!("Keyboard Shortcuts (KS): customize, edit, and load shortcut keys");
             if big_button(ui, Icon::Keyboard, "Shortcuts", self.show_shortcuts, tip).clicked() {
                 self.show_shortcuts = true;
@@ -3627,18 +3647,6 @@ impl BimApp {
                 if stacked_button(ui, Icon::Snaps, "Snaps", self.show_snaps, tip).clicked() {
                     self.show_snaps = true;
                 }
-                let now = self.session.model.units;
-                let tip = tf("Project Units (UN): how lengths show and read; now {}", &[&t(now.label()).to_lowercase()]);
-                let r = stacked_button(ui, Icon::Units, msg!("Project Units"), false, &tip);
-                let asked = self.open_units;
-                let opened = ribbon::choices(ui, &r, asked, |ui| {
-                    for u in Units::ALL {
-                        if ui.selectable_label(u == now, t(u.label())).clicked() {
-                            self.run("units", json!({"length": u.name()}));
-                        }
-                    }
-                });
-                self.open_units &= !opened;
             });
             let tip = msg!("Materials: the project's library, each material's colour in 3D and the patterns its cut and its surfaces show");
             if big_button(ui, Icon::Materials, "Materials", self.materials_dialog.is_some(), tip).clicked() {
@@ -3687,12 +3695,6 @@ impl BimApp {
             let tip = tf("Technical Standards: configure drawing standards (NBR, ISO, ANSI, EU); now {}", &[t(now_std.short_name())]);
             if big_button(ui, Icon::Settings, "Technical Standards", self.standards_dialog.is_some(), &tip).clicked() {
                 self.standards_dialog = Some(standards::StandardsDialog::new(&self.session.model));
-            }
-            let tip = msg!(
-                "Electrical Settings: the voltages, distribution systems and wire types circuits and panels refer to; sections in mm²"
-            );
-            if big_button(ui, Icon::Wire, "Electrical Settings", self.electrical_dialog.is_some(), tip).clicked() {
-                self.electrical_dialog = Some(electrical::ElectricalDialog::new(&self.session.model));
             }
             // Where a room's area is measured, as Revit's Room Area Computation.
             let now = self.session.model.room_area;
