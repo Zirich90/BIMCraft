@@ -4727,9 +4727,11 @@ fn the_units_shortcut_gets_to_the_choices_in_the_smallest_window_too() {
     h.set_size(vec2(crate::window::MIN_SIZE[0], crate::window::MIN_SIZE[1]));
     h.run();
     shortcut(&mut h, "UN");
-    assert!(egui::Popup::is_any_open(&h.ctx), "the panel's list is open");
-    let row = h.get_by_label("Project Units").rect().center();
-    click_at(&mut h, row);
+    assert!(egui::Popup::is_any_open(&h.ctx), "the units choices or their panel list is open");
+    if h.query_by_label("Feet and inches").is_none() {
+        let row = h.get_by_label("Project Units").rect().center();
+        click_at(&mut h, row);
+    }
     press(&mut h, "Feet and inches");
     assert_eq!(h.state().session.model.units, bimcraft_core::units::Units::FeetInches);
 }
