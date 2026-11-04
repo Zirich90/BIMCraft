@@ -5635,11 +5635,11 @@ fn a_project_is_saved_as_the_current_format_and_older_files_open_but_newer_files
         }
     }
     assert!(full["elements"].as_object().unwrap().len() > 5);
-    // A project in Dutch is saved as format 12, which is what tells a build that doesn't know `nl` to refuse it.
+    // A project in Dutch is saved in the current format and retains its language code.
     let mut dutch = Session::new();
     run(&mut dutch, "new", json!({"language": "nl"}));
     let v = serde_json::to_value(&*dutch.model).unwrap();
-    assert_eq!((v["format"].clone(), v["language"].clone()), (json!(12), json!("nl")));
+    assert_eq!((v["format"].clone(), v["language"].clone()), (json!(crate::model::FORMAT), json!("nl")));
     // A newer file says what it is and what to do, even when nothing else in it is wrong.
     let mut newer = empty.clone();
     newer["format"] = json!(crate::model::FORMAT + 1);
