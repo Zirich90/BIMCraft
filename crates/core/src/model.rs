@@ -3315,7 +3315,7 @@ impl Model {
     /// Read from a project file, with what this BIMCraft doesn't know of it left out: a field a newer one added, or a
     /// misspelled one. The fields left out come back as JSON pointers into the file (`/elements/100004/finish`). A file
     /// of a newer format is refused whole, since what changed may be more than a field.
-    fn prepare_old_element(e: &mut serde_json::Value) {
+    fn prepare_old_element(e: &mut serde_json::Value, merge_carriers: bool) {
         let Some(map) = e.as_object_mut() else { return };
         let category = map.get("category").and_then(|v| v.as_str());
         match category {
@@ -3339,7 +3339,7 @@ impl Model {
                 map.insert("start".into(), serde_json::json!([0, 0]));
                 map.insert("end".into(), serde_json::json!([0, 0]));
             }
-            Some("conduit") | Some("cabletray") => {
+            Some("conduit") | Some("cabletray") if merge_carriers => {
                 map.insert("category".into(), serde_json::json!("cablecarrier"));
             }
             _ => {}
@@ -3347,10 +3347,10 @@ impl Model {
     }
 
     /// Category references in old schedules, view overrides, filters and project parameters follow their elements.
-    fn prepare_old_categories(v: &mut serde_json::Value) {
+    fn prepare_old_categories(v: &mut serde_json::Value, merge_carriers: bool) {
         use serde_json::Value;
         let category = |s: &str| match s {
-            "conduit" | "conduits" | "cabletray" | "cabletrays" => Some("cablecarrier"),
+            "conduit" | "conduits" | "cabletray" | "cabletrays" if merge_carriers => Some("cablecarrier"),
             "circuit" | "circuits" => Some("wire"),
             _ => None,
         };
@@ -3371,7 +3371,9 @@ impl Model {
                     match o.get_mut(key) {
                         Some(Value::Object(categories)) => {
                             for old in ["conduit", "cabletray", "circuit"] {
-                                if let (Some(value), Some(new)) = (categories.remove(old), category(old)) {
+                                if let Some(new) = category(old)
+                                    && let Some(value) = categories.remove(old)
+                                {
                                     categories.entry(new).or_insert(value);
                                 }
                             }
@@ -3389,12 +3391,12 @@ impl Model {
                     }
                 }
                 for child in o.values_mut() {
-                    Self::prepare_old_categories(child);
+                    Self::prepare_old_categories(child, merge_carriers);
                 }
             }
             Value::Array(a) => {
                 for child in a {
-                    Self::prepare_old_categories(child);
+                    Self::prepare_old_categories(child, merge_carriers);
                 }
             }
             _ => {}
@@ -3414,6 +3416,7 @@ impl Model {
         if format < 4 {
             pens_from_pixels(&mut v);
         }
+        let merge_carriers = format < 8 && v.pointer("/types/runs/cablecarrier").is_none();
         let mut old_wires = Vec::new();
         if format < 8 {
             if let Some(Value::Object(es)) = v.get_mut("elements") {
@@ -3421,23 +3424,23 @@ impl Model {
                     if e.get("category").and_then(Value::as_str) == Some("circuit") {
                         old_wires.push(id.parse::<Id>().map_err(|e| e.to_string())?);
                     }
-                    Model::prepare_old_element(e);
+                    Model::prepare_old_element(e, merge_carriers);
                 }
             }
-            if let Some(Value::Object(library)) = v.get_mut("library") {
+            if merge_carriers && let Some(Value::Object(library)) = v.get_mut("library") {
                 for entry in library.values_mut() {
                     if matches!(entry.get("kind").and_then(Value::as_str), Some("type:conduit" | "type:cabletray")) {
                         entry["kind"] = serde_json::json!("type:cablecarrier");
                     }
                 }
             }
-            Self::prepare_old_categories(&mut v);
+            Self::prepare_old_categories(&mut v, merge_carriers);
             if let Some(Value::Object(groups)) = v.get_mut("detail_groups") {
                 for (_, group) in groups.iter_mut() {
                     if let Some(Value::Array(members)) = group.get_mut("members") {
                         for member in members.iter_mut() {
                             if let Some(e) = member.get_mut("element") {
-                                Model::prepare_old_element(e);
+                                Model::prepare_old_element(e, merge_carriers);
                             }
                         }
                     }
@@ -3485,6 +3488,13 @@ impl Model {
             v["elements"] = elements;
         }
         let mut m: Model = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        if merge_carriers {
+            for old in ["conduit", "cabletray"] {
+                if let Some(types) = m.types.runs.remove(old) {
+                    m.types.runs.entry("cablecarrier".into()).or_default().extend(types);
+                }
+            }
+        }
         m.migrate();
         m.names_from_file();
         for id in old_wires {
@@ -3561,13 +3571,6 @@ impl Model {
         // none of it, so reading it as 6 changes nothing.
         // 6 to 7 (CAD drawings, and the imports that place them) has none either.
         // 7 to 8 unifies the two carrier categories; their GUIDs still name the same types.
-        if self.format < 8 {
-            for old in ["conduit", "cabletray"] {
-                if let Some(types) = self.types.runs.remove(old) {
-                    self.types.runs.entry("cablecarrier".into()).or_default().extend(types);
-                }
-            }
-        }
         // 8 to 9 defaults library placeholders to false; older readers must not bill retained placeholder geometry.
         // 9 to 10 defaults components to placed; older readers must not place nonspatial equipment or miscount quantities.
         // 10 to 11 defaults pending catalogue identities to empty; older readers must not drop unexported products on open.

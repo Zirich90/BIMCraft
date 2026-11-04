@@ -184,7 +184,9 @@ fn old_circuits_and_carrier_types_migrate_without_losing_ids_or_references() {
         let category = if ty["round"] == true { "conduit" } else { "cabletray" };
         types.get_mut(category).unwrap()[name] = ty.clone();
     }
-    for entry in file["library"].as_object_mut().unwrap().values_mut() {
+    let library = file["library"].as_object_mut().unwrap();
+    library.retain(|_, entry| !matches!(entry["kind"].as_str(), Some("type:conduit" | "type:cabletray")));
+    for entry in library.values_mut() {
         if entry["kind"] == "type:cablecarrier" {
             let name = entry["name"].as_str().unwrap();
             entry["kind"] = json!(if s.model.types.runs["cablecarrier"][name].round { "type:conduit" } else { "type:cabletray" });
