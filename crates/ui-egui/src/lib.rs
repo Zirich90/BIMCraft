@@ -3623,31 +3623,12 @@ impl BimApp {
             if big_button(ui, Icon::Favorite, "Favorites", self.favorites_dialog.is_some(), tip).clicked() {
                 self.open_favorites();
             }
-            // Object styles, snaps and units, stacked.
-            stacked(ui, |ui| {
-                let tip = msg!("Object Styles: the pen each category draws in, seen and cut, in every view");
-                if stacked_button(ui, Icon::ObjectStyles, "Object Styles", self.object_styles_dialog.is_some(), tip).clicked() {
-                    self.object_styles_dialog = Some(objectstyles::ObjectStylesDialog::new(&self.session.model));
-                }
-                let tip = msg!(
-                    "Snaps: what a picked point sticks to (ends, middles, crossings, centres, perpendiculars), and the angles it steps by; SE, SM, SI, SC, SP and SN take one alone for the next point, SO none"
-                );
-                if stacked_button(ui, Icon::Snaps, "Snaps", self.show_snaps, tip).clicked() {
-                    self.show_snaps = true;
-                }
-                let now = self.session.model.units;
-                let tip = tf("Project Units (UN): how lengths show and read; now {}", &[&t(now.label()).to_lowercase()]);
-                let r = stacked_button(ui, Icon::Units, msg!("Project Units"), false, &tip);
-                let asked = self.open_units;
-                let opened = ribbon::choices(ui, &r, asked, |ui| {
-                    for u in Units::ALL {
-                        if ui.selectable_label(u == now, t(u.label())).clicked() {
-                            self.run("units", json!({"length": u.name()}));
-                        }
-                    }
-                });
-                self.open_units &= !opened;
-            });
+            let tip = msg!(
+                "Electrical Settings: the voltages, distribution systems and wire types circuits and panels refer to; sections in mm²"
+            );
+            if big_button(ui, Icon::Wire, "Electrical Settings", self.electrical_dialog.is_some(), tip).clicked() {
+                self.electrical_dialog = Some(electrical::ElectricalDialog::new(&self.session.model));
+            }
             let tip = msg!("Project Parameters: values of your own each element of their categories holds, for schedules and IFC");
             if big_button(ui, Icon::Parameters, "Project Parameters", self.parameters_dialog.is_some(), tip).clicked() {
                 self.parameters_dialog = Some(properties::ParametersDialog::new(&self.session.model));
@@ -3688,12 +3669,31 @@ impl BimApp {
             if big_button(ui, Icon::Settings, "Technical Standards", self.standards_dialog.is_some(), &tip).clicked() {
                 self.standards_dialog = Some(standards::StandardsDialog::new(&self.session.model));
             }
-            let tip = msg!(
-                "Electrical Settings: the voltages, distribution systems and wire types circuits and panels refer to; sections in mm²"
-            );
-            if big_button(ui, Icon::Wire, "Electrical Settings", self.electrical_dialog.is_some(), tip).clicked() {
-                self.electrical_dialog = Some(electrical::ElectricalDialog::new(&self.session.model));
-            }
+            // Object styles, snaps and units, stacked.
+            stacked(ui, |ui| {
+                let tip = msg!("Object Styles: the pen each category draws in, seen and cut, in every view");
+                if stacked_button(ui, Icon::ObjectStyles, "Object Styles", self.object_styles_dialog.is_some(), tip).clicked() {
+                    self.object_styles_dialog = Some(objectstyles::ObjectStylesDialog::new(&self.session.model));
+                }
+                let tip = msg!(
+                    "Snaps: what a picked point sticks to (ends, middles, crossings, centres, perpendiculars), and the angles it steps by; SE, SM, SI, SC, SP and SN take one alone for the next point, SO none"
+                );
+                if stacked_button(ui, Icon::Snaps, "Snaps", self.show_snaps, tip).clicked() {
+                    self.show_snaps = true;
+                }
+                let now = self.session.model.units;
+                let tip = tf("Project Units (UN): how lengths show and read; now {}", &[&t(now.label()).to_lowercase()]);
+                let r = stacked_button(ui, Icon::Units, msg!("Project Units"), false, &tip);
+                let asked = self.open_units;
+                let opened = ribbon::choices(ui, &r, asked, |ui| {
+                    for u in Units::ALL {
+                        if ui.selectable_label(u == now, t(u.label())).clicked() {
+                            self.run("units", json!({"length": u.name()}));
+                        }
+                    }
+                });
+                self.open_units &= !opened;
+            });
             // Where a room's area is measured, as Revit's Room Area Computation.
             let now = self.session.model.room_area;
             let tip = tf("Room Area Computation: where room areas are measured; now {}", &[&t(now.label()).to_lowercase()]);

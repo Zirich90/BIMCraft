@@ -919,7 +919,7 @@ fn ks_lists_every_shortcut_and_every_one_it_lists_works() {
     assert!(h.query_by_label("Create Similar").is_none());
     // UN, as Revit's opens Project Units: Manage's Project Units menu.
     shortcut(&mut h, "UN");
-    press(&mut h, "Feet and inches");
+    choose_feet_and_inches(&mut h);
     assert_eq!(h.state().session.model.units.name(), "ft-in");
     // Any two letters do something exactly when the dialog lists them, and it names each in every language.
     let listed: Vec<&str> = crate::shortcuts().iter().map(|(letters, _)| *letters).collect();
@@ -2677,7 +2677,11 @@ fn place_view_puts_schedules_and_the_3d_view_on_sheets() {
 fn project_units_show_and_read_lengths_in_feet_and_inches() {
     let mut h = app(BOX);
     press(&mut h, "Manage");
-    press(&mut h, "Project Units");
+    if h.query_by_label("Project Units").is_some() {
+        press(&mut h, "Project Units");
+    } else {
+        from_list(&mut h, "Settings", "Project Units");
+    }
     press(&mut h, "Feet and inches");
     assert_eq!(h.state().session.model.units.name(), "ft-in");
     // The bottom wall, 8000 mm long, in Properties; a base offset typed in feet and inches.
@@ -4727,13 +4731,17 @@ fn the_units_shortcut_gets_to_the_choices_in_the_smallest_window_too() {
     h.set_size(vec2(crate::window::MIN_SIZE[0], crate::window::MIN_SIZE[1]));
     h.run();
     shortcut(&mut h, "UN");
+    choose_feet_and_inches(&mut h);
+    assert_eq!(h.state().session.model.units, bimcraft_core::units::Units::FeetInches);
+}
+
+fn choose_feet_and_inches(h: &mut Harness<BimApp>) {
     assert!(egui::Popup::is_any_open(&h.ctx), "the units choices or their panel list is open");
     if h.query_by_label("Feet and inches").is_none() {
         let row = h.get_by_label("Project Units").rect().center();
-        click_at(&mut h, row);
+        click_at(h, row);
     }
-    press(&mut h, "Feet and inches");
-    assert_eq!(h.state().session.model.units, bimcraft_core::units::Units::FeetInches);
+    press(h, "Feet and inches");
 }
 
 #[test]
