@@ -194,7 +194,7 @@ fn open_if_asked(ui: &Ui, r: &Response) {
 /// once (a shortcut's): true when that is done, or handed to the panel (a tab's first frame lays out every tool, so what shows
 /// is not known until the next). egui keeps one popup open: a popup of the row's own would close the list that holds the row, and
 /// with it itself, so in a list the choices are a submenu of it. A tool the panel has handed over or folded has no button on the
-/// ribbon to hang them from: a request to open them opens the panel's list, where its row is.
+/// ribbon to hang them from. A shortcut opens the panel list so its choices survive a change in tool visibility.
 pub(crate) fn choices(ui: &Ui, r: &Response, open: bool, content: impl FnOnce(&mut Ui)) -> bool {
     if listing() {
         egui::containers::menu::SubMenu::new().show(ui, r, content);
@@ -202,13 +202,10 @@ pub(crate) fn choices(ui: &Ui, r: &Response, open: bool, content: impl FnOnce(&m
     }
     let drawn = r.rect.is_positive() && ui.is_rect_visible(r.rect);
     let asked = open && FITTED.with(Cell::get);
-    if drawn {
-        if asked {
-            Popup::open_id(ui.ctx(), Popup::default_response_id(r));
-        }
-        Popup::menu(r).show(content);
-    } else if asked {
+    if asked {
         OPEN_LIST.with(|o| o.set(true));
+    } else if drawn {
+        Popup::menu(r).show(content);
     }
     asked
 }
