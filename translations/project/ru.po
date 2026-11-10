@@ -115,7 +115,7 @@ msgstr "Штрихпунктирная"
 msgid "Data Outlet"
 msgstr "Розетка информационная"
 
-#: crates/core/src/commands.rs:6821
+#: crates/core/src/commands.rs:6827
 msgid "Dependent"
 msgstr "Зависимый"
 
@@ -176,8 +176,8 @@ msgstr "Восток"
 msgid "Elbow 90"
 msgstr "Отвод 90"
 
-#: crates/core/src/commands.rs:6605
-#: crates/core/src/commands.rs:8434
+#: crates/core/src/commands.rs:6611
+#: crates/core/src/commands.rs:8440
 msgid "Elevation"
 msgstr "Фасад"
 
@@ -477,8 +477,8 @@ msgstr "Стяжка"
 msgid "Seat Height"
 msgstr "Высота сиденья"
 
-#: crates/core/src/commands.rs:6582
-#: crates/core/src/commands.rs:8433
+#: crates/core/src/commands.rs:6588
+#: crates/core/src/commands.rs:8439
 msgid "Section"
 msgstr "Разрез"
 
@@ -546,7 +546,7 @@ msgstr "Источник"
 msgid "South"
 msgstr "Юг"
 
-#: crates/core/src/commands.rs:7522
+#: crates/core/src/commands.rs:7528
 msgid "Specification Items"
 msgstr "Позиции спецификации"
 
@@ -598,7 +598,7 @@ msgstr "Тип"
 msgid "UP"
 msgstr "ВВЕРХ"
 
-#: crates/core/src/commands.rs:6962
+#: crates/core/src/commands.rs:6968
 msgid "Unnamed"
 msgstr "Без имени"
 

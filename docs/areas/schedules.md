@@ -70,17 +70,23 @@ values still fail atomically. This follows [ODF 1.3, sections 19.388–19.389](h
 A CLI-exported catalogue was resaved by LibreOffice Calc and reimported with
 project data and GUIDs unchanged (QA artifacts under `target/ods-qa`).
 Invalid rows roll back the complete import. Renaming an identified type through ODS
-is not supported yet. `catalogue_link {path}` binds an absolute external path,
-imports an existing catalogue or creates one; `{path:null}` detaches it without deleting
-the spreadsheet. Opening a saved project imports external replacements; a broken or
-missing catalogue leaves the saved model intact and reports `catalogue_not_loaded`.
-`catalogue_sync {}` protects existing model rows while accepting new blank-GUID rows.
+is not supported yet. `catalogue_link {path}` approves an external workbook for the
+current project, imports an existing catalogue or creates one. `{path:null}` detaches
+it without deleting the spreadsheet. The desktop keeps approvals by project path in
+user settings. CLI and MCP sessions keep their approvals in memory. Existing projects
+with a stored catalogue path require explicit approval again. Opening or recovering a
+project reads only an approved workbook and applies external replacements in memory.
+A broken or missing catalogue leaves the saved model intact and reports
+`catalogue_not_loaded`. `catalogue_sync {}` protects existing model rows while
+accepting new rows and writing the workbook. Pass `{"read_only":true}` to only read
+and apply new rows. A project opened with `open {"path":…,"read_only":true}` or backed
+by a read-only file cannot link, export, or synchronize with ODS writes.
 The session remembers GUIDs exported by its linked catalogue, independently of Undo/Redo.
 Rows for owned types removed by Undo are dropped on the next synchronization, with
 the original workbook backed up. Redo exports the original GUID again; an intervening
 edit that clears Redo does not resurrect the removed type. New/Open resets this
 runtime ownership set to the current document. Save and autosave also persist a bounded
-set of cancelled GUIDs, so saving immediately after Undo, before the next poll, does
+set of cancelled GUIDs, so saving immediately after Undo, before the next explicit sync, does
 not restore the cancelled product on reopening. Cleanup backs up the old ODS and then
 clears the saved cancellations; a failed read/write preserves them for a later retry.
 Detaching or linking a different workbook clears that workbook-specific cancellation set.
@@ -88,8 +94,8 @@ Saving does not modify the live model, Undo history or external workbook. The ba
 worker carries the ownership set alongside the original model snapshot, preserving
 the UI's snapshot identity without copying the model on the UI thread.
 Save and autosave also mark newly created product GUIDs which have not reached the linked
-workbook. On reopening, missing rows for these products are exported with a backup instead
-of becoming placeholders. A damaged workbook preserves this metadata across another Save
+workbook. On reopening, missing rows for these products are kept in the model instead
+of becoming placeholders. An explicit synchronization exports them with a backup. A damaged workbook preserves this metadata across another Save
 and subsequent retry. Successful synchronization clears it, so later external replacements
 remain authoritative when the project opens. A different external row carrying an unexported
 GUID reports a conflict and preserves both the workbook and saved model; normal open-model
@@ -99,8 +105,8 @@ these workbook-specific markers too. Format 11 prevents older readers from disca
 unexported products; earlier files default the marker set to empty.
 The session also retains the last synchronized product rows independently of Undo/Redo.
 Save and autosave persist comparison rows only for locally changed products. On opening,
-an unchanged external row is replaced with the pending model row, with the original
-workbook backed up. A row already equal to the model is accepted. A different external
+the pending model row stays in the model if the external row is unchanged. The original
+workbook is backed up when an explicit synchronization writes the row. A row already equal to the model is accepted. A different external
 edit or deletion reports a conflict and leaves both versions intact; saving this state
 retains the comparison rows for recovery. Explicit open-model `catalogue_sync` selects
 the model version and backs up the external workbook. After synchronization, later

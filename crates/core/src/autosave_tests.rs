@@ -62,6 +62,7 @@ fn background_session_snapshot_keeps_an_unexported_product_and_its_original_iden
         other => panic!("{other:?}"),
     }
     let mut recovered = Session::new();
+    recovered.catalogue_bindings.insert(backup.clone(), catalogue.clone());
     let reply = recovered.execute("open", &json!({"path":backup})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     let rows = crate::ods::catalogue_rows(&recovered.model);
@@ -90,6 +91,7 @@ fn a_model_only_background_snapshot_does_not_invent_unexported_products() {
     rows.iter_mut().find(|row| row[2].ends_with(": Committed software")).unwrap()[9] = "REPLACEMENT".into();
     std::fs::write(&catalogue, crate::ods::write(&rows).unwrap()).unwrap();
     let mut recovered = Session::new();
+    recovered.catalogue_bindings.insert(backup.clone(), catalogue.clone());
     let reply = recovered.execute("open", &json!({"path":backup})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(
@@ -120,10 +122,14 @@ fn background_session_snapshot_preserves_catalogue_cancellations_and_original_id
         other => panic!("{other:?}"),
     }
     let mut recovered = Session::new();
+    recovered.catalogue_bindings.insert(backup.clone(), catalogue.clone());
     let reply = recovered.execute("open", &json!({"path":backup})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(recovered.model.elements.len(), original.elements.len());
     assert!(!crate::ods::catalogue_rows(&recovered.model).iter().any(|row| row[2].ends_with(": Later edit")));
+    let rows = crate::ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
+    assert!(rows.iter().any(|row| row[2].ends_with(": Cancelled software")), "open does not write the workbook");
+    recovered.execute("catalogue_sync", &json!({})).unwrap();
     let rows = crate::ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
     assert!(!rows.iter().any(|row| row[2].ends_with(": Cancelled software")));
 }
@@ -318,6 +324,7 @@ fn pending_local_change_to_exported_type_survives_autosave() {
     }
     assert_eq!(std::fs::read(&catalogue).unwrap(), ods_bytes);
     let mut recovered = Session::new();
+    recovered.catalogue_bindings.insert(backup.clone(), catalogue.clone());
     let reply = recovered.execute("open", &json!({"path":backup})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(recovered.model.types.runs["wire"]["Recovery cable"].width, 12.0);

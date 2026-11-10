@@ -25,6 +25,14 @@ use crate::icons::Icon;
 use crate::style::{canvas_pal, pal};
 use crate::{BimApp, Sheet, Status, Tool, icon_button};
 
+fn selected_mount<'a>(model: &'a Model, selection: &[Id]) -> Option<&'a bimcraft_core::model::RunMount> {
+    let [id] = selection else { return None };
+    match model.elements.get(*id)? {
+        Element::Component(component) => component.mount.as_ref(),
+        element => element.run()?.mount.as_ref(),
+    }
+}
+
 /// What a picture is of: the model, the camera, the elements tinted, whether the theme is dark, whether the card drew it, and
 /// the section box it is cut to while one is dragged.
 type Shot = (Arc<Model>, Camera, Vec<(Id, Rgb)>, bool, bool, Option<(P3, P3)>);
@@ -174,6 +182,10 @@ impl BimApp {
         if self.sheet == Sheet::View3D
             && matches!(self.tool, Tool::Move(_) | Tool::Run("wire" | "cablecarrier", _) | Tool::Split | Tool::SplitRoute3D { .. })
         {
+            if matches!(self.tool, Tool::Move(_)) && selected_mount(&self.session.model, &self.selection).is_some() {
+                ui.label(crate::lang::t(bimcraft_i18n::msg!("Mounting surface")));
+                return;
+            }
             if let Tool::Run(category, _) = self.tool
                 && ui.checkbox(&mut self.free_run_3d, crate::lang::t(bimcraft_i18n::msg!("Free 3D"))).changed()
             {
@@ -558,8 +570,14 @@ impl BimApp {
             point[v] = p.1;
             point
         };
-        let split_point =
-            |at, origin: P3| move_point(at, Some(P2(origin[u], origin[v])), origin[work_axis]).map(|to| world(to, origin[work_axis]));
+        let split_point = |at, id, origin: P3| {
+            let run = model.elements.get(id)?.run()?;
+            if let Some(mount) = &run.mount {
+                let host = model.elements.id(mount.host)?;
+                return scene.surface_at(host, &cam, px(at)).filter(|hit| hit.face == mount.face).map(|hit| hit.point);
+            }
+            move_point(at, Some(P2(origin[u], origin[v])), origin[work_axis]).map(|to| world(to, origin[work_axis]))
+        };
         let free_point = |at: Pos2| {
             let surface = pick(&o.picker, at).and_then(|hit| scene.surface_at(hit.id, &cam, px(at)));
             let point = surface.as_ref().map(|hit| hit.point).or_else(|| {
@@ -616,6 +634,23 @@ impl BimApp {
         }
         let vertical_run = !free_run && matches!(self.tool, Tool::Run("wire" | "cablecarrier", _)) && work_axis != 2;
         let run_plane = vertical_run.then(|| model.units.parse(&self.work_coordinate)).flatten();
+        if let Tool::Run("wire" | "cablecarrier", from) = self.tool {
+            let start = if free_run {
+                free_start.as_ref().map(|(point, _)| *point).or_else(|| hover.and_then(free_point).map(|(point, _)| point))
+            } else {
+                let plane = if vertical_run {
+                    run_plane
+                } else {
+                    placement_level.zip(model.units.parse(&self.beam_offset)).map(|(level, offset)| model.elevation(level) + offset)
+                };
+                plane.and_then(|plane| from.or_else(|| hover.and_then(|at| move_point(at, None, plane))).map(|point| world(point, plane)))
+            };
+            if let Some(start) = start {
+                let at = screen(start);
+                p.circle_filled(at, 5.0, pal().surface);
+                p.circle_stroke(at, 5.0, Stroke::new(2.0, canvas_pal().accent));
+            }
+        }
         if let (Tool::Run(_, Some(from)), Some(coordinate), Some(at)) = (self.tool.clone(), run_plane, hover)
             && let Some(to) = move_point(at, Some(from), coordinate)
         {
@@ -637,17 +672,44 @@ impl BimApp {
                 );
             }
         }
-        if let (Tool::Move(Some(from)), Some(height), Some(at)) = (&self.tool, move_plane, hover)
-            && let Some(to) = move_point(at, Some(*from), height)
+        let move_mount = if matches!(self.tool, Tool::Move(_)) { selected_mount(&model, &selection) } else { None };
+        let mounted_point = |at, mount: &bimcraft_core::model::RunMount| {
+            let host = model.elements.id(mount.host)?;
+            scene.surface_at(host, &cam, px(at)).filter(|hit| hit.face == mount.face)
+        };
+        let move_target = |at, from: Option<P2>, height| {
+            if let Some(mount) = move_mount {
+                let hit = mounted_point(at, mount)?;
+                let axis = (0..3).max_by(|&a, &b| hit.normal[a].abs().total_cmp(&hit.normal[b].abs()))?;
+                let (i, j) = [(1, 2), (0, 2), (0, 1)][axis];
+                let point = P2(hit.point[i], hit.point[j]);
+                let start = from.map(|from| {
+                    let mut start = hit.point;
+                    start[i] = from.0;
+                    start[j] = from.1;
+                    start[axis] -=
+                        ((start[i] - hit.point[i]) * hit.normal[i] + (start[j] - hit.point[j]) * hit.normal[j]) / hit.normal[axis];
+                    start
+                });
+                return Some((point, hit.point, start));
+            }
+            let point = move_point(at, from, height)?;
+            Some((point, world(point, height), from.map(|from| world(from, height))))
+        };
+        if let (Tool::Move(from), Some(height), Some(at)) = (&self.tool, move_plane, hover)
+            && let Some((_, to, start)) = move_target(at, *from, height)
         {
-            p.line_segment([screen(world(*from, height)), screen(world(to, height))], Stroke::new(1.5, canvas_pal().accent));
+            if let Some(start) = start {
+                p.line_segment([screen(start), screen(to)], Stroke::new(1.5, canvas_pal().accent));
+            }
+            p.circle_stroke(screen(to), 4.0, Stroke::new(1.5, canvas_pal().accent));
         }
         if let Some(b) = reboxed.or(boxed) {
             crate::section_box::draw(&p, &cam, b, modify, o.boxing.map(|(k, _)| k), screen);
         }
         if let Tool::SplitRoute3D { id, origin, .. } = self.tool
             && let Some(g) = model.elements.get(id).and_then(|e| model.run_geom(e))
-            && let Some(to) = hover.and_then(|at| split_point(at, origin))
+            && let Some(to) = hover.and_then(|at| split_point(at, id, origin))
         {
             let stroke = Stroke::new(1.5, canvas_pal().accent);
             p.line_segment([screen(g.a), screen(to)], stroke);
@@ -716,9 +778,16 @@ impl BimApp {
                 (component, surface)
             })
         };
+        let move_equipment = match (&self.tool, selection.as_slice()) {
+            (Tool::Move(_), [id]) => match model.elements.get(*id) {
+                Some(Element::Component(component)) if component.mount.is_some() => Some((*id, component)),
+                _ => None,
+            },
+            _ => None,
+        };
         let preview_equipment = equipment.clone().or_else(|| match o.mount_drag.and_then(|id| model.elements.get(id)) {
             Some(Element::Component(component)) => Some(component.clone()),
-            _ => None,
+            _ => move_equipment.map(|(_, component)| component.clone()),
         });
         if let Some((component, hit)) = preview_equipment.and_then(|component| hover.and_then(|at| surface_component(component, at))) {
             let tint = canvas_pal().accent;
@@ -801,19 +870,25 @@ impl BimApp {
                     }
                 }
             }
+            Some(_) if move_equipment.is_some() => {
+                if let Some((id, component)) = move_equipment
+                    && let Some((c, _)) = click.and_then(|at| surface_component(component.clone(), at))
+                    && self.run("modify", json!({"id":id,"at":[c.at.0,c.at.1],"angle":c.angle,"offset":c.offset,"mount":c.mount})).is_some()
+                {
+                    self.tool = Tool::Modify;
+                }
+            }
             Some(_) if matches!(self.tool, Tool::Move(_)) => {
                 if let (Tool::Move(from), Some(height), Some(at)) = (&self.tool, move_plane, click)
-                    && let Some(to) = move_point(at, *from, height)
+                    && let Some((to, target, start)) = move_target(at, *from, height)
                 {
-                    if let Some(from) = *from {
-                        if work_axis == 2 {
-                            self.shift_selection(from, to);
-                        } else {
-                            let [dx, dy, dz] = world(to - from, 0.0);
-                            let params = json!({"ids": self.selection, "by": [micron(dx), micron(dy)], "dz": micron(dz)});
-                            if !self.offer_carrier_move(&params) && self.run("move", params).is_some() {
-                                self.tool = Tool::Modify;
-                            }
+                    if let Some(start) = start {
+                        let [dx, dy, dz] = std::array::from_fn(|i| target[i] - start[i]);
+                        // Rounding each coordinate separately can move a route off a diagonal wall.
+                        let [dx, dy, dz] = if move_mount.is_some() { [dx, dy, dz] } else { [dx, dy, dz].map(micron) };
+                        let params = json!({"ids": self.selection, "by": [dx, dy], "dz": dz});
+                        if !self.offer_carrier_move(&params) && self.run("move", params).is_some() {
+                            self.tool = Tool::Modify;
                         }
                     } else {
                         self.tool = Tool::Move(Some(to));
@@ -850,10 +925,20 @@ impl BimApp {
             }
             Some(_) if matches!(self.tool, Tool::SplitRoute3D { .. }) => {
                 if let Tool::SplitRoute3D { id, fraction, origin } = self.tool
-                    && let Some([x, y, z]) = click.and_then(|at| split_point(at, origin))
-                    && self.run("split", json!({"id":id, "fraction":fraction, "to":[x,y], "dz":z-origin[2]})).is_some()
+                    && let Some(run) = model.elements.get(id).and_then(Element::run)
+                    && let Some([x, y, z]) = click.and_then(|at| split_point(at, id, origin))
                 {
-                    self.tool = Tool::Split;
+                    let on_axis = run.start + (run.end - run.start) * fraction;
+                    let joint = if run.mount.is_some() { [x, y] } else { [on_axis.0 + x - origin[0], on_axis.1 + y - origin[1]] };
+                    let z = if run.mount.is_some() {
+                        let offset = run.offset + (run.end_offset.unwrap_or(run.offset) - run.offset) * fraction;
+                        z - model.elevation(run.level) - offset
+                    } else {
+                        z - origin[2]
+                    };
+                    if self.run("split", json!({"id":id, "fraction":fraction, "to":joint, "dz":z})).is_some() {
+                        self.tool = Tool::Split;
+                    }
                 }
             }
             Some(found) if matches!(self.tool, Tool::Run(..) | Tool::Component | Tool::Fixture(_)) => {

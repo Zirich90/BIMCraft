@@ -72,6 +72,7 @@ fn saving_before_the_first_catalogue_poll_keeps_new_equipment_billable() {
         assert!(std::sync::Arc::ptr_eq(&s.model, &before));
         assert_eq!(std::fs::read(&catalogue).unwrap(), original);
         let mut reopened = Session::new();
+        reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
         let reply = reopened.execute("open", &json!({"path":project})).unwrap();
         assert!(reply.get("catalogue_not_loaded").is_none(), "{command}: {reply}");
         assert!(
@@ -79,13 +80,15 @@ fn saving_before_the_first_catalogue_poll_keeps_new_equipment_billable() {
             "saving before the first poll must not exclude a new product from schedules"
         );
         assert!(ods::catalogue_rows(&reopened.model).contains(&row));
+        assert_eq!(std::fs::read(&catalogue).unwrap(), original);
+        let sync = reopened.execute("catalogue_sync", &json!({})).unwrap();
         assert!(
             ods::read(&std::fs::read(&catalogue).unwrap())
                 .unwrap()
                 .iter()
                 .any(|written| written.first() == row.first() && written.get(2) == row.get(2))
         );
-        assert_eq!(std::fs::read(reply["catalogue"]["backup"].as_str().unwrap()).unwrap(), original);
+        assert_eq!(std::fs::read(sync["backup"].as_str().unwrap()).unwrap(), original);
         reopened.model.check().unwrap();
     }
 }
@@ -103,14 +106,18 @@ fn unsynchronized_equipment_survives_catalogue_failure_and_later_accepts_externa
     s.execute("save", &json!({"path":project})).unwrap();
     std::fs::write(&catalogue, b"damaged workbook").unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     assert!(reopened.execute("open", &json!({"path":project})).unwrap().get("catalogue_not_loaded").is_some());
     reopened.execute("save", &json!({"path":project})).unwrap();
     std::fs::write(&catalogue, &original).unwrap();
     let mut restored = Session::new();
+    restored.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = restored.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert!(ods::catalogue_rows(&restored.model).contains(&row));
-    assert_eq!(std::fs::read(reply["catalogue"]["backup"].as_str().unwrap()).unwrap(), original);
+    assert_eq!(std::fs::read(&catalogue).unwrap(), original);
+    let sync = restored.execute("catalogue_sync", &json!({})).unwrap();
+    assert_eq!(std::fs::read(sync["backup"].as_str().unwrap()).unwrap(), original);
     assert!(restored.model.catalogue_unexported.is_empty());
     restored.execute("save", &json!({"path":project})).unwrap();
     let mut rows = ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
@@ -119,6 +126,7 @@ fn unsynchronized_equipment_survives_catalogue_failure_and_later_accepts_externa
     external[9] = "REPLACEMENT-ARTICLE".into();
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
     let mut accepted = Session::new();
+    accepted.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = accepted.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(ods::catalogue_rows(&accepted.model).iter().find(|r| r[0] == row[0]).unwrap()[9], "REPLACEMENT-ARTICLE");
@@ -142,6 +150,7 @@ fn an_external_conflict_with_an_unexported_product_does_not_discard_either_versi
     let external_bytes = ods::write(&rows).unwrap();
     std::fs::write(&catalogue, &external_bytes).unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply["catalogue_not_loaded"].as_str().unwrap().contains("conflicts"));
     assert!(ods::catalogue_rows(&reopened.model).contains(&row));
@@ -155,6 +164,7 @@ fn an_external_conflict_with_an_unexported_product_does_not_discard_either_versi
             .any(|written| written.first() == row.first() && written.get(2) == row.get(2))
     );
     let mut recovered_again = Session::new();
+    recovered_again.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = recovered_again.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "a saved pending row may already have reached the ODS: {reply}");
     assert!(ods::catalogue_rows(&recovered_again.model).contains(&row));
@@ -183,11 +193,14 @@ fn saving_immediately_after_undo_does_not_restore_an_exported_product_on_open() 
         assert_eq!(s.model, before, "saving must not edit the model or its undo state");
         assert_eq!(std::fs::read(&catalogue).unwrap(), original, "saving a project must not rewrite its external catalogue");
         let mut reopened = Session::new();
+        reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
         let reply = reopened.execute("open", &json!({"path":project})).unwrap();
         assert!(reply.get("catalogue_not_loaded").is_none(), "{command}: {reply}");
         assert!(!ods::catalogue_rows(&reopened.model).iter().any(|row| row[0] == guid));
+        assert_eq!(std::fs::read(&catalogue).unwrap(), original);
+        let sync = reopened.execute("catalogue_sync", &json!({})).unwrap();
         assert!(!ods::read(&std::fs::read(&catalogue).unwrap()).unwrap().iter().any(|row| row[0] == guid));
-        let backup = reply["catalogue"]["backup"].as_str().unwrap();
+        let backup = sync["backup"].as_str().unwrap();
         assert_eq!(std::fs::read(backup).unwrap(), original);
         reopened.model.check().unwrap();
         // Copied foreign products are new local entries, never the cancelled product.
@@ -199,6 +212,7 @@ fn saving_immediately_after_undo_does_not_restore_an_exported_product_on_open() 
         rows.push(foreign);
         std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
         let mut imported = Session::new();
+        imported.catalogue_bindings.insert(project.clone(), catalogue.clone());
         let reply = imported.execute("open", &json!({"path":project})).unwrap();
         assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
         let rows = ods::catalogue_rows(&imported.model);
@@ -223,6 +237,7 @@ fn saved_cancellations_survive_catalogue_failures_without_affecting_another_file
     s.execute("save", &json!({"path":project})).unwrap();
     std::fs::write(&catalogue, b"broken workbook").unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     assert!(reopened.execute("open", &json!({"path":project})).unwrap().get("catalogue_not_loaded").is_some());
     assert!(reopened.model.catalogue_retired.contains(&guid));
     let before = reopened.model.clone();
@@ -239,8 +254,12 @@ fn saved_cancellations_survive_catalogue_failures_without_affecting_another_file
     reopened.execute("undo", &json!({})).unwrap();
     assert!(reopened.model.catalogue_retired.contains(&guid));
     std::fs::write(&catalogue, &original).unwrap();
+    reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
+    assert!(reopened.model.catalogue_retired.contains(&guid));
+    assert_eq!(std::fs::read(&catalogue).unwrap(), original);
+    reopened.execute("catalogue_sync", &json!({})).unwrap();
     assert!(reopened.model.catalogue_retired.is_empty());
     assert!(!ods::read(&std::fs::read(&catalogue).unwrap()).unwrap().iter().any(|row| row[0] == guid.to_string()));
 }

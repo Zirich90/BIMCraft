@@ -324,14 +324,17 @@ impl BimApp {
 
     pub(crate) fn recover_backup(&mut self, backup: Backup) {
         let saved = Arc::clone(&self.saved);
-        if self.run("recover", json!({"path": backup.path, "project": backup.project})).is_none() {
+        let Some(reply) = self.run("recover", json!({"path": backup.path, "project": backup.project})) else {
             self.autosave.recovery_error = Some(self.status.text.clone());
             self.autosave.show_recovery = true;
             return;
-        }
+        };
         self.retire_autosave();
         // Opening a recovered model uses the same view setup as Open, but it remains dirty.
         self.reopened();
+        if let Some(error) = reply["catalogue_not_loaded"].as_str() {
+            self.catalogue_open_failed(error);
+        }
         self.saved = saved;
         self.autosave.candidates.retain(|b| b != &backup);
         self.autosave.recovery_error = None;

@@ -307,6 +307,7 @@ fn closed_ods_reopen_uses_persisted_internal_box_limit() {
     row[4] = "30".into();
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
     let mut opened = Session::new();
+    opened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = opened.execute("open", &json!({"path":project})).unwrap();
     assert_eq!(opened.model.elements, elements);
     assert_eq!(reply["carrier_check"]["elements"].as_array().unwrap().len(), 1);

@@ -187,7 +187,7 @@ pub static ALL: &[Command] = &[
         "catalogue_sync",
         "Synchronize Catalogue",
         &[],
-        "{} protect existing model rows, accept new ODS rows, back up external edits before writing assigned GUIDs",
+        "{read_only?:bool} accept new ODS rows and protect existing model rows; read_only skips workbook writes",
         catalogue_sync,
     ),
     other(
@@ -210,7 +210,7 @@ pub static ALL: &[Command] = &[
          Nível 2 in Portuguese; Nivel 1, Nivel 2 in Spanish)",
         new,
     ),
-    other("open", "Open", "{path} a .bimcraft project", open),
+    other("open", "Open", "{path, read_only?:bool} a .bimcraft project; read_only disables catalogue writes", open),
     other("highrise", "Synthetic Highrise", "{storeys?: 20} replace the project with an original 1–80 storey performance sample", highrise),
     other(
         "autosave",
@@ -566,7 +566,7 @@ pub static ALL: &[Command] = &[
          types as an IFC cable tray segment; `system` names the cable group it carries. Alternatively \
          {from_wire: id|GUID, type?, placement?: centre|top|bottom, local_offset?: mm} creates a carrier around the wire's \
          physical axis and links that wire in one undo step, preserving the wire's heights and slope. Placement and lateral \
-         offset must fit the section; already linked wires and owned equipment feeders are refused. Use mount: {host: id|GUID, face} with points to create a supported contact line. +         {from_wires: {level?: name|id|GUID}} applies centre placement to all uncarried main wires on the given level, or throughout the project if level is omitted",
+         offset must fit the section; already linked wires and owned equipment feeders are refused. Use mount: {host: id|GUID, face} with points to create a supported contact line. {from_wires: {level?: name|id|GUID}, type?: carrier type name} applies centre placement to all uncarried main wires on the given level, or throughout the project if level is omitted",
         cable_carrier,
     ),
     edit(
@@ -1789,47 +1789,75 @@ fn catalogue_link(s: &mut Session, p: &Value) -> R {
     only("catalogue_link", p, &["path"])?;
     if p.get("path") == Some(&Value::Null) {
         let model = s.model_mut();
-        model.catalogue = None;
         model.catalogue_retired.clear();
         model.catalogue_unexported.clear();
         model.catalogue_pending_edits.clear();
+        s.set_catalogue_path(None);
+        s.catalogue_owned.clear();
+        s.catalogue_baseline = Default::default();
         return Ok(json!({"path":null}));
     }
+    require_catalogue_write(s)?;
     let path = string("catalogue_link", p, "path")?.ok_or("catalogue_link: path is required")?;
-    let path = std::path::absolute(&path).map_err(|e| e.to_string())?;
+    let path = crate::ods::workbook_path(Path::new(&path))?;
+    if s.path.as_ref().and_then(|p| std::path::absolute(p).ok()).as_ref() == Some(&path) {
+        return Err("Catalogue path must differ from the project file".into());
+    }
     let mut model = (*s.model).clone();
-    let catalogue = path.to_str().ok_or("Catalogue path must be Unicode")?;
-    let already_linked = model.catalogue.as_deref() == Some(catalogue);
-    if !already_linked {
+    let current = s.catalogue_path();
+    let already_linked = current == Some(path.as_path());
+    let exists = crate::ods::workbook_exists(&path)?;
+    // A project can retain pending edits from a legacy or unavailable approval.
+    let resume_pending = current.is_none()
+        && exists
+        && (!model.catalogue_retired.is_empty() || !model.catalogue_unexported.is_empty() || !model.catalogue_pending_edits.is_empty());
+    if !already_linked && !resume_pending {
         model.catalogue_retired.clear();
         model.catalogue_unexported.clear();
         model.catalogue_pending_edits.clear();
     }
-    model.catalogue = Some(catalogue.into());
     model.check()?;
     let unowned = BTreeSet::new();
-    let reply = if path.try_exists().map_err(|e| e.to_string())? {
-        crate::ods::sync_bound(&mut model, already_linked, if already_linked { &s.catalogue_owned } else { &unowned })?
+    let reply = if exists {
+        let owned = if already_linked { &s.catalogue_owned } else { &unowned };
+        crate::ods::sync_bound(&mut model, &path, already_linked || resume_pending, !resume_pending, owned)?
     } else {
-        crate::autosave::atomic_write_bytes(&path, &crate::ods::write(&crate::ods::catalogue_rows(&model))?)?;
+        use std::io::Write;
+        let mut staged =
+            tempfile::NamedTempFile::new_in(path.parent().ok_or("Catalogue path needs a parent directory")?).map_err(|e| e.to_string())?;
+        staged.write_all(&crate::ods::write(&crate::ods::catalogue_rows(&model))?).map_err(|e| e.to_string())?;
+        staged.as_file().sync_all().map_err(|e| e.to_string())?;
+        staged.persist_noclobber(&path).map_err(|e| e.to_string())?;
         json!({"path":path,"updated":0})
     };
     if model != *s.model {
         *s.model_mut() = model;
     }
+    s.set_catalogue_path(Some(path));
     s.remember_catalogue();
     Ok(reply)
 }
 
 fn catalogue_sync(s: &mut Session, p: &Value) -> R {
-    only("catalogue_sync", p, &[])?;
+    only("catalogue_sync", p, &["read_only"])?;
+    let write = !flag("catalogue_sync", p, "read_only")?;
+    if write {
+        require_catalogue_write(s)?;
+    }
+    let path = s.catalogue_path().ok_or("No ODS catalogue is linked")?;
     let mut model = (*s.model).clone();
-    let reply = crate::ods::sync_bound(&mut model, true, &s.catalogue_owned)?;
+    let reply = crate::ods::sync_bound(&mut model, path, true, write, &s.catalogue_owned)?;
     if model != *s.model {
         *s.model_mut() = model;
     }
-    s.remember_catalogue();
+    if write {
+        s.remember_catalogue();
+    }
     Ok(reply)
+}
+
+fn require_catalogue_write(s: &Session) -> Result<(), String> {
+    if s.catalogue_writable() { Ok(()) } else { Err("Cannot write an ODS catalogue in a read-only session".into()) }
 }
 
 fn catalogue_pending(s: &mut Session, p: &Value) -> R {
@@ -1843,18 +1871,22 @@ fn catalogue_pending(s: &mut Session, p: &Value) -> R {
 
 fn catalogue_export(s: &mut Session, p: &Value) -> R {
     only("catalogue_export", p, &["path"])?;
+    require_catalogue_write(s)?;
     let path = string("catalogue_export", p, "path")?.ok_or("catalogue_export: path is required")?;
+    let path = crate::ods::workbook_path(Path::new(&path))?;
+    crate::ods::workbook_exists(&path)?;
+    if s.path.as_ref().and_then(|p| std::path::absolute(p).ok()).as_ref() == Some(&path) {
+        return Err("Catalogue path must differ from the project file".into());
+    }
     let bytes = crate::ods::write(&crate::ods::catalogue_rows(&s.model))?;
-    crate::autosave::atomic_write_bytes(Path::new(&path), &bytes)?;
+    crate::autosave::atomic_write_bytes(&path, &bytes)?;
     Ok(json!({"path":path}))
 }
 
 fn catalogue_import(s: &mut Session, p: &Value) -> R {
     only("catalogue_import", p, &["path", "conflicts"])?;
     let path = string("catalogue_import", p, "path")?.ok_or("catalogue_import: path is required")?;
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path).map_err(|e| e.to_string())?.take((32 << 20) + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let bytes = crate::ods::read_workbook(Path::new(&path))?;
     let rows = crate::ods::read(&bytes)?;
     let rows = crate::ods::transfer_rows(&s.model, &rows, string("catalogue_import", p, "conflicts")?.as_deref())?;
     let count = crate::ods::apply_catalogue(s.model_mut(), &rows)?;
@@ -2472,7 +2504,9 @@ fn language(s: &mut Session, p: &Value) -> R {
 const MAX_LEFT_OUT: usize = 100;
 
 fn open(s: &mut Session, p: &Value) -> R {
-    let reply = open_file(s, p)?;
+    let path = PathBuf::from(string("open", p, "path")?.ok_or("open: `path` is required")?);
+    let read_only = flag("open", p, "read_only")?;
+    let reply = open_file(s, &path, Some(path.clone()), read_only)?;
     Ok(with_links(s, reply))
 }
 
@@ -2491,16 +2525,15 @@ fn with_links(s: &mut Session, mut reply: Value) -> Value {
 }
 
 /// `open`, but for what its links read.
-fn open_file(s: &mut Session, p: &Value) -> R {
+fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: bool) -> R {
     let c = "open";
-    let path = PathBuf::from(string(c, p, "path")?.ok_or_else(|| bad(c, "`path` is required"))?);
-    let size = std::fs::metadata(&path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
+    let size = std::fs::metadata(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
     if size >= MAX_FILE {
         return Err(bad(c, format!("{} is too large ({size} bytes)", path.display())));
     }
     // IFC comes in as a new project: saving it asks where.
-    if ext(&path) == "ifc" {
-        let bytes = std::fs::read(&path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+    if ext(path) == "ifc" {
+        let bytes = std::fs::read(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         let stem = path.file_stem().map_or_else(|| "Project".into(), |s| s.to_string_lossy().into_owned());
         let i = crate::import::ifc(&bytes, &stem).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -2510,9 +2543,10 @@ fn open_file(s: &mut Session, p: &Value) -> R {
         let reply =
             json!({"path": path, "name": i.model.name, "format": i.schema, "elements": counts, "skipped": i.skipped, "moved": i.moved});
         s.reset(i.model, None);
+        s.read_only = read_only;
         return Ok(reply);
     }
-    let text = std::fs::read_to_string(&path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+    let text = std::fs::read_to_string(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
     let (mut m, left_out) = Model::read(&text).map_err(|e| bad(c, format!("{} is not a BIMCraft project: {e}", path.display())))?;
     m.adopt_materials();
     // A project parameter named as a phase or a design option is held under is from before they were: it keeps its values, renamed.
@@ -2534,9 +2568,13 @@ fn open_file(s: &mut Session, p: &Value) -> R {
     }
     m.sync_library();
     m.check().map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
-    let catalogue = m.catalogue.as_ref().map(|_| ()).map(|()| crate::ods::sync_bound(&mut m, false, &BTreeSet::new()));
+    let catalogue = project
+        .as_deref()
+        .and_then(|project| s.catalogue_for(project))
+        .map(|path| crate::ods::sync_bound(&mut m, path, false, false, &BTreeSet::new()));
     let name = m.name.clone();
-    s.reset(m, Some(path.clone()));
+    s.reset(m, project);
+    s.read_only = read_only;
     let mut reply = json!({"path": path, "name": name});
     let missing: Vec<_> = s.model.library.entries().filter(|(_, entry)| entry.placeholder).map(|(_, entry)| entry.guid).collect();
     if !missing.is_empty() {
@@ -2666,7 +2704,7 @@ fn insert_from(s: &mut Session, p: &Value) -> R {
     let path = string(c, p, "path")?.ok_or_else(|| bad(c, "`path` is required"))?;
     // Read as `open` reads it, in a session of its own.
     let mut other = Session::new();
-    open_file(&mut other, &json!({"path": path})).map_err(|e| bad(c, e.trim_start_matches("open: ")))?;
+    open_file(&mut other, Path::new(&path), None, true).map_err(|e| bad(c, e.trim_start_matches("open: ")))?;
     let ids: Vec<Id> = match p.get("ids") {
         v if absent(v) => Vec::new(),
         Some(_) => ids_param(c, &other.model, p)?,
@@ -2681,7 +2719,7 @@ fn insert_from(s: &mut Session, p: &Value) -> R {
 fn read_link(s: &Session, path: &str) -> Result<Arc<Model>, String> {
     let full = beside(s, path);
     let mut other = Session::new();
-    open_file(&mut other, &json!({"path": full})).map_err(|e| e.trim_start_matches("open: ").to_string())?;
+    open_file(&mut other, &full, None, true).map_err(|e| e.trim_start_matches("open: ").to_string())?;
     Ok(other.model)
 }
 
@@ -2798,7 +2836,17 @@ fn save(s: &mut Session, p: &Value) -> R {
     snapshot.check().map_err(|e| bad(c, e))?;
     let text = snapshot.to_json().map_err(|e| bad(c, e))?;
     crate::autosave::atomic_write(&path, &text).map_err(|e| bad(c, e))?;
-    s.path = Some(path.clone());
+    let first_catalogue = s.catalogue_untitled.take();
+    let previous = s.path.replace(path.clone());
+    if first_catalogue.is_some() {
+        s.set_catalogue_path(first_catalogue);
+    } else if previous.as_ref() != Some(&path) {
+        s.catalogue_owned.clear();
+        s.catalogue_baseline = Default::default();
+        if s.catalogue_path().is_some() {
+            s.remember_catalogue();
+        }
+    }
     Ok(json!({"path": path, "format": "bimcraft"}))
 }
 
@@ -2820,9 +2868,10 @@ fn autosave(s: &mut Session, p: &Value) -> R {
 fn recover(s: &mut Session, p: &Value) -> R {
     // Parse all params before open resets the session, so invalid input cannot partially recover.
     let project = string("recover", p, "project")?.map(PathBuf::from);
-    let result = open_file(s, p)?;
-    // Its links are read from where the project lives, not from where the backup does.
-    s.path = project;
+    let path = PathBuf::from(string("recover", p, "path")?.ok_or("recover: `path` is required")?);
+    // Its links and approved catalogue belong to the project, not the backup.
+    let read_only = s.read_only;
+    let result = open_file(s, &path, project, read_only)?;
     Ok(with_links(s, result))
 }
 
@@ -5421,8 +5470,12 @@ fn pipe(s: &mut Session, p: &Value) -> R {
 fn cable_carrier(s: &mut Session, p: &Value) -> R {
     if let Some(scope) = p.get("from_wires") {
         let c = "cable_carrier";
-        only(c, p, &["from_wires"])?;
+        only(c, p, &["from_wires", "type"])?;
         only(c, scope, &["level"])?;
+        let chosen = string(c, p, "type")?;
+        if chosen.as_ref().is_some_and(|name| !s.model.types.runs.get("cablecarrier").is_some_and(|types| types.contains_key(name))) {
+            return Err(bad(c, "select an existing cable carrier type"));
+        }
         let level = scope.get("level").map(|_| level_param(c, &s.model, scope, "level")).transpose()?;
         let wires: Vec<_> = s
             .model
@@ -5439,13 +5492,14 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         }
         let mut ids = Vec::with_capacity(wires.len());
         for wire in wires {
-            if share_carrier(s.model_mut(), wire) {
+            if share_carrier(s.model_mut(), wire, chosen.as_deref()) {
                 continue;
             }
-            let result = cable_carrier(s, &json!({"from_wire":wire})).map_err(|error| bad(c, format!("wire {wire}: {error}")))?;
+            let result =
+                cable_carrier(s, &json!({"from_wire":wire,"type":chosen})).map_err(|error| bad(c, format!("wire {wire}: {error}")))?;
             let carrier = result["ids"][0].as_u64().ok_or_else(|| bad(c, "missing created carrier"))?;
             if !carrier_fill_fits(&s.model, s.model.guid(carrier)) {
-                return Err(bad(c, format!("wire {wire}: the default carrier cannot be verified to fit under the selected fill rules")));
+                return Err(bad(c, format!("wire {wire}: the carrier cannot be verified to fit under the selected fill rules")));
             }
             ids.push(result["ids"][0].clone());
         }
@@ -5536,15 +5590,9 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         carrier.params.clear();
         carrier.connections.clear();
         carrier.feeder = None;
+        let base = m.elevation(wire.level);
         let mut wire = wire.clone();
-        // Transfer ownership to the new carrier without treating the saved contact line as an axis.
-        wire.mount = None;
-        wire.square_ends = geometry.square_ends;
-        wire.start = P2(geometry.a[0], geometry.a[1]);
-        wire.end = P2(geometry.b[0], geometry.b[1]);
-        wire.offset = geometry.a[2] - m.elevation(wire.level);
-        wire.end_offset = Some(geometry.b[2] - m.elevation(wire.level));
-        wire.justify = crate::model::Justify::Centre;
+        set_wire_axis(&mut wire, geometry, base);
         let m = s.model_mut();
         let id = m.insert(Element::CableCarrier(carrier));
         wire.carrier = Some(m.guid(id));
@@ -5553,6 +5601,18 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         return Ok(json!({"ids": [id], "wire": wire_id}));
     }
     chain(s, p, "cablecarrier")
+}
+
+// A wire in a carrier stores its physical axis instead of a mounting contact line.
+fn set_wire_axis(wire: &mut crate::model::Run, geometry: crate::runs::Geom, base: f64) {
+    wire.mount = None;
+    wire.section_roll = geometry.roll;
+    wire.square_ends = geometry.square_ends;
+    wire.start = P2(geometry.a[0], geometry.a[1]);
+    wire.end = P2(geometry.b[0], geometry.b[1]);
+    wire.offset = geometry.a[2] - base;
+    wire.end_offset = Some(geometry.b[2] - base);
+    wire.justify = crate::model::Justify::Centre;
 }
 
 fn carrier_fill_fits(m: &Model, carrier: Guid) -> bool {
@@ -5565,28 +5625,33 @@ fn carrier_fill_fits(m: &Model, carrier: Guid) -> bool {
         && m.carrier_type_fits(&run.type_name, envelope, profile)
 }
 
-fn share_carrier(m: &mut Model, id: Id) -> bool {
+fn share_carrier(m: &mut Model, id: Id, chosen: Option<&str>) -> bool {
     let Some(Element::Wire(original)) = m.elements.get(id).cloned() else { return false };
-    if original.mount.is_some() {
-        return false;
-    }
     let candidates: Vec<_> = m
         .elements
         .iter()
         .filter_map(|(id, element)| {
             matches!(element, Element::CableCarrier(run)
-            if run.level == original.level && run.system == original.system && run.compartments.is_empty())
+            if run.level == original.level && run.system == original.system && run.compartments.is_empty()
+                && chosen.is_none_or(|name| run.type_name == name))
             .then_some(*id)
         })
         .collect();
     for carrier in candidates {
         let guid = m.guid(carrier);
-        let compatible = m.elements.values().all(|element| !matches!(element, Element::Wire(run)
-            if run.carrier == Some(guid) && (run.type_name != original.type_name || run.cable != original.cable || run.system != original.system)));
+        let compatible = m.elements.values().all(|element| {
+            !matches!(element, Element::Wire(run)
+            if run.carrier == Some(guid) && run.system != original.system)
+        });
         if !compatible || !m.carrier_wire_candidates(carrier).is_ok_and(|wires| wires.contains(&id)) {
             continue;
         }
         let mut wire = original.clone();
+        if wire.mount.is_some()
+            && let Some(geometry) = m.elements.get(id).and_then(|element| m.run_geom(element))
+        {
+            set_wire_axis(&mut wire, geometry, m.elevation(original.level));
+        }
         wire.carrier = Some(guid);
         m.elements.insert(id, Element::Wire(wire));
         if carrier_fill_fits(m, guid) {

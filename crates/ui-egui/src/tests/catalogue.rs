@@ -165,6 +165,7 @@ fn removed_catalogue_types_warn_until_the_product_is_restored() {
     rows.retain(|row| row[2] != "Removed cable");
     std::fs::write(&path, bimcraft_core::ods::write(&rows).unwrap()).unwrap();
     let mut h = app("");
+    h.state_mut().session.catalogue_bindings = session.catalogue_bindings.clone();
     assert!(h.state_mut().open_path(&project));
     h.run();
     assert!(h.state().status.error);
@@ -181,11 +182,43 @@ fn removed_catalogue_types_warn_until_the_product_is_restored() {
     h.run();
     assert!(h.state().status.error, "Reopened placeholders must warn without an external link");
     std::fs::write(&path, original).unwrap();
+    h.state_mut().session.catalogue_bindings = session.catalogue_bindings;
     assert!(h.state_mut().open_path(&project));
     h.run();
     assert!(!h.state().status.error, "{}", h.state().status.text);
 }
 use bimcraft_core::ods;
+
+#[test]
+fn desktop_keeps_catalogue_approval_in_user_settings_and_only_reads_it_on_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = temp.path().join("settings.json");
+    let path = temp.path().join("catalogue.ods");
+    let project = temp.path().join("project.bimcraft");
+    let mut h = app("");
+    h.state_mut().use_settings(settings.clone());
+    h.state_mut().run("catalogue_link", json!({"path":path})).unwrap();
+    assert!(h.state_mut().save_to(&project));
+    h.run();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&project).unwrap()).unwrap();
+    assert!(saved.get("catalogue").is_none());
+    assert_eq!(crate::settings::catalogue_bindings_in(&settings).get(&project), Some(&path));
+
+    let mut rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
+    let mut row = rows.iter().find(|row| row[1] == "wire").unwrap().clone();
+    row[0].clear();
+    row[2] = "New workbook cable".into();
+    rows.push(row);
+    let external = ods::write(&rows).unwrap();
+    std::fs::write(&path, &external).unwrap();
+
+    let mut h = app("");
+    h.state_mut().use_settings(settings);
+    assert!(h.state_mut().open_path(&project));
+    h.run();
+    assert!(h.state().session.model.types.runs["wire"].contains_key("New workbook cable"));
+    assert_eq!(std::fs::read(&path).unwrap(), external);
+}
 
 #[test]
 fn catalogue_dialog_creates_unlinks_and_reconnects_an_existing_file() {
@@ -198,21 +231,21 @@ fn catalogue_dialog_creates_unlinks_and_reconnects_an_existing_file() {
     let tx = crate::dialog::BEGUN.with(|b| b.borrow_mut().pop()).unwrap();
     tx.send(Some(vec![path.clone()])).unwrap();
     h.run();
-    assert_eq!(h.state().session.model.catalogue.as_deref(), path.to_str());
+    assert_eq!(h.state().session.catalogue_path(), Some(path.as_path()));
     assert!(ods::read(&std::fs::read(&path).unwrap()).is_ok());
     press(&mut h, "Unlink");
-    assert!(h.state().session.model.catalogue.is_none());
+    assert!(h.state().session.catalogue_path().is_none());
     assert!(path.is_file(), "unlink keeps the external workbook");
     press(&mut h, "Link Existing...");
     let tx = crate::dialog::BEGUN.with(|b| b.borrow_mut().pop()).unwrap();
     tx.send(None).unwrap();
     h.run();
-    assert!(h.state().session.model.catalogue.is_none(), "cancellation changes nothing");
+    assert!(h.state().session.catalogue_path().is_none(), "cancellation changes nothing");
     press(&mut h, "Link Existing...");
     let tx = crate::dialog::BEGUN.with(|b| b.borrow_mut().pop()).unwrap();
     tx.send(Some(vec![path.clone()])).unwrap();
     h.run();
-    assert_eq!(h.state().session.model.catalogue.as_deref(), path.to_str());
+    assert_eq!(h.state().session.catalogue_path(), Some(path.as_path()));
     press(&mut h, "Synchronize");
     assert!(!h.state().status.error, "{}", h.state().status.text);
     press(&mut h, "Close");
@@ -239,7 +272,7 @@ fn a_bound_catalogue_is_polled_without_a_manual_import() {
     h.run();
     assert!(h.state().session.model.types.runs["wire"].contains_key("External cable"));
     let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
-    assert!(!rows.iter().find(|r| r[2] == "External cable").unwrap()[0].is_empty());
+    assert!(rows.iter().find(|r| r[2] == "External cable").unwrap()[0].is_empty(), "polling only reads the workbook");
     let history = h.state().session.history();
     for _ in 0..10 {
         h.step();
@@ -258,7 +291,7 @@ fn a_bound_catalogue_is_polled_without_a_manual_import() {
 }
 
 #[test]
-fn changes_in_the_open_model_reach_the_bound_catalogue() {
+fn changes_in_the_open_model_reach_the_bound_catalogue_on_explicit_sync() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("catalogue.ods");
     let mut h = app("");
@@ -267,7 +300,12 @@ fn changes_in_the_open_model_reach_the_bound_catalogue() {
     h.state_mut().run("type", json!({"category":"wire","name":"Model cable","width":8,"round":true})).unwrap();
     h.ctx.request_repaint();
     h.run();
-    let rows = ods::read(&std::fs::read(path).unwrap()).unwrap();
+    let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(rows.iter().all(|r| r[2] != "Model cable"));
+    press(&mut h, "Manage");
+    press(&mut h, "Equipment Catalogue");
+    press(&mut h, "Synchronize");
+    let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
     assert!(!rows.iter().find(|r| r[2] == "Model cable").unwrap()[0].is_empty());
 }
 
@@ -282,6 +320,7 @@ fn opening_with_a_broken_catalogue_shows_a_visible_warning() {
     let original = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"broken").unwrap();
     let mut h = app("");
+    h.state_mut().session.catalogue_bindings = s.catalogue_bindings;
     assert!(h.state_mut().open_path(&project));
     assert!(h.state().status.error);
     assert!(h.state().status.text.contains("catalogue"), "{}", h.state().status.text);

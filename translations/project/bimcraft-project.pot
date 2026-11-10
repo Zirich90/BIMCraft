@@ -115,7 +115,7 @@ msgstr ""
 msgid "Data Outlet"
 msgstr ""
 
-#: crates/core/src/commands.rs:6821
+#: crates/core/src/commands.rs:6827
 msgid "Dependent"
 msgstr ""
 
@@ -176,8 +176,8 @@ msgstr ""
 msgid "Elbow 90"
 msgstr ""
 
-#: crates/core/src/commands.rs:6605
-#: crates/core/src/commands.rs:8434
+#: crates/core/src/commands.rs:6611
+#: crates/core/src/commands.rs:8440
 msgid "Elevation"
 msgstr ""
 
@@ -477,8 +477,8 @@ msgstr ""
 msgid "Seat Height"
 msgstr ""
 
-#: crates/core/src/commands.rs:6582
-#: crates/core/src/commands.rs:8433
+#: crates/core/src/commands.rs:6588
+#: crates/core/src/commands.rs:8439
 msgid "Section"
 msgstr ""
 
@@ -546,7 +546,7 @@ msgstr ""
 msgid "South"
 msgstr ""
 
-#: crates/core/src/commands.rs:7522
+#: crates/core/src/commands.rs:7528
 msgid "Specification Items"
 msgstr ""
 
@@ -598,7 +598,7 @@ msgstr ""
 msgid "UP"
 msgstr ""
 
-#: crates/core/src/commands.rs:6962
+#: crates/core/src/commands.rs:6968
 msgid "Unnamed"
 msgstr ""
 

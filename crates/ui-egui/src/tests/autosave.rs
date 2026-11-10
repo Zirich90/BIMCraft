@@ -50,7 +50,7 @@ fn background_autosave_remembers_undo_before_the_catalogue_poll_runs() {
     let original = Arc::clone(&s.model);
     let ctx = h.ctx.clone();
     h.state_mut().autosave.next_due = Instant::now();
-    // Queue recovery directly: the next ordinary UI frame would synchronize the external file first.
+    // Queue recovery directly to exercise the snapshot of the just-undone edit.
     h.state_mut().poll_autosave(&ctx);
     assert!(h.state().autosave.busy);
     until(&mut h, |h| !h.state().autosave.busy);

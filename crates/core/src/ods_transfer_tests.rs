@@ -85,8 +85,12 @@ fn bound_catalogue_accepts_copied_unique_products_and_rewrites_their_guid() {
         exported.push(rows(&donor)[1].clone());
         let external = ods::write(&exported).unwrap();
         std::fs::write(&path, &external).unwrap();
-        let reply = if closed { s.execute("open", &json!({"path":project})) } else { s.execute("catalogue_sync", &json!({})) }.unwrap();
-        assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
+        if closed {
+            let reply = s.execute("open", &json!({"path":project})).unwrap();
+            assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
+            assert_eq!(std::fs::read(&path).unwrap(), external);
+        }
+        s.execute("catalogue_sync", &json!({})).unwrap();
         let local = guid(&s, "Transfer cable");
         assert_ne!(local, guid(&donor, "Transfer cable"));
         let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();

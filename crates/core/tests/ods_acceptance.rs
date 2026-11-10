@@ -30,6 +30,7 @@ fn closed_model_replacement_updates_every_instance_and_preserves_real_connection
     row[4] = "9".into();
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings = s.catalogue_bindings.clone();
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(reopened.model.types.runs["wire"]["Acceptance cable"].width, 9.0);

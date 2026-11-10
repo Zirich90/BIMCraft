@@ -3,6 +3,72 @@ use serde_json::json;
 use crate::{engine::Session, ods};
 
 #[test]
+fn a_project_supplied_catalogue_path_is_ignored_even_when_it_points_to_a_valid_workbook() {
+    let (_temp, session, catalogue, project) = project();
+    let mut file: serde_json::Value = serde_json::from_str(&session.model.to_json().unwrap()).unwrap();
+    file["catalogue"] = json!(catalogue);
+    let mut rows = ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
+    rows.retain(|row| row[2] != "Test cable");
+    let external = ods::write(&rows).unwrap();
+    std::fs::write(&catalogue, &external).unwrap();
+    std::fs::write(&project, file.to_string()).unwrap();
+
+    let mut reopened = Session::new();
+    let reply = reopened.execute("open", &json!({"path":project})).unwrap();
+    assert!(reply.get("catalogue").is_none());
+    assert!(!reopened.model.library.entries().any(|(_, entry)| entry.placeholder));
+    assert_eq!(std::fs::read(&catalogue).unwrap(), external);
+}
+
+#[test]
+fn read_only_open_refuses_catalogue_writes() {
+    let (_temp, mut session, catalogue, project) = project();
+    let other = project.with_file_name("other.ods");
+    let external = std::fs::read(&catalogue).unwrap();
+    session.execute("open", &json!({"path":project,"read_only":true})).unwrap();
+    assert!(session.execute("catalogue_sync", &json!({"read_only":true})).is_ok());
+    for (command, params) in
+        [("catalogue_link", json!({"path":other})), ("catalogue_sync", json!({})), ("catalogue_export", json!({"path":other}))]
+    {
+        assert!(session.execute(command, &params).is_err(), "{command}");
+    }
+    assert!(!other.exists());
+    assert_eq!(std::fs::read(&catalogue).unwrap(), external);
+}
+
+#[test]
+fn a_catalogue_binding_rejects_non_regular_or_oversized_workbooks() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("directory.ods");
+    std::fs::create_dir(&directory).unwrap();
+    let large = temp.path().join("large.ods");
+    std::fs::File::create(&large).unwrap().set_len((32 << 20) + 1).unwrap();
+
+    let mut session = Session::new();
+    for path in [&directory, &large] {
+        assert!(session.execute("catalogue_link", &json!({"path":path})).is_err());
+        assert!(session.catalogue_path().is_none());
+    }
+}
+
+#[test]
+fn approving_a_legacy_catalogue_preserves_pending_local_edits() {
+    let (_temp, mut session, catalogue, project) = project();
+    session.execute("type", &json!({"category":"wire","name":"Test cable","width":12})).unwrap();
+    session.execute("save", &json!({"path":project})).unwrap();
+    let external = std::fs::read(&catalogue).unwrap();
+
+    let mut reopened = Session::new();
+    reopened.execute("open", &json!({"path":project})).unwrap();
+    reopened.execute("catalogue_link", &json!({"path":catalogue})).unwrap();
+    assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 12.0);
+    assert_eq!(std::fs::read(&catalogue).unwrap(), external);
+    reopened.execute("catalogue_sync", &json!({})).unwrap();
+    let rows = ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
+    assert_eq!(rows.iter().find(|r| r[2] == "Test cable").unwrap()[3], "12");
+}
+
+#[test]
 fn relinking_the_current_catalogue_keeps_open_model_changes_authoritative() {
     let (_temp, mut session, catalogue, _) = project();
     session.execute("type", &json!({"category":"wire","name":"Test cable","width":12})).unwrap();
@@ -35,13 +101,17 @@ fn saving_unsynchronized_changes_to_an_exported_product_preserves_them_on_open()
         assert!(std::sync::Arc::ptr_eq(&session.model, &before));
         assert_eq!(std::fs::read(&catalogue).unwrap(), original, "saving does not write the catalogue");
         let mut reopened = Session::new();
+        reopened.catalogue_bindings.insert(destination.clone(), catalogue.clone());
         let reply = reopened.execute("open", &json!({"path":destination})).unwrap();
         assert!(reply.get("catalogue_not_loaded").is_none(), "{command}: {reply}");
         assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 12.0, "{command}");
         assert_eq!(reopened.model.elements, elements);
+        assert_eq!(std::fs::read(&catalogue).unwrap(), original);
+        assert!(reply["catalogue"]["backup"].is_null());
+        let sync = reopened.execute("catalogue_sync", &json!({})).unwrap();
         let rows = ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
         assert_eq!(rows.iter().find(|r| r[2] == "Test cable").unwrap()[3], "12");
-        assert_eq!(std::fs::read(reply["catalogue"]["backup"].as_str().unwrap()).unwrap(), original);
+        assert_eq!(std::fs::read(sync["backup"].as_str().unwrap()).unwrap(), original);
         reopened.model.check().unwrap();
     }
 }
@@ -61,6 +131,7 @@ fn simultaneous_product_edits_or_external_deletion_preserve_both_versions_until_
         let external = ods::write(&rows).unwrap();
         std::fs::write(&catalogue, &external).unwrap();
         let mut reopened = Session::new();
+        reopened.catalogue_bindings = session.catalogue_bindings.clone();
         let reply = reopened.execute("open", &json!({"path":project})).unwrap();
         assert!(reply["catalogue_not_loaded"].as_str().is_some_and(|s| s.contains("conflict")), "{reply}");
         assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 12.0);
@@ -115,6 +186,7 @@ fn a_deleted_catalogue_type_keeps_geometry_and_identity_but_leaves_schedules() {
     rows.pop();
     rows.push(original);
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
+    session.catalogue_bindings.insert(project.clone(), catalogue.clone());
     session.execute("open", &json!({"path":project})).unwrap();
     assert_eq!(session.model.library.guid(&crate::library::Kind::Type("wire".into()), "Test cable"), Some(guid));
     assert!(ods::catalogue_rows(&session.model).iter().any(|r| r[2] == "Test cable"));
@@ -132,10 +204,13 @@ fn undoing_an_exported_type_edit_is_preserved_even_before_the_next_catalogue_pol
     let external = std::fs::read(&catalogue).unwrap();
     session.execute("save", &json!({"path":project})).unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings = session.catalogue_bindings.clone();
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 6.0);
-    assert_eq!(std::fs::read(reply["catalogue"]["backup"].as_str().unwrap()).unwrap(), external);
+    assert_eq!(std::fs::read(&catalogue).unwrap(), external);
+    let sync = reopened.execute("catalogue_sync", &json!({})).unwrap();
+    assert_eq!(std::fs::read(sync["backup"].as_str().unwrap()).unwrap(), external);
 }
 
 #[test]
@@ -146,12 +221,14 @@ fn pending_existing_product_edits_survive_read_failure_then_allow_later_external
     let original = std::fs::read(&catalogue).unwrap();
     std::fs::write(&catalogue, b"broken workbook").unwrap();
     let mut recovered = Session::new();
+    recovered.catalogue_bindings = session.catalogue_bindings.clone();
     assert!(recovered.execute("open", &json!({"path":project})).unwrap().get("catalogue_not_loaded").is_some());
     recovered.execute("save", &json!({"path":project})).unwrap();
     std::fs::write(&catalogue, &original).unwrap();
     let reply = recovered.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(recovered.model.types.runs["wire"]["Test cable"].width, 12.0);
+    recovered.execute("catalogue_sync", &json!({})).unwrap();
     recovered.execute("save", &json!({"path":project})).unwrap();
     let mut rows = ods::read(&std::fs::read(&catalogue).unwrap()).unwrap();
     let row = rows.iter_mut().find(|r| r[2] == "Test cable").unwrap();
@@ -239,6 +316,7 @@ fn opening_a_project_reads_external_replacements_and_keeps_type_identity() {
     row[4] = "9".into();
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings = session.catalogue_bindings.clone();
     reopened.execute("open", &json!({"path":project})).unwrap();
     assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 9.0);
     assert_eq!(guid, reopened.model.library.guid(&crate::library::Kind::Type("wire".into()), "Test cable"));
@@ -246,9 +324,10 @@ fn opening_a_project_reads_external_replacements_and_keeps_type_identity() {
 
 #[test]
 fn a_broken_external_catalogue_does_not_prevent_opening_the_last_saved_model() {
-    let (_temp, _session, catalogue, project) = project();
+    let (_temp, session, catalogue, project) = project();
     std::fs::write(&catalogue, b"broken spreadsheet").unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings = session.catalogue_bindings.clone();
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply["catalogue_not_loaded"].is_string());
     assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 6.0);

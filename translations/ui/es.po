@@ -207,7 +207,7 @@ msgstr "Añadir parámetro"
 msgid "Add Revolve"
 msgstr "Añadir revolución"
 
-#: crates/ui-egui/src/context.rs:74
+#: crates/ui-egui/src/context.rs:75
 msgid "Add Route Point"
 msgstr ""
 
@@ -232,7 +232,7 @@ msgstr "Añadir atajo"
 msgid "Add Sort"
 msgstr "Añadir orden"
 
-#: crates/ui-egui/src/mep.rs:467
+#: crates/ui-egui/src/mep.rs:487
 msgid "Add Terminal"
 msgstr "Añadir terminal"
 
@@ -450,12 +450,12 @@ msgstr "Pregunta si guardar, si hay cambios sin guardar; después cierra BIMCraf
 msgid "Associated Level"
 msgstr "Nivel asociado"
 
-#: crates/ui-egui/src/context.rs:93
-#: crates/ui-egui/src/context.rs:610
+#: crates/ui-egui/src/context.rs:95
+#: crates/ui-egui/src/context.rs:617
 msgid "Attach Existing Wire"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:620
+#: crates/ui-egui/src/context.rs:627
 msgid "Attach Selected Wire"
 msgstr ""
 
@@ -655,7 +655,7 @@ msgstr "Bloque"
 msgid "Boards"
 msgstr "Tablas"
 
-#: crates/ui-egui/src/context.rs:471
+#: crates/ui-egui/src/context.rs:478
 #: crates/ui-egui/src/properties.rs:371
 msgid "Bottom"
 msgstr "Inferior"
@@ -740,7 +740,7 @@ msgstr ""
 msgid "Cable carriers"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:328
+#: crates/ui-egui/src/context.rs:335
 msgid "Cable end"
 msgstr ""
 
@@ -790,11 +790,11 @@ msgstr "Cámaras"
 
 #: crates/ui-egui/src/cad.rs:128
 #: crates/ui-egui/src/clouds.rs:85
-#: crates/ui-egui/src/context.rs:426
-#: crates/ui-egui/src/context.rs:484
-#: crates/ui-egui/src/context.rs:521
-#: crates/ui-egui/src/context.rs:579
-#: crates/ui-egui/src/context.rs:621
+#: crates/ui-egui/src/context.rs:433
+#: crates/ui-egui/src/context.rs:491
+#: crates/ui-egui/src/context.rs:528
+#: crates/ui-egui/src/context.rs:586
+#: crates/ui-egui/src/context.rs:628
 #: crates/ui-egui/src/editor.rs:1012
 #: crates/ui-egui/src/fillpatterns.rs:698
 #: crates/ui-egui/src/filter.rs:113
@@ -822,7 +822,7 @@ msgstr "Cancelar modo de edición"
 msgid "Cancel Edit Mode: drop the lines, keep it as it was"
 msgstr "Cancelar modo de edición: descartar las líneas, dejarlo como estaba"
 
-#: crates/ui-egui/src/mep.rs:483
+#: crates/ui-egui/src/mep.rs:503
 msgid "Capture & Descent"
 msgstr "Captación y bajada"
 
@@ -1571,12 +1571,12 @@ msgstr "Tubo conduit"
 msgid "Conflicting imported products"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:425
+#: crates/ui-egui/src/context.rs:432
 msgid "Connect"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:92
-#: crates/ui-egui/src/context.rs:325
+#: crates/ui-egui/src/context.rs:94
+#: crates/ui-egui/src/context.rs:332
 msgid "Connect Equipment to Wire"
 msgstr ""
 
@@ -1584,7 +1584,7 @@ msgstr ""
 msgid "Connect Wire"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:415
+#: crates/ui-egui/src/context.rs:422
 msgid "Connection point relative to equipment insertion point"
 msgstr ""
 
@@ -1720,12 +1720,12 @@ msgstr "Recuento"
 msgid "Create"
 msgstr "Crear"
 
-#: crates/ui-egui/src/context.rs:520
+#: crates/ui-egui/src/context.rs:527
 msgid "Create Carrier"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:91
-#: crates/ui-egui/src/context.rs:501
+#: crates/ui-egui/src/context.rs:93
+#: crates/ui-egui/src/context.rs:508
 msgid "Create Carrier from Wire"
 msgstr ""
 
@@ -1749,7 +1749,7 @@ msgstr "Crear piso"
 msgid "Create Floor Boundary"
 msgstr "Crear contorno de suelo"
 
-#: crates/ui-egui/src/context.rs:86
+#: crates/ui-egui/src/context.rs:88
 msgid "Create Group"
 msgstr "Crear grupo"
 
@@ -1757,7 +1757,7 @@ msgstr "Crear grupo"
 msgid "Create Group (GP): the selected detail lines, filled regions and text made one detail group"
 msgstr "Crear grupo (GP): las líneas de detalle, regiones rellenadas y textos seleccionados en un solo grupo de detalle"
 
-#: crates/ui-egui/src/mep.rs:390
+#: crates/ui-egui/src/mep.rs:410
 msgid "Create Line from Selection"
 msgstr "Crear línea a partir de la selección"
 
@@ -1797,7 +1797,7 @@ msgstr "Crear similar"
 msgid "Create Stair"
 msgstr "Crear escalera"
 
-#: crates/ui-egui/src/context.rs:423
+#: crates/ui-egui/src/context.rs:430
 msgid "Create carrier branches"
 msgstr ""
 
@@ -1925,6 +1925,10 @@ msgstr "Puntos de datos"
 msgid "Datum"
 msgstr "Referencia"
 
+#: crates/ui-egui/src/mep.rs:362
+msgid "Default"
+msgstr ""
+
 #: crates/ui-egui/src/lib.rs:2658
 msgid "Default 3D View"
 msgstr "Vista 3D predeterminada"
@@ -2001,7 +2005,7 @@ msgstr "Demoler (DW): haga clic en un elemento para demolerlo en la fase de la v
 msgid "Demolished"
 msgstr "Demolido"
 
-#: crates/core/src/commands.rs:6821
+#: crates/core/src/commands.rs:6827
 msgid "Dependent"
 msgstr "Dependiente"
 
@@ -2116,7 +2120,7 @@ msgstr "Dimensiones"
 msgid "Discard"
 msgstr "Descartar"
 
-#: crates/ui-egui/src/context.rs:576
+#: crates/ui-egui/src/context.rs:583
 msgid "Disconnect Equipment"
 msgstr ""
 
@@ -2202,7 +2206,7 @@ msgstr "Abajo"
 msgid "Down Conductor"
 msgstr "Conductor de bajada"
 
-#: crates/ui-egui/src/mep.rs:487
+#: crates/ui-egui/src/mep.rs:507
 msgid "Down Conductor (DC): click its start and its end; the same point twice and two heights stand it up a wall"
 msgstr "Conductor de bajada (DC): haz clic en el inicio y el final; el mismo punto dos veces y dos alturas lo ponen de pie en un muro"
 
@@ -2289,7 +2293,7 @@ msgstr "El ancho de cada plumilla en el papel, en mm, para cotas, etiquetas, tex
 msgid "Each pen's width on paper, mm, in views at each scale: a view between two takes the nearer one's. Pen 0 is always a hairline."
 msgstr "El ancho de cada plumilla en el papel, en mm, en las vistas a cada escala: una vista entre dos toma el de la más cercana. La plumilla 0 es siempre una línea capilar."
 
-#: crates/ui-egui/src/mep.rs:492
+#: crates/ui-egui/src/mep.rs:512
 msgid "Earthing"
 msgstr "Puesta a tierra"
 
@@ -2297,7 +2301,7 @@ msgstr "Puesta a tierra"
 msgid "Earthing Conductor"
 msgstr "Conductor de puesta a tierra"
 
-#: crates/ui-egui/src/mep.rs:496
+#: crates/ui-egui/src/mep.rs:516
 msgid "Earthing Conductor (GC): click its start and its end; a chain of clicks makes the ring or the mesh, under the level"
 msgstr "Conductor de puesta a tierra (GC): haz clic en el inicio y el final; una cadena de clics hace el anillo o la malla, bajo el nivel"
 
@@ -2384,12 +2388,12 @@ msgstr "Equipo eléctrico"
 msgid "Electrical Equipment (EE): a distribution board, where you click on the wall; Space turns it"
 msgstr "Equipo eléctrico (EE): un cuadro de distribución, donde hagas clic en el muro; Espacio lo gira"
 
-#: crates/ui-egui/src/mep.rs:367
-#: crates/ui-egui/src/mep.rs:375
+#: crates/ui-egui/src/mep.rs:387
+#: crates/ui-egui/src/mep.rs:395
 msgid "Electrical Lines"
 msgstr "Líneas eléctricas"
 
-#: crates/ui-egui/src/mep.rs:442
+#: crates/ui-egui/src/mep.rs:462
 msgid "Electrical Terminals"
 msgstr "Terminales eléctricos"
 
@@ -2459,7 +2463,7 @@ msgstr "Introduzca un nombre para cada estilo y patrón."
 msgid "Enter a name for every type and pattern."
 msgstr "Introduzca un nombre para cada tipo y patrón."
 
-#: crates/ui-egui/src/context.rs:441
+#: crates/ui-egui/src/context.rs:448
 msgid "Enter a valid bend radius."
 msgstr ""
 
@@ -2467,11 +2471,11 @@ msgstr ""
 msgid "Enter a valid equipment height offset."
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:537
+#: crates/ui-egui/src/context.rs:544
 msgid "Enter a valid lateral offset."
 msgstr ""
 
-#: crates/ui-egui/src/orbit.rs:883
+#: crates/ui-egui/src/orbit.rs:953
 msgid "Enter a valid workplane height offset."
 msgstr ""
 
@@ -2483,7 +2487,7 @@ msgstr ""
 msgid "Enter valid compartment lengths."
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:449
+#: crates/ui-egui/src/context.rs:456
 msgid "Enter valid connection coordinates."
 msgstr ""
 
@@ -2566,11 +2570,11 @@ msgstr "Exportar..."
 msgid "Extents"
 msgstr "Extensión"
 
-#: crates/ui-egui/src/context.rs:470
+#: crates/ui-egui/src/context.rs:477
 msgid "Exterior"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:401
+#: crates/ui-egui/src/context.rs:408
 msgid "Exterior face"
 msgstr ""
 
@@ -2755,7 +2759,7 @@ msgstr "Alto"
 msgid "Finish"
 msgstr "Acabado"
 
-#: crates/ui-egui/src/context.rs:76
+#: crates/ui-egui/src/context.rs:78
 msgid "Finish Drawing"
 msgstr "Terminar dibujo"
 
@@ -2796,7 +2800,7 @@ msgstr ""
 msgid "Fire Alarm Panels"
 msgstr "Centrales de alarma de incendio"
 
-#: crates/ui-egui/src/context.rs:329
+#: crates/ui-egui/src/context.rs:336
 msgid "First end"
 msgstr ""
 
@@ -2804,7 +2808,7 @@ msgstr ""
 msgid "Fixed Window"
 msgstr "Ventana fija"
 
-#: crates/ui-egui/src/context.rs:384
+#: crates/ui-egui/src/context.rs:391
 msgid "Fixed point"
 msgstr ""
 
@@ -2976,7 +2980,7 @@ msgstr "Material del marco"
 msgid "Frame Width"
 msgstr "Ancho del marco"
 
-#: crates/ui-egui/src/orbit.rs:178
+#: crates/ui-egui/src/orbit.rs:190
 msgid "Free 3D"
 msgstr ""
 
@@ -3182,7 +3186,7 @@ msgstr "Resaltar lo que está bajo el cursor"
 msgid "Home"
 msgstr "Inicio"
 
-#: crates/ui-egui/src/orbit.rs:914
+#: crates/ui-egui/src/orbit.rs:984
 msgid "Home View"
 msgstr "Vista inicial"
 
@@ -3361,11 +3365,11 @@ msgstr ""
 msgid "Interface scale"
 msgstr "Escala de la interfaz"
 
-#: crates/ui-egui/src/context.rs:470
+#: crates/ui-egui/src/context.rs:477
 msgid "Interior"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:400
+#: crates/ui-egui/src/context.rs:407
 msgid "Interior face"
 msgstr ""
 
@@ -3429,7 +3433,7 @@ msgstr "Justo ahora"
 msgid "Justification:"
 msgstr "Alineación:"
 
-#: crates/ui-egui/src/context.rs:573
+#: crates/ui-egui/src/context.rs:580
 msgid "Keep Connection"
 msgstr ""
 
@@ -3470,7 +3474,7 @@ msgstr "Idioma"
 msgid "Later"
 msgstr "Más tarde"
 
-#: crates/ui-egui/src/context.rs:517
+#: crates/ui-egui/src/context.rs:524
 msgid "Lateral Offset:"
 msgstr ""
 
@@ -3749,7 +3753,7 @@ msgstr "Línea de ubicación"
 msgid "Location Line:"
 msgstr "Línea de ubicación:"
 
-#: crates/ui-egui/src/mep.rs:425
+#: crates/ui-egui/src/mep.rs:445
 msgid "Lock Mark"
 msgstr "Fijar marca"
 
@@ -3770,9 +3774,9 @@ msgstr ""
 msgid "Main Model"
 msgstr "Modelo principal"
 
-#: crates/ui-egui/src/context.rs:357
-#: crates/ui-egui/src/context.rs:361
-#: crates/ui-egui/src/context.rs:363
+#: crates/ui-egui/src/context.rs:364
+#: crates/ui-egui/src/context.rs:368
+#: crates/ui-egui/src/context.rs:370
 msgid "Main wire route"
 msgstr ""
 
@@ -3957,7 +3961,7 @@ msgstr "Minimizar la cinta de opciones"
 msgid "Minimize the ribbon to its tabs"
 msgstr "Minimizar la cinta de opciones a sus pestañas"
 
-#: crates/ui-egui/src/context.rs:405
+#: crates/ui-egui/src/context.rs:412
 msgid "Minimum bend radius"
 msgstr ""
 
@@ -4038,8 +4042,8 @@ msgstr ""
 msgid "Motion Detectors"
 msgstr "Detectores de movimiento"
 
-#: crates/ui-egui/src/context.rs:90
-#: crates/ui-egui/src/context.rs:466
+#: crates/ui-egui/src/context.rs:92
+#: crates/ui-egui/src/context.rs:473
 msgid "Mount to Surface"
 msgstr ""
 
@@ -4048,7 +4052,8 @@ msgstr ""
 msgid "Mounting Height"
 msgstr "Altura de montaje"
 
-#: crates/ui-egui/src/context.rs:377
+#: crates/ui-egui/src/context.rs:384
+#: crates/ui-egui/src/orbit.rs:186
 msgid "Mounting surface"
 msgstr ""
 
@@ -4060,7 +4065,7 @@ msgstr "Mover"
 msgid "Move (MV): click a base point, then where it goes"
 msgstr "Mover (MV): haz clic en un punto base y luego adonde va"
 
-#: crates/ui-egui/src/context.rs:571
+#: crates/ui-egui/src/context.rs:578
 msgid "Move Connected Cable Carrier"
 msgstr ""
 
@@ -4474,7 +4479,7 @@ msgstr "Voladizo:"
 msgid "Overhead Lines"
 msgstr "Líneas superiores"
 
-#: crates/ui-egui/src/context.rs:611
+#: crates/ui-egui/src/context.rs:618
 msgid "Overlapping wires: select a wire and confirm the attachment."
 msgstr ""
 
@@ -4770,7 +4775,7 @@ msgstr "Imagen…"
 msgid "Pipe"
 msgstr "Tubería"
 
-#: crates/ui-egui/src/mep.rs:510
+#: crates/ui-egui/src/mep.rs:530
 msgid "Pipe (PI): click its start and its end; a chain of clicks makes a pipe for each step"
 msgstr "Tubería (PI): haz clic en el inicio y el final; una cadena de clics hace una tubería por tramo"
 
@@ -4990,7 +4995,7 @@ msgstr "Colocar ventana"
 msgid "Place Wire"
 msgstr "Colocar cable"
 
-#: crates/ui-egui/src/orbit.rs:216
+#: crates/ui-egui/src/orbit.rs:228
 msgid "Place on Face"
 msgstr ""
 
@@ -5023,7 +5028,7 @@ msgstr "Planta como SVG…"
 msgid "Plane"
 msgstr "Plano"
 
-#: crates/ui-egui/src/orbit.rs:203
+#: crates/ui-egui/src/orbit.rs:215
 msgid "Plane Coordinate"
 msgstr ""
 
@@ -5051,7 +5056,7 @@ msgstr "Enlucido"
 msgid "Plumbing"
 msgstr "Fontanería"
 
-#: crates/ui-egui/src/mep.rs:506
+#: crates/ui-egui/src/mep.rs:526
 msgid "Plumbing & Piping"
 msgstr "Fontanería y tuberías"
 
@@ -5391,7 +5396,7 @@ msgstr "Recargar"
 msgid "Reload All"
 msgstr "Recargar todos"
 
-#: crates/ui-egui/src/context.rs:89
+#: crates/ui-egui/src/context.rs:91
 msgid "Reload CAD"
 msgstr "Recargar CAD"
 
@@ -5433,11 +5438,11 @@ msgstr "Renombrar opción"
 msgid "Rename Set"
 msgstr "Renombrar conjunto"
 
-#: crates/ui-egui/src/mep.rs:467
+#: crates/ui-egui/src/mep.rs:487
 msgid "Rename Terminal"
 msgstr "Cambiar nombre del terminal"
 
-#: crates/ui-egui/src/mep.rs:431
+#: crates/ui-egui/src/mep.rs:451
 msgid "Renumber Electrical Line"
 msgstr "Renumerar línea eléctrica"
 
@@ -5623,15 +5628,15 @@ msgstr "Redonda"
 msgid "Route Carriers"
 msgstr ""
 
-#: crates/ui-egui/src/mep.rs:360
+#: crates/ui-egui/src/mep.rs:356
 msgid "Route Carriers in Project"
 msgstr ""
 
-#: crates/ui-egui/src/mep.rs:354
+#: crates/ui-egui/src/mep.rs:355
 msgid "Route Carriers on Level"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:359
+#: crates/ui-egui/src/context.rs:366
 msgid "Route carrier"
 msgstr ""
 
@@ -5760,7 +5765,7 @@ msgstr "Buscar…"
 msgid "Seat Height"
 msgstr "Altura del asiento"
 
-#: crates/ui-egui/src/context.rs:330
+#: crates/ui-egui/src/context.rs:337
 msgid "Second end"
 msgstr ""
 
@@ -5812,7 +5817,7 @@ msgstr "Segmentos de {}"
 msgid "Select"
 msgstr "Seleccionar"
 
-#: crates/ui-egui/src/context.rs:82
+#: crates/ui-egui/src/context.rs:84
 msgid "Select All Instances"
 msgstr "Seleccionar todos los ejemplares"
 
@@ -6194,7 +6199,7 @@ msgstr "Espaciado:"
 msgid "Speakers"
 msgstr "Altavoces"
 
-#: crates/core/src/commands.rs:7522
+#: crates/core/src/commands.rs:7528
 msgid "Specification Items"
 msgstr ""
 
@@ -6524,7 +6529,7 @@ msgstr "Los extremos de muros, ejes y lo demás dibujado, y los puntos ya señal
 msgid "The foot of the perpendicular from the last point to a wall or grid"
 msgstr "El pie de la perpendicular desde el último punto a un muro o eje"
 
-#: crates/ui-egui/src/orbit.rs:487
+#: crates/ui-egui/src/orbit.rs:499
 msgid "The graphics card couldn't draw the 3D view ({}): it is drawn on the processor"
 msgstr "La tarjeta gráfica no pudo dibujar la vista 3D ({}): se dibuja en el procesador"
 
@@ -6544,7 +6549,7 @@ msgstr "El bucle está abierto: {} extremos de línea no se encuentran con otra 
 msgid "The middle of a wall, along its arc"
 msgstr "El medio de un muro, a lo largo de su arco"
 
-#: crates/ui-egui/src/context.rs:413
+#: crates/ui-egui/src/context.rs:420
 msgid "The mounting wall was deleted. Select a new wall or a fixed point to reconnect."
 msgstr ""
 
@@ -6607,7 +6612,7 @@ msgstr "La barra de título y el marco del propio sistema, en lugar de los de la
 msgid "The views following it get from it:"
 msgstr "Lo que reciben de ella las vistas que la siguen:"
 
-#: crates/ui-egui/src/context.rs:633
+#: crates/ui-egui/src/context.rs:640
 msgid "The wire no longer overlaps this carrier."
 msgstr ""
 
@@ -6726,7 +6731,7 @@ msgstr "Hasta (grados)"
 msgid "Tools"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:471
+#: crates/ui-egui/src/context.rs:478
 #: crates/ui-egui/src/lib.rs:3959
 msgid "Top"
 msgstr "Superior"
@@ -6861,7 +6866,7 @@ msgstr "Escribe la nota en la barra de opciones y haz clic donde va."
 msgid "Type the note in the Options Bar, then click where it goes: its top left corner."
 msgstr "Escribe la nota en la barra de opciones y haz clic donde va: su esquina superior izquierda."
 
-#: crates/ui-egui/src/context.rs:502
+#: crates/ui-egui/src/context.rs:509
 #: crates/ui-egui/src/fillpatterns.rs:435
 #: crates/ui-egui/src/properties.rs:1576
 #: crates/ui-egui/src/properties.rs:2032
@@ -6914,7 +6919,7 @@ msgstr "Deshacer {}"
 msgid "Undo {} steps"
 msgstr "Deshacer {} pasos"
 
-#: crates/ui-egui/src/context.rs:87
+#: crates/ui-egui/src/context.rs:89
 msgid "Ungroup"
 msgstr "Desagrupar"
 
@@ -6950,7 +6955,7 @@ msgstr ""
 msgid "Unlink"
 msgstr ""
 
-#: crates/ui-egui/src/mep.rs:425
+#: crates/ui-egui/src/mep.rs:445
 msgid "Unlock Mark"
 msgstr "Desfijar marca"
 
@@ -6958,7 +6963,7 @@ msgstr "Desfijar marca"
 msgid "Unlock selected carrier sizes"
 msgstr ""
 
-#: crates/core/src/commands.rs:6962
+#: crates/core/src/commands.rs:6968
 msgid "Unnamed"
 msgstr "Sin nombre"
 
@@ -7150,7 +7155,7 @@ msgid "WC"
 msgstr "Inodoro"
 
 #: crates/core/src/commands.rs:332
-#: crates/ui-egui/src/context.rs:376
+#: crates/ui-egui/src/context.rs:383
 msgid "Wall"
 msgstr "Muro"
 
@@ -7272,11 +7277,11 @@ msgstr "Cable (EW): haz clic en el inicio y el final; una cadena de clics hace u
 msgid "Wire compartment"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:511
+#: crates/ui-egui/src/context.rs:518
 msgid "Wire placement inside carrier:"
 msgstr ""
 
-#: crates/ui-egui/src/context.rs:615
+#: crates/ui-egui/src/context.rs:622
 msgid "Wire {}"
 msgstr ""
 
@@ -7288,11 +7293,11 @@ msgstr "Estructura alámbrica"
 msgid "Wires"
 msgstr "Cables"
 
-#: crates/ui-egui/src/orbit.rs:221
+#: crates/ui-egui/src/orbit.rs:233
 msgid "Work Level"
 msgstr ""
 
-#: crates/ui-egui/src/orbit.rs:182
+#: crates/ui-egui/src/orbit.rs:194
 msgid "Work Plane"
 msgstr ""
 
@@ -7333,7 +7338,7 @@ msgid "Zoom Out"
 msgstr "Alejar"
 
 #: crates/ui-egui/src/canvas.rs:1237
-#: crates/ui-egui/src/orbit.rs:917
+#: crates/ui-egui/src/orbit.rs:987
 msgid "Zoom to Fit"
 msgstr "Zoom para ajustar"
 
@@ -7670,7 +7675,7 @@ msgstr "la abertura tiene que quedar en su muro"
 msgid "there's no detail group yet: select detail lines and Create Group"
 msgstr "aún no hay grupo de detalle: seleccione líneas de detalle y Crear grupo"
 
-#: crates/ui-egui/src/orbit.rs:263
+#: crates/ui-egui/src/orbit.rs:275
 msgid "there's no face to paint there"
 msgstr "no hay cara que pintar ahí"
 
@@ -7678,7 +7683,7 @@ msgstr "no hay cara que pintar ahí"
 msgid "there's no folder to keep favorites in here"
 msgstr "no hay carpeta donde guardar favoritos aquí"
 
-#: crates/ui-egui/src/orbit.rs:891
+#: crates/ui-egui/src/orbit.rs:961
 #: crates/ui-egui/src/paper.rs:136
 #: crates/ui-egui/src/section.rs:151
 msgid "this tool works in plan views: open one from the Project Browser"
@@ -8487,3 +8492,6 @@ msgstr "Cables"
 #: crates/ui-egui/src/lib.rs:4065
 #~ msgid "Click a wall or a line where to split it."
 #~ msgstr "Haga clic en un muro o una línea donde dividirlo."
+#: crates/ui-egui/src/mep.rs:359
+#~ msgid "Carrier Type"
+#~ msgstr ""

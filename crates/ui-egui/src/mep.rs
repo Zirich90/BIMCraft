@@ -351,15 +351,35 @@ impl BimApp {
             }
             ui.menu_button(crate::lang::t(msg!("Route Carriers")), |ui| {
                 let level = self.plan_level();
-                if ui.add_enabled(level.is_some(), egui::Button::new(crate::lang::t(msg!("Route Carriers on Level")))).clicked()
-                    && let Some(level) = level
-                {
-                    self.run("cable_carrier", serde_json::json!({"from_wires":{"level":level}}));
-                    ui.close();
-                }
-                if ui.button(crate::lang::t(msg!("Route Carriers in Project"))).clicked() {
-                    self.run("cable_carrier", serde_json::json!({"from_wires":{}}));
-                    ui.close();
+                for (label, enabled, scope) in [
+                    (msg!("Route Carriers on Level"), level.is_some(), serde_json::json!({"level":level})),
+                    (msg!("Route Carriers in Project"), true, serde_json::json!({})),
+                ] {
+                    let picked = ui
+                        .add_enabled_ui(enabled, |ui| {
+                            ui.menu_button(crate::lang::t(label), |ui| {
+                                let types = self.session.model.types.runs.get("cablecarrier");
+                                if ui.button(crate::lang::t(msg!("Default"))).clicked() {
+                                    return Some(None);
+                                }
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        types
+                                            .into_iter()
+                                            .flat_map(|types| types.keys())
+                                            .find_map(|name| ui.button(name).clicked().then(|| Some(name.clone())))
+                                    })
+                                    .inner
+                            })
+                            .inner
+                            .flatten()
+                        })
+                        .inner;
+                    if let Some(type_name) = picked {
+                        self.run("cable_carrier", serde_json::json!({"from_wires":scope,"type":type_name}));
+                        ui.close();
+                    }
                 }
             });
         });

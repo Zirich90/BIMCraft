@@ -1,8 +1,9 @@
 //! The session every front end drives: one model, its undo history and the command registry.
 //! Every user-visible action is a [`Command`]; the CLI, scripts and MCP all reach the same ones.
 
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use serde_json::{Value, json};
@@ -79,6 +80,10 @@ pub struct Session {
     redo: Vec<(Step, Arc<Model>)>,
     /// How many times the project was replaced, so a transaction knows its history went with it.
     resets: usize,
+    /// User-approved workbook paths, keyed by absolute project path. Never loaded from a model.
+    pub catalogue_bindings: BTreeMap<PathBuf, PathBuf>,
+    pub(crate) catalogue_untitled: Option<PathBuf>,
+    pub(crate) read_only: bool,
     /// GUIDs already owned by this document's catalogue, including types removed by Undo.
     pub(crate) catalogue_owned: std::collections::BTreeSet<crate::ids::Guid>,
     /// Last rows written to the catalogue, independent of undoable model history.
@@ -116,6 +121,9 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             resets: 0,
+            catalogue_bindings: BTreeMap::new(),
+            catalogue_untitled: None,
+            read_only: false,
             catalogue_owned: Default::default(),
             catalogue_baseline: Default::default(),
         }
@@ -143,35 +151,25 @@ impl Session {
     /// Committed project state plus catalogue changes that must survive closing or recovery.
     /// Saving does not edit the live model or add an undo step.
     pub fn snapshot(&self) -> Arc<Model> {
-        let retired = if self.model.catalogue.is_some() {
+        if self.catalogue_path().is_none() {
+            return Arc::clone(&self.model);
+        }
+        let retired = {
             let active: std::collections::BTreeSet<_> = self.model.library.entries().map(|(_, entry)| entry.guid).collect();
             self.model.catalogue_retired.union(&self.catalogue_owned).copied().filter(|guid| !active.contains(guid)).collect()
-        } else {
-            Default::default()
         };
-        let unexported = if self.model.catalogue.is_some() {
-            crate::ods::catalogue_rows(&self.model)
-                .iter()
-                .skip(1)
-                .filter_map(|row| row.first().and_then(|guid| crate::ids::Guid::parse(guid)))
-                .filter(|guid| self.model.catalogue_unexported.contains(guid) || !self.catalogue_owned.contains(guid))
-                .collect()
-        } else {
-            Default::default()
-        };
-        let pending_edits = if self.model.catalogue.is_some() {
-            crate::ods::catalogue_rows(&self.model)
-                .into_iter()
-                .skip(1)
-                .filter_map(|row| {
-                    let guid = crate::ids::Guid::parse(&row[0])?;
-                    let previous = self.catalogue_baseline.get(&guid)?;
-                    (previous != &row).then(|| (guid, previous.clone()))
-                })
-                .collect()
-        } else {
-            Default::default()
-        };
+        let mut unexported = std::collections::BTreeSet::new();
+        let mut pending_edits = BTreeMap::new();
+        for row in crate::ods::catalogue_rows(&self.model).into_iter().skip(1) {
+            let Some(guid) = crate::ids::Guid::parse(&row[0]) else { continue };
+            if self.model.catalogue_unexported.contains(&guid) || !self.catalogue_owned.contains(&guid) {
+                unexported.insert(guid);
+            } else if let Some(previous) = self.catalogue_baseline.get(&guid)
+                && previous != &row
+            {
+                pending_edits.insert(guid, previous.clone());
+            }
+        }
         if retired == self.model.catalogue_retired
             && unexported == self.model.catalogue_unexported
             && pending_edits == self.model.catalogue_pending_edits
@@ -185,17 +183,49 @@ impl Session {
         Arc::new(model)
     }
 
+    pub fn catalogue_path(&self) -> Option<&Path> {
+        match &self.path {
+            Some(project) => self.catalogue_for(project),
+            None => self.catalogue_untitled.as_deref(),
+        }
+    }
+
+    pub(crate) fn catalogue_for(&self, project: &Path) -> Option<&Path> {
+        let key = std::path::absolute(project).ok()?;
+        self.catalogue_bindings.get(&key).map(PathBuf::as_path)
+    }
+
+    pub(crate) fn set_catalogue_path(&mut self, path: Option<PathBuf>) {
+        if let Some(project) = &self.path {
+            if let Ok(key) = std::path::absolute(project) {
+                if let Some(path) = path {
+                    self.catalogue_bindings.insert(key, path);
+                } else {
+                    self.catalogue_bindings.remove(&key);
+                }
+            }
+        } else {
+            self.catalogue_untitled = path;
+        }
+    }
+
+    pub fn catalogue_writable(&self) -> bool {
+        !self.read_only && !self.path.as_ref().and_then(|path| std::fs::metadata(path).ok()).is_some_and(|m| m.permissions().readonly())
+    }
+
     /// Replace the model (new, open), forgetting the history.
     pub fn reset(&mut self, model: Model, path: Option<PathBuf>) {
         self.model = Arc::new(model);
         self.path = path;
+        self.catalogue_untitled = None;
+        self.read_only = false;
         (self.phase, self.option) = (None, None);
         self.resets += 1;
         self.undo.clear();
         self.redo.clear();
         self.catalogue_owned.clear();
         self.catalogue_baseline = Default::default();
-        if self.model.catalogue.is_some() {
+        if self.catalogue_path().is_some() {
             self.remember_catalogue();
         }
     }
@@ -205,15 +235,11 @@ impl Session {
             .into_iter()
             .skip(1)
             .filter_map(|row| crate::ids::Guid::parse(&row[0]).map(|guid| (guid, row)))
+            .filter(|(guid, _)| !self.model.catalogue_unexported.contains(guid))
             .collect();
+        self.catalogue_owned = baseline.keys().chain(&self.model.catalogue_retired).copied().collect();
         baseline.extend(self.model.catalogue_pending_edits.clone());
         self.catalogue_baseline = Arc::new(baseline);
-        self.catalogue_owned = crate::ods::catalogue_rows(&self.model)
-            .iter()
-            .skip(1)
-            .filter_map(|row| crate::ids::Guid::parse(&row[0]))
-            .chain(self.model.catalogue_retired.iter().copied())
-            .collect();
     }
 
     /// Labels of the undo steps, oldest first.
@@ -357,13 +383,21 @@ impl Session {
         let (mut undo, redo, resets) = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo), self.resets);
         let catalogue_owned = self.catalogue_owned.clone();
         let catalogue_baseline = self.catalogue_baseline.clone();
+        let catalogue_untitled = self.catalogue_untitled.clone();
+        let catalogue_bindings = self.catalogue_bindings.clone();
+        let read_only = self.read_only;
         let result = catch_unwind(AssertUnwindSafe(|| f(self)))
             .unwrap_or_else(|p| Err(format!("internal error in `{label}`: {}", panic_text(p.as_ref()))));
         match result {
             Err(e) => {
+                let binding_changed =
+                    self.path != path || self.catalogue_untitled != catalogue_untitled || self.catalogue_bindings != catalogue_bindings;
                 (self.model, self.path, self.phase, self.option) = (before, path, phase, option);
                 (self.undo, self.redo) = (undo, redo);
-                if self.resets != resets {
+                self.catalogue_untitled = catalogue_untitled;
+                self.catalogue_bindings = catalogue_bindings;
+                self.read_only = read_only;
+                if self.resets != resets || binding_changed {
                     self.catalogue_owned = catalogue_owned;
                     self.catalogue_baseline = catalogue_baseline;
                 }

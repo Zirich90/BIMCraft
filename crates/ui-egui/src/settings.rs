@@ -7,6 +7,7 @@
 
 use bimcraft_i18n::msg;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use egui::{Align, ComboBox, Context, Id as UiId, Layout, Modal, RichText, ScrollArea, ThemePreference, Ui, vec2};
@@ -31,6 +32,10 @@ pub fn beside(favorites: &Path) -> PathBuf {
 /// The interface's language the settings file at `path` keeps, if it keeps one: a blank project starts in it.
 pub fn language_in(path: &Path) -> Option<Lang> {
     read(path)?["language"].as_str().and_then(Lang::from_code)
+}
+
+pub fn catalogue_bindings_in(path: &Path) -> BTreeMap<PathBuf, PathBuf> {
+    read(path).and_then(|v| serde_json::from_value(v.get("catalogue_bindings")?.clone()).ok()).unwrap_or_default()
 }
 
 /// How the window was left: its size in points and whether it was maximized.
@@ -93,6 +98,7 @@ pub struct Settings {
     pub high_contrast: [u8; 3],
     /// The system's title bar rather than the window's own, where the window can draw its own.
     pub system_title_bar: bool,
+    pub catalogue_bindings: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Settings {
@@ -115,6 +121,7 @@ impl Settings {
             "window": self.window.to_json(),
             "high_contrast": self.high_contrast,
             "system_title_bar": self.system_title_bar,
+            "catalogue_bindings": self.catalogue_bindings,
         })
     }
 
@@ -148,6 +155,7 @@ impl Settings {
             window: Window::from_json(&v["window"], base.window),
             high_contrast: colour(&v["high_contrast"]).unwrap_or(base.high_contrast),
             system_title_bar: v["system_title_bar"].as_bool().unwrap_or(base.system_title_bar),
+            catalogue_bindings: serde_json::from_value(v["catalogue_bindings"].clone()).unwrap_or(base.catalogue_bindings),
         }
     }
 }
@@ -230,6 +238,7 @@ impl BimApp {
         self.window.kept = kept.window;
         self.scan_contrast = kept.high_contrast;
         self.system_title_bar = kept.system_title_bar;
+        self.session.catalogue_bindings = kept.catalogue_bindings.clone();
         self.settings_kept = Some(kept);
         self.settings_path = Some(path);
     }
@@ -253,6 +262,7 @@ impl BimApp {
             window: self.window.kept,
             high_contrast: self.scan_contrast,
             system_title_bar: self.system_title_bar,
+            catalogue_bindings: self.session.catalogue_bindings.clone(),
         }
     }
 

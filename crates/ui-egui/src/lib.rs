@@ -2526,7 +2526,7 @@ impl BimApp {
             }
         }
         if let Some(error) = reply["catalogue_not_loaded"].as_str() {
-            self.status = Status { text: tf("Equipment catalogue could not be loaded: {}", &[error]), error: true };
+            self.catalogue_open_failed(error);
         }
         true
     }

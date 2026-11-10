@@ -2116,9 +2116,6 @@ pub struct Model {
     /// What its drawings say, and the names commands give.
     #[serde(default)]
     pub language: Language,
-    /// External equipment catalogue; an absolute path, independent of the working directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalogue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carrier_settings: Option<CarrierSettings>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2129,7 +2126,7 @@ pub struct Model {
     /// Newly created products not yet exported; reopening must not treat them as externally deleted.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub catalogue_unexported: BTreeSet<Guid>,
-    /// Last synchronized rows for locally edited products; opening compares all three versions before writing.
+    /// Last synchronized rows for locally edited products; opening compares all three versions without writing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogue_pending_edits: BTreeMap<Guid, Vec<String>>,
     pub next_id: Id,
@@ -2227,7 +2224,6 @@ impl Model {
             uid: fresh_uid(),
             units: Units::default(),
             language,
-            catalogue: None,
             carrier_settings: None,
             electrical_mark_templates: BTreeMap::new(),
             catalogue_retired: BTreeSet::new(),
@@ -4959,13 +4955,6 @@ impl Model {
             || (!self.catalogue_retired.is_empty() && self.library.entries().any(|(_, e)| self.catalogue_retired.contains(&e.guid)))
         {
             return Err("Cancelled catalogue identities must be real GUIDs, absent from the library, with at most 20000 entries".into());
-        }
-        if self
-            .catalogue
-            .as_ref()
-            .is_some_and(|p| p.is_empty() || p.len() > 4096 || p.contains('\0') || !std::path::Path::new(p).is_absolute())
-        {
-            return Err("Catalogue path must be absolute, nonempty and at most 4096 bytes".into());
         }
         if let Some(lw) = &self.line_weights {
             lw.check()?;

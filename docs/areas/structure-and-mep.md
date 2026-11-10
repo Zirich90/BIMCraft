@@ -83,8 +83,10 @@ vertical span, and links the wire by GUID in the same undo step. Placement uses
 the section's local frame, keeping the wire fixed; its whole section must fit,
 including rectangular corners inside a round carrier. Already linked wires and
 owned equipment feeders are refused. On Low Voltage, Route Carriers on Level and Route Carriers in Project process uncarried main
-wires in one undo step. Compatible wires can share an overlapping, uncompartmented carrier when its envelope and simultaneous fill
-fit the selected profile. A new carrier uses the project's default type and must pass the same checks.
+wires in one undo step. Wires of the same system can share an uncompartmented carrier when it contains their full physical runs
+and the simultaneous fill fits the selected profile. Wires may have different cable marks, sizes or surface mounts. Select a carrier
+type before running either scope. An explicit type limits both new carriers and sharing
+to that type. Default uses the project's configured type for new carriers.
 Create Carrier from Wire opens an explicit
 type, placement and lateral-offset editor in plans and the 3D view.
 
@@ -204,8 +206,12 @@ current acceptance evidence and the pending Russian regulatory profile.
 # Surface query for mounting drafts
 
 In 3D, Free 3D on Wire and Cable Carrier takes points from visible faces, or from the chosen work plane in open space.
+The start marker follows the pointer until the first click and then marks the fixed start.
 Ortho keeps the dominant world axis. A segment whose endpoints lie on the same supported face is created with a mount
 in the same undo step. The preview draws the physical axis, including the offset from the face.
+Move on the 3D selection's context menu uses the work plane. For one mounted route, it uses the mounting face.
+For mounted equipment, hover over a supported face to preview the new pose and click to move and mount the same component there.
+Add Route Point on a mounted route places the bend on that face.
 
 Place on Face and Shift-drag in 3D store an equipment mount by host GUID and face. The contact follows edits to the host,
 and cable feeders follow the equipment in the same undo step. Removing the host detaches the equipment at its current pose.

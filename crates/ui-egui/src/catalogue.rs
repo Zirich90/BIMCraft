@@ -1,4 +1,5 @@
 //! Desktop polling policy; catalogue ownership, validation and file replacement stay in the core commands.
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -14,7 +15,7 @@ use crate::{BimApp, Status};
 pub(crate) struct State {
     next_check: f64,
     model: Weak<Model>,
-    path: Option<String>,
+    path: Option<PathBuf>,
     stamp: Option<(SystemTime, u64)>,
     error: Option<String>,
     announced: std::collections::BTreeSet<bimcraft_core::ids::Guid>,
@@ -64,7 +65,7 @@ impl Default for EquipmentDraft {
     }
 }
 
-fn stamp(path: &str) -> Option<(SystemTime, u64)> {
+fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     // shortcut: saves retaining mtime and length are invisible; use content hashing to support such editors.
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.modified().ok()?, metadata.len()))
@@ -91,7 +92,8 @@ impl BimApp {
                 self.equipment_draft.name.clear();
             }
         }
-        let linked = self.session.model.catalogue.clone();
+        let linked = self.session.catalogue_path().is_some();
+        let writable = self.session.catalogue_writable();
         let mut close = false;
         let response = egui::Modal::new(egui::Id::new("equipment-catalogue")).show(ctx, |ui| {
             ui.set_width(540.0);
@@ -154,7 +156,7 @@ impl BimApp {
                     }
                     ui.horizontal(|ui| {
                         for (label, save) in [(bimcraft_i18n::msg!("Link Existing..."), false), (bimcraft_i18n::msg!("Create..."), true)] {
-                            if ui.button(t(label)).clicked() {
+                            if ui.add_enabled(writable, egui::Button::new(t(label))).clicked() {
                                 let dialog = rfd::AsyncFileDialog::new().add_filter(t("OpenDocument Spreadsheet"), &["ods"]);
                                 let dialog = if save { dialog.set_file_name("equipment.ods") } else { dialog };
                                 self.ask_file(ctx, dialog, save, |app, path| {
@@ -218,11 +220,10 @@ impl BimApp {
                 });
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.add_enabled(linked.is_some(), egui::Button::new(t("Synchronize"))).clicked() {
-                    self.catalogue.model = Weak::new();
-                    self.poll_catalogue(ctx);
+                if ui.add_enabled(linked && writable, egui::Button::new(t("Synchronize"))).clicked() {
+                    self.sync_catalogue(ctx, true);
                 }
-                if ui.add_enabled(linked.is_some(), egui::Button::new(t("Unlink"))).clicked() {
+                if ui.add_enabled(linked, egui::Button::new(t("Unlink"))).clicked() {
                     self.run("catalogue_link", json!({"path":null}));
                 }
                 close = ui.button(t("Close")).clicked();
@@ -487,10 +488,23 @@ impl BimApp {
     }
 
     pub(crate) fn poll_catalogue(&mut self, ctx: &Context) {
+        self.sync_catalogue(ctx, false);
+    }
+
+    pub(crate) fn catalogue_open_failed(&mut self, error: &str) {
+        let text = tf("Equipment catalogue could not be loaded: {}", &[error]);
+        self.catalogue.path = self.session.catalogue_path().map(Path::to_path_buf);
+        self.catalogue.stamp = self.catalogue.path.as_deref().and_then(stamp);
+        self.catalogue.model = Arc::downgrade(&self.session.model);
+        self.catalogue.error = Some(text.clone());
+        self.status = Status { text, error: true };
+    }
+
+    fn sync_catalogue(&mut self, ctx: &Context, write: bool) {
         if !self.catalogue.model.ptr_eq(&Arc::downgrade(&self.session.model)) {
             self.notify_pending_catalogue();
         }
-        let Some(path) = self.session.model.catalogue.clone() else {
+        let Some(path) = self.session.catalogue_path().map(Path::to_path_buf) else {
             if self.catalogue.path.is_none() && self.catalogue.model.ptr_eq(&Arc::downgrade(&self.session.model)) {
                 return;
             }
@@ -505,15 +519,16 @@ impl BimApp {
         ctx.request_repaint_after(Duration::from_secs(2));
         let model_changed = !self.catalogue.model.ptr_eq(&Arc::downgrade(&self.session.model));
         let now = ctx.input(|i| i.time);
-        if !model_changed && now < self.catalogue.next_check {
+        if !write && !model_changed && now < self.catalogue.next_check {
             return;
         }
         self.catalogue.next_check = now + 2.0;
         let current = stamp(&path);
-        if !model_changed && self.catalogue.path.as_ref() == Some(&path) && current == self.catalogue.stamp {
+        if !write && self.catalogue.path.as_ref() == Some(&path) && current == self.catalogue.stamp {
+            self.catalogue.model = Arc::downgrade(&self.session.model);
             return;
         }
-        match self.session.execute("catalogue_sync", &json!({})) {
+        match self.session.execute("catalogue_sync", &json!({"read_only":!write})) {
             Ok(reply) => {
                 if let Some(report) = reply.get("carrier_check") {
                     self.carrier_feedback(report);

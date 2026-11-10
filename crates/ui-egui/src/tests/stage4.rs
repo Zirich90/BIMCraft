@@ -131,6 +131,11 @@ fn stage4_visual_acceptance() {
         h.hover_at(at);
         h.run();
         h.render().unwrap().save(output.join(format!("equipment-face-preview-{name}.png"))).unwrap();
+        shortcut(&mut h, "EW");
+        press(&mut h, "Free 3D");
+        h.hover_at(at);
+        h.run();
+        h.render().unwrap().save(output.join(format!("wire-start-{name}.png"))).unwrap();
     }
 }
 
@@ -695,16 +700,47 @@ wire {"points":[[0,0],[2000,0]]}
 wire {"level":"Upper","points":[[0,1000],[2000,1000]]}"#);
     press(&mut h, "Low Voltage");
     press(&mut h, "Route Carriers");
-    press(&mut h, "Route Carriers on Level");
+    press(&mut h, "Route Carriers on Level ⏵");
+    press(&mut h, "Tray 100 x 50");
     assert_eq!(ids(&h, "cablecarrier").len(), 1);
     press(&mut h, "Route Carriers");
-    press(&mut h, "Route Carriers in Project");
+    press(&mut h, "Route Carriers in Project ⏵");
+    press(&mut h, "Tray 100 x 50");
     assert_eq!(ids(&h, "cablecarrier").len(), 2);
+    for carrier in ids(&h, "cablecarrier") {
+        assert_eq!(h.state().session.model.elements.get(carrier).unwrap().run().unwrap().type_name, "Tray 100 x 50");
+    }
     press(&mut h, "Route Carriers");
-    press(&mut h, "Route Carriers in Project");
+    press(&mut h, "Route Carriers in Project ⏵");
+    press(&mut h, "Default");
     assert_eq!(ids(&h, "cablecarrier").len(), 2);
     h.state_mut().run("undo", json!({})).unwrap();
     assert_eq!(ids(&h, "cablecarrier").len(), 1);
+}
+
+#[test]
+fn carrier_batch_shares_one_tray_for_three_wall_wires() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}"#);
+    let wall = h.state().session.model.guid(ids(&h, "wall")[0]);
+    for cable in ["A", "B", "C"] {
+        let result = h.state_mut().run(
+            "wire",
+            json!({"points":[[1000,-100],[6000,-100]],"offset":1200,
+            "cable":cable,"mount":{"host":wall,"face":"interior"}}),
+        );
+        assert!(result.is_some(), "{}", h.state().status.text);
+    }
+    press(&mut h, "Low Voltage");
+    press(&mut h, "Route Carriers");
+    press(&mut h, "Route Carriers in Project ⏵");
+    press(&mut h, "Tray 100 x 50");
+    let carriers = ids(&h, "cablecarrier");
+    assert_eq!(carriers.len(), 1, "{}", h.state().status.text);
+    let m = &h.state().session.model;
+    assert_eq!(ids(&h, "wire").len(), 3);
+    for wire in ids(&h, "wire") {
+        assert_eq!(m.elements.get(wire).unwrap().run().unwrap().carrier, Some(m.guid(carriers[0])));
+    }
 }
 
 #[test]
@@ -716,7 +752,8 @@ wire {"type":"Test wire","points":[[0,0],[2000,0]]}
 wire {"type":"Test wire","points":[[0,0],[2000,0]]}"#);
     press(&mut h, "Low Voltage");
     press(&mut h, "Route Carriers");
-    press(&mut h, "Route Carriers in Project");
+    press(&mut h, "Route Carriers in Project ⏵");
+    press(&mut h, "Default");
     assert_eq!(ids(&h, "cablecarrier").len(), 2, "{}", h.state().status.text);
     assert!(h.state().session.model.carrier_warnings().is_empty());
 }
@@ -765,6 +802,31 @@ fn stage41_split_places_a_route_bend_and_undoes_in_one_step() {
         h.state_mut().run("redo", json!({})).unwrap();
         assert_eq!(h.state().session.model.to_json().unwrap(), after);
     }
+}
+
+#[test]
+fn mounted_route_can_bend_and_move_on_its_wall_in_3d() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}"#);
+    press(&mut h, "Default 3D View");
+    shortcut(&mut h, "EW");
+    press(&mut h, "Free 3D");
+    stage4_click_world(&mut h, [1500.0, -100.0, 1000.0], true);
+    stage4_click_world(&mut h, [5500.0, -100.0, 1000.0], true);
+    h.state_mut().escape();
+    let wire = ids(&h, "wire")[0];
+    h.state_mut().selection = vec![wire];
+    h.state_mut().act(crate::context::Action::Move);
+    stage4_click_world(&mut h, [3000.0, -100.0, 1000.0], true);
+    stage4_click_world(&mut h, [3000.0, -100.0, 1500.0], true);
+    let run = h.state().session.model.elements.get(wire).unwrap().run().unwrap();
+    assert!((run.offset - 1500.0).abs() < 20.0, "{}", h.state().status.text);
+    let route = h.state().session.model.run_geom(h.state().session.model.elements.get(wire).unwrap()).unwrap();
+    h.state_mut().act(crate::context::Action::AddRoutePoint);
+    stage4_click_world(&mut h, std::array::from_fn(|i| (route.a[i] + route.b[i]) / 2.0), true);
+    stage4_click_world(&mut h, [3500.0, -100.0, 2200.0], true);
+    assert_eq!(ids(&h, "wire").len(), 2, "{}", h.state().status.text);
+    let run = h.state().session.model.elements.get(wire).unwrap().run().unwrap();
+    assert!((run.end_offset.unwrap() - 2200.0).abs() < 20.0);
 }
 
 #[test]
@@ -866,6 +928,24 @@ fn stage41_3d_places_equipment_on_visible_wall_face() {
     assert_eq!(h.state().session.model.to_json().unwrap(), before);
     h.state_mut().run("redo", json!({})).unwrap();
     assert_eq!(h.state().session.model.to_json().unwrap(), after);
+}
+
+#[test]
+fn move_command_repositions_wall_panel_in_3d() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}"#);
+    press(&mut h, "Default 3D View");
+    shortcut(&mut h, "FA");
+    press(&mut h, "Place on Face");
+    stage4_click_world(&mut h, [4000.0, -100.0, 1800.0], true);
+    let panel = ids(&h, "component")[0];
+    h.state_mut().escape();
+    h.state_mut().selection = vec![panel];
+    h.state_mut().act(crate::context::Action::Move);
+    stage4_click_world(&mut h, [5200.0, -100.0, 2100.0], true);
+    let Some(Element::Component(component)) = h.state().session.model.elements.get(panel) else { panic!("expected panel") };
+    assert!((component.at.0 - 5200.0).abs() < 20.0, "{}", h.state().status.text);
+    assert!((component.offset - 600.0).abs() < 20.0);
+    assert!(component.mount.is_some());
 }
 
 #[test]
@@ -985,6 +1065,11 @@ fn free_3d_routes_snap_to_surfaces_and_share_the_ortho_preview() {
             press(&mut h, "Free 3D");
             h.state_mut().constrain = ortho;
             let b = if ortho { [cursor[0], a[1], a[2]] } else { cursor };
+            let start = h.state().screen3(a);
+            h.hover_at(start);
+            h.run();
+            assert!(h.output().shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Circle(circle) if circle.center.distance(start) < 2.0 && (circle.radius - 5.0).abs() < f32::EPSILON)));
             stage4_click_world(&mut h, a, true);
             h.hover_at(h.state().screen3(cursor));
             h.run();

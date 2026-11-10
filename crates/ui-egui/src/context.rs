@@ -42,6 +42,7 @@ pub(crate) struct CarrierFromWireDialog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     AddRoutePoint,
+    Move,
     MountToSurface,
     /// Esc: the tool's points, else the tool, else the selection.
     Cancel,
@@ -72,6 +73,7 @@ impl Action {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Action::AddRoutePoint => msg!("Add Route Point"),
+            Action::Move => "Move",
             Action::Cancel => "Cancel",
             Action::Finish => msg!("Finish Drawing"),
             Action::ZoomToFit => "Zoom to Fit",
@@ -99,6 +101,7 @@ impl Action {
         match self {
             Action::Cancel => Some("Esc"),
             Action::Finish => Some("Enter"),
+            Action::Move => Some("MV"),
             Action::ZoomToFit => Some("ZF"),
             Action::SelectAllInstances => Some("SA"),
             Action::HideElement => Some("EH"),
@@ -160,6 +163,9 @@ impl BimApp {
             groups.push(vec![Item::new(Action::ConnectEquipmentToWire, true)]);
         }
         if some {
+            if self.sheet == Sheet::View3D {
+                groups.push(vec![Item::new(Action::Move, true)]);
+            }
             groups.push(vec![
                 Item::new(Action::EditType, self.type_subject().is_some()),
                 Item::new(Action::SelectAllInstances, true),
@@ -215,6 +221,7 @@ impl BimApp {
     pub(crate) fn act(&mut self, action: Action) {
         match action {
             Action::AddRoutePoint => self.set_tool(Tool::Split),
+            Action::Move => self.set_tool(Tool::Move(None)),
             Action::Cancel => self.escape(),
             Action::Finish => self.finish_open_shape(),
             Action::ZoomToFit => self.fit(),

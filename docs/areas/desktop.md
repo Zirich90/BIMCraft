@@ -28,9 +28,9 @@ and cosmetic changes are not treated as such permission. The public
 [interface documentation](https://help.rengabim.com/ru/Content/interface.htm)
 describes the workflow; implementation and artwork remain BIMCraft's own.
 
-`catalogue.rs` polls a project's bound ODS every two seconds and after model changes.
-It runs the core `catalogue_sync` command, so existing rows remain model-owned while
-new rows receive GUIDs. File errors appear in the status bar without changing the model;
+`catalogue.rs` checks the workbook approved for the project in user settings every two seconds.
+The poll reads new rows and assigns GUIDs in the model. Synchronize writes those GUIDs
+and local changes to the workbook. File errors appear in the status bar without changing the model;
 a changed/repaired file is retried. Polling unchanged data keeps the undo history intact.
 Change detection uses file modification time and length, as produced by normal office saves.
 Manage > Equipment Catalogue opens the same dialog from plans and 3D: link an existing

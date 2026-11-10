@@ -1,6 +1,7 @@
 //! Bounded ODS tables used by the project's editable equipment catalogue.
 
 use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 
 use quick_xml::{Reader, events::Event};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -10,6 +11,37 @@ pub const MAX_CELL: usize = 16_384;
 const MAX_COLUMNS: usize = 64;
 const MAX_XML: u64 = 32 << 20;
 const MIME: &str = "application/vnd.oasis.opendocument.spreadsheet";
+
+pub(crate) fn workbook_path(path: &Path) -> Result<PathBuf, String> {
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    if !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("ods")) || path.as_os_str().len() > 4096 {
+        return Err("Catalogue path must name an .ods file and be at most 4096 bytes".into());
+    }
+    Ok(path)
+}
+
+pub(crate) fn workbook_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err("Catalogue path must refer to a regular file, not a link or special file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) fn read_workbook(path: &Path) -> Result<Vec<u8>, String> {
+    if !workbook_exists(path)? {
+        return Err(format!("Catalogue file does not exist: {}", path.display()));
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > MAX_XML {
+        return Err("Catalogue must be a regular file of at most 32 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_XML + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
 
 /// Geometry of a removed catalogue type remains in the model, but is not a billable product.
 pub fn placeholder_element(model: &crate::model::Model, element: &crate::model::Element) -> bool {
@@ -38,15 +70,16 @@ pub fn pending_products(model: &crate::model::Model) -> Vec<(crate::ids::Id, &cr
         .collect()
 }
 
-/// Synchronize a bound catalogue transactionally. While the model is open, only new rows may enter it.
-pub fn sync_bound(
+/// Apply an approved workbook. A read preserves pending edits and never touches the workbook.
+pub(crate) fn sync_bound(
     model: &mut crate::model::Model,
+    path: &Path,
     protect_existing: bool,
+    write: bool,
     owned: &std::collections::BTreeSet<crate::ids::Guid>,
 ) -> Result<serde_json::Value, String> {
-    let path = model.catalogue.as_ref().ok_or("No ODS catalogue is linked")?.clone();
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path).map_err(|e| e.to_string())?.take(MAX_XML + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let path = workbook_path(path)?;
+    let bytes = read_workbook(&path)?;
     let mut rows: Vec<_> = read(&bytes)?
         .into_iter()
         .filter(|row| !row.first().and_then(|g| crate::ids::Guid::parse(g)).is_some_and(|guid| model.catalogue_retired.contains(&guid)))
@@ -143,23 +176,29 @@ pub fn sync_bound(
         count
     };
     candidate.follow_carrier_type_changes(model);
-    candidate.catalogue_retired.clear();
-    candidate.catalogue_unexported.clear();
-    candidate.catalogue_pending_edits.clear();
+    if write {
+        candidate.catalogue_retired.clear();
+        candidate.catalogue_unexported.clear();
+        candidate.catalogue_pending_edits.clear();
+    }
     candidate.check()?;
-    let output = replace_first_sheet(&bytes, &catalogue_rows(&candidate))?;
-    let backup = if output != bytes {
-        let parent = std::path::Path::new(&path).parent().ok_or("Catalogue path needs a parent directory")?;
-        let mut backup =
-            tempfile::Builder::new().prefix("bimcraft-ods-backup-").suffix(".ods").tempfile_in(parent).map_err(|e| e.to_string())?;
-        backup.write_all(&bytes).map_err(|e| e.to_string())?;
-        backup.as_file().sync_all().map_err(|e| e.to_string())?;
-        let (_, backup) = backup.keep().map_err(|e| e.to_string())?;
-        crate::autosave::atomic_write_bytes(std::path::Path::new(&path), &output)?;
-        Some(backup)
-    } else {
-        None
-    };
+    let mut backup = None;
+    if write {
+        let output = replace_first_sheet(&bytes, &catalogue_rows(&candidate))?;
+        if output != bytes {
+            let parent = path.parent().ok_or("Catalogue path needs a parent directory")?;
+            let mut staged_backup =
+                tempfile::Builder::new().prefix("bimcraft-ods-backup-").suffix(".ods").tempfile_in(parent).map_err(|e| e.to_string())?;
+            staged_backup.write_all(&bytes).map_err(|e| e.to_string())?;
+            staged_backup.as_file().sync_all().map_err(|e| e.to_string())?;
+            if read_workbook(&path)? != bytes {
+                return Err("Catalogue changed while synchronizing; try again".into());
+            }
+            let (_, saved_backup) = staged_backup.keep().map_err(|e| e.to_string())?;
+            crate::autosave::atomic_write_bytes(&path, &output)?;
+            backup = Some(saved_backup);
+        }
+    }
     let placeholders: Vec<_> = candidate.library.entries().filter(|(_, e)| e.placeholder).map(|(_, e)| e.guid).collect();
     *model = candidate;
     Ok(serde_json::json!({"path":path,"updated":updated,"backup":backup,"placeholders":placeholders}))

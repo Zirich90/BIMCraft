@@ -37,6 +37,7 @@ fn closed_ods_diameter_change_warns_carrier_overfill() {
     row[4] = "20".into();
     std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
     let mut reopened = Session::new();
+    reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
     let reply = reopened.execute("open", &json!({"path":project})).unwrap();
     assert!(reply.get("catalogue_not_loaded").is_none(), "{reply}");
     assert_eq!(reopened.model.types.runs["wire"]["Test cable"].width, 20.0);
@@ -517,6 +518,7 @@ fn closed_ods_carrier_depth_change_takes_the_cable_with_its_section() {
         row[4] = "30".into();
         std::fs::write(&catalogue, ods::write(&rows).unwrap()).unwrap();
         let mut reopened = Session::new();
+        reopened.catalogue_bindings.insert(project.clone(), catalogue.clone());
         reopened.execute("open", &json!({"path":project})).unwrap();
         assert_eq!(reopened.model.elements.get(wire).unwrap().run().unwrap().offset, sign * 15.0);
         assert_eq!(reopened.model.elements.guid(wire), guid);
