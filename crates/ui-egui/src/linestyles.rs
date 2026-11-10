@@ -1,18 +1,19 @@
 //! Manage > Line Styles, as Revit's dialogs: the project's line styles (a pen, a colour and a pattern each) and its line
-//! patterns (dashes, dots and spaces, mm on paper), on two tabs of one draft, applied as one undo step (OK and Apply), or
+//! patterns (graphic segments, mm on paper), on two tabs of one draft, applied as one undo step (OK and Apply), or
 //! dropped (Cancel).
+
+use crate::popup::Modal;
 
 use bimcraft_i18n::msg;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use bimcraft_core::engine::Session;
-use bimcraft_core::lines::{LinePattern, LineStyle, MAX_SEGMENT, MAX_SEGMENTS, MIN_SEGMENT, SOLID, Segment};
+use bimcraft_core::lines::{LinePattern, LineStyle, SOLID, Segment};
 use bimcraft_core::model::Model;
 use bimcraft_core::pen::{MAX_PEN, Pen};
 use egui::{
-    Align, Button, ComboBox, Context, DragValue, Grid, Id as UiId, Layout, Modal, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
-    WidgetInfo, WidgetType, vec2,
+    Align, Button, ComboBox, Context, Grid, Id as UiId, Layout, RichText, ScrollArea, Sense, TextEdit, Ui, WidgetInfo, WidgetType, vec2,
 };
 use serde_json::{Value, json};
 
@@ -23,6 +24,8 @@ use crate::style::{ERROR_HEIGHT, boxed_text, dialog_room, dialog_row, pal};
 use crate::{BimApp, Status};
 
 /// The dialog's tabs.
+mod creator;
+
 const TABS: [&str; 2] = [msg!("Styles"), "Patterns"];
 
 /// A pattern as edited: the name it had (none, new), the name it has, its segments.
@@ -49,7 +52,7 @@ pub(crate) struct LineStylesDialog {
     patterns: Vec<PatternRow>,
     /// Patterns deleted: their rows stay, so the styles' indices do, and are skipped.
     gone: Vec<bool>,
-    open: Option<usize>,
+    creator: Option<creator::PatternEditor>,
     /// Why Apply was refused, said in the dialog.
     error: Option<String>,
     /// The patterns and styles the project held when this opened: a draft is not applied over a project that has changed since.
@@ -72,7 +75,12 @@ impl LineStylesDialog {
             .collect();
         let gone = vec![false; patterns.len()];
         let held = (m.line_patterns.clone(), m.line_styles.clone());
-        LineStylesDialog { tab: 0, styles, patterns, gone, open: None, error: None, held }
+        LineStylesDialog { tab: 0, styles, patterns, gone, creator: None, error: None, held }
+    }
+
+    /// Open on the Patterns tab, as Manage > Annotation Settings > Line Patterns does.
+    pub(crate) fn patterns(m: &Model) -> LineStylesDialog {
+        LineStylesDialog { tab: 1, ..Self::new(m) }
     }
 
     /// What stops the draft being applied: a project that changed since it was opened (an agent's command, say), or a name
@@ -131,31 +139,8 @@ fn named_button(ui: &mut Ui, text: &str, name: String) -> bool {
 
 /// A sample of `segments` drawn across `width` px, a mm of paper `k` px: what a line in the pattern looks like.
 fn sample(ui: &mut Ui, segments: &[Segment], width: f32, k: f32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 14.0), Sense::hover());
-    let ink = ui.visuals().text_color();
-    let y = rect.center().y;
-    let dash = LinePattern(segments.to_vec()).dash(k);
-    let Some(dash) = dash.filter(|d| d.len() >= 2) else {
-        ui.painter().line_segment([rect.left_center(), rect.right_center()], Stroke::new(1.5, ink));
-        return;
-    };
-    let mut x = rect.left();
-    for (i, len) in dash.iter().cycle().enumerate() {
-        if x >= rect.right() || i > 4096 {
-            break;
-        }
-        // A dot as a dot: a stroke a pixel long fades away between pixels.
-        match (i % 2 == 0, *len < 1.0) {
-            (true, true) => {
-                ui.painter().circle_filled(egui::pos2(x, y), 1.0, ink);
-            }
-            (true, false) => {
-                ui.painter().line_segment([egui::pos2(x, y), egui::pos2((x + len).min(rect.right()), y)], Stroke::new(1.5, ink));
-            }
-            _ => {}
-        }
-        x += len;
-    }
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
+    creator::paint(ui, segments, rect, k, false);
 }
 
 /// The styles: a row each, its name, pen, colour and pattern, and its Delete; then New Style. The rows scroll in what the window
@@ -205,16 +190,12 @@ fn styles_tab(ui: &mut Ui, d: &mut LineStylesDialog, below: f32) {
     }
 }
 
-/// The patterns: a row each, its name, a sample of it, Edit and Delete; under them, the segments of the one open. The rows scroll
-/// in what the window has left over `below` (the dialog's own notes and buttons) and the row of New Pattern; when a pattern's
-/// segments are open, the list and they share it.
+/// The pattern library. New and Edit open an independent creator draft.
 fn patterns_tab(ui: &mut Ui, d: &mut LineStylesDialog, below: f32) {
-    ui.label(t("Dashes, dots and spaces, mm on paper, so a pattern reads the same at any scale."));
+    ui.label(t("Graphic segments in mm on paper, repeating along the centerline."));
     ui.add_space(4.0);
     let mut delete = None;
-    let room = dialog_room(ui, below + dialog_row(ui));
-    let editor = if d.open.is_some_and(|i| d.patterns.get(i).is_some()) { room / 2.0 } else { 0.0 };
-    ScrollArea::vertical().id_salt("line-patterns-rows").max_height(room - editor).show(ui, |ui| {
+    ScrollArea::vertical().id_salt("line-patterns-rows").max_height(dialog_room(ui, below + dialog_row(ui))).show(ui, |ui| {
         Grid::new("line-patterns").striped(true).num_columns(4).show(ui, |ui| {
             for h in ["Name", "Sample", "", ""] {
                 ui.label(RichText::new(t(h)).strong());
@@ -224,10 +205,8 @@ fn patterns_tab(ui: &mut Ui, d: &mut LineStylesDialog, below: f32) {
                 let who = p.name.clone();
                 name_field(ui, &mut p.name, tf("{}: Name", &[&who]));
                 sample(ui, &p.segments, 160.0, 6.0);
-                let r = ui.selectable_label(d.open == Some(i), t("Edit"));
-                r.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, d.open == Some(i), tf("{}: Edit", &[&who])));
-                if r.clicked() {
-                    d.open = Some(i);
+                if named_button(ui, t("Edit"), tf("{}: Edit", &[&who])) {
+                    d.creator = Some(creator::PatternEditor::new(Some(i), p.name.clone(), p.segments.clone()));
                 }
                 if named_button(ui, t("Delete"), tf("{}: Delete", &[&who])) {
                     delete = Some(i);
@@ -238,9 +217,6 @@ fn patterns_tab(ui: &mut Ui, d: &mut LineStylesDialog, below: f32) {
     });
     if let Some(i) = delete {
         d.gone[i] = true;
-        if d.open == Some(i) {
-            d.open = None;
-        }
         for s in d.styles.iter_mut().filter(|s| s.pattern == Some(i)) {
             s.pattern = None;
         }
@@ -248,64 +224,7 @@ fn patterns_tab(ui: &mut Ui, d: &mut LineStylesDialog, below: f32) {
     if ui.button(t("New Pattern")).clicked() {
         let taken: Vec<&str> = d.live().map(|(_, p)| p.name.as_str()).collect();
         let name = fresh(t("Pattern"), &taken);
-        d.patterns.push(PatternRow { was: None, name, segments: vec![Segment::Dash(3.0), Segment::Space(1.5)] });
-        d.gone.push(false);
-        d.open = Some(d.patterns.len() - 1);
-    }
-    let Some(p) = d.open.and_then(|i| d.patterns.get_mut(i)) else { return };
-    ui.separator();
-    ui.label(RichText::new(tf("Segments of {}", &[&p.name])).strong());
-    let mut remove = None;
-    // The separator and heading above and the Add Segment button below are not the rows' room.
-    let rows = (editor - 3.0 * dialog_row(ui)).max(60.0);
-    ScrollArea::vertical().id_salt("line-pattern-segment-rows").max_height(rows).show(ui, |ui| {
-        Grid::new("line-pattern-segments").num_columns(3).show(ui, |ui| {
-            let last = p.segments.len();
-            for (i, s) in p.segments.iter_mut().enumerate() {
-                let n = (i + 1).to_string();
-                if i % 2 == 0 {
-                    let dot = matches!(s, Segment::Dot);
-                    let shown = t(if dot { "Dot" } else { "Dash" });
-                    let label = tf("Segment {}", &[&n]);
-                    let c = ComboBox::from_id_salt(("segment", i)).selected_text(shown).width(90.0).show_ui(ui, |ui| {
-                        if ui.selectable_label(!dot, t("Dash")).clicked() && dot {
-                            *s = Segment::Dash(3.0);
-                        }
-                        if ui.selectable_label(dot, t("Dot")).clicked() {
-                            *s = Segment::Dot;
-                        }
-                    });
-                    c.response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, true, label.clone()));
-                } else {
-                    ui.label(t("Space"));
-                }
-                match s {
-                    Segment::Dash(l) | Segment::Space(l) => {
-                        let label = tf("Segment {} Length", &[&n]);
-                        let r = ui.add(DragValue::new(l).range(MIN_SEGMENT..=MAX_SEGMENT).speed(0.05).suffix(" mm"));
-                        r.widget_info(|| WidgetInfo::labeled(WidgetType::DragValue, true, label.clone()));
-                    }
-                    Segment::Dot => {
-                        ui.label("");
-                    }
-                }
-                // A pair goes together, so the pattern stays a mark then a space.
-                if i % 2 == 1 && last > 2 && named_button(ui, t("Delete"), tf("Segment {}: Delete", &[&n])) {
-                    remove = Some(i - 1);
-                } else {
-                    ui.label("");
-                }
-                ui.end_row();
-            }
-        });
-    });
-    if let Some(i) = remove {
-        p.segments.drain(i..i + 2);
-    }
-    let full = p.segments.len() >= MAX_SEGMENTS;
-    if ui.add_enabled(!full, Button::new(t("Add Segment"))).clicked() {
-        let next = if p.segments.len() % 2 == 0 { Segment::Dash(3.0) } else { Segment::Space(1.5) };
-        p.segments.push(next);
+        d.creator = Some(creator::PatternEditor::new(None, name, vec![Segment::Dash(3.0), Segment::Space(1.5)]));
     }
 }
 
@@ -355,38 +274,48 @@ impl BimApp {
     pub(crate) fn line_styles_window(&mut self, ctx: &Context) {
         let Some(mut d) = self.line_styles_dialog.take() else { return };
         let (mut ok, mut apply, mut cancel) = (false, false, false);
-        let r = Modal::new(UiId::new("line-styles")).show(ctx, |ui| {
-            ui.set_width(640.0);
-            ui.label(RichText::new(t("Line Styles")).heading());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (i, tab) in TABS.iter().enumerate() {
-                    if ui.selectable_label(d.tab == i, t(tab)).clicked() {
-                        d.tab = i;
+        let editing = d.creator.is_some();
+        let r = Modal::new(UiId::new("line-styles"), t("Line Styles")).width(640.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                if editing {
+                    ui.disable();
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (i, tab) in TABS.iter().enumerate() {
+                        if ui.selectable_label(d.tab == i, t(tab)).clicked() {
+                            d.tab = i;
+                        }
                     }
+                });
+                ui.separator();
+                // Under the tab: the error, then OK, Cancel and Apply. What the window has left over them is the tab's, so that on a
+                // small one the buttons stay in reach and the rows scroll.
+                let below = d.error.as_ref().map_or(0.0, |_| ERROR_HEIGHT + 6.0) + 8.0 + dialog_row(ui);
+                if d.tab == 0 {
+                    styles_tab(ui, &mut d, below);
+                } else {
+                    patterns_tab(ui, &mut d, below);
+                }
+                if let Some(error) = &d.error {
+                    boxed_text(ui, "line-styles-error", pal().error, error, ERROR_HEIGHT);
                 }
             });
-            ui.separator();
-            // Under the tab: the error, then OK, Cancel and Apply. What the window has left over them is the tab's, so that on a
-            // small one the buttons stay in reach and the rows scroll.
-            let below = d.error.as_ref().map_or(0.0, |_| ERROR_HEIGHT + 6.0) + 8.0 + dialog_row(ui);
-            if d.tab == 0 {
-                styles_tab(ui, &mut d, below);
-            } else {
-                patterns_tab(ui, &mut d, below);
-            }
-            if let Some(error) = &d.error {
-                boxed_text(ui, "line-styles-error", pal().error, error, ERROR_HEIGHT);
-            }
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                apply = ui.button(t("Apply")).clicked();
-                cancel = ui.button(t("Cancel")).clicked();
-                ok = ui.button(t("OK")).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    apply = ui.button(t("Apply")).clicked();
+                    cancel = ui.button(t("Cancel")).clicked();
+                    ok = ui.button(t("OK")).clicked();
+                });
             });
         });
+        // Settle the child modal's measured size before the next pointer event uses its widget positions.
+        if !editing && d.creator.is_some() {
+            ctx.request_repaint();
+        }
+        creator::window(ctx, &mut d);
         let failed = (ok || apply) && !self.apply_line_styles(&mut d, apply);
-        if failed || !(ok || cancel || r.should_close()) {
+        if failed || !(ok || cancel || (!editing && r.should_close())) {
             self.line_styles_dialog = Some(d);
         }
     }

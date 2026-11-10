@@ -8,7 +8,7 @@ use bimcraft_i18n::msg;
 use std::collections::BTreeSet;
 
 use bimcraft_core::geom::{self, P2};
-use bimcraft_core::model::{Element, Id, Model, TOL};
+use bimcraft_core::model::{Element, Id, Line, Model, TOL};
 use bimcraft_core::render::View;
 use bimcraft_core::sketch::{self as solver, Problem, SketchLine};
 use bimcraft_core::units::Units;
@@ -20,7 +20,7 @@ use crate::icons::Icon;
 use crate::lang::{t, tf};
 use crate::properties::number;
 use crate::style::{canvas_pal, pal};
-use crate::{BimApp, Sheet, Status, Tool, big_button, draw, panel, ribbon};
+use crate::{BimApp, Sheet, Status, Tool, big_button, draw, panel, ribbon, small_button};
 
 /// What Finish Edit Mode makes of the lines.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,6 +61,8 @@ pub struct Sketch {
     pub styled: bool,
     /// The plan it began in: the sketch belongs to it, and Finish Edit Mode makes its element there.
     pub plan: Sheet,
+    /// The work plane a new one begun in the 3D view lies on (`workplane.rs`): what it makes stands on the level below it.
+    pub surface: Option<bimcraft_core::walls::Plane>,
     /// The lines as they were before each change, oldest first, and as the last frame saw them: Ctrl+Z takes back one change
     /// (a line drawn, a trim, a fillet, a grip moved), not one line.
     history: Vec<Vec<SketchLine>>,
@@ -99,6 +101,18 @@ impl Sketch {
             .filter(|(_, d)| *d <= reach)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i)
+    }
+
+    /// The nearest actual straight segment, including one of a polyline: Align's candidate.
+    pub(crate) fn alignment_at(&self, p: P2, reach: f64) -> Option<(usize, Line, f64)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| {
+                bimcraft_core::align::curve_lines(&l.curve).into_iter().map(move |line| (i, line, geom::dist_to_segment(p, line.0, line.1)))
+            })
+            .filter(|(_, _, d)| *d <= reach)
+            .min_by(|a, b| a.2.total_cmp(&b.2))
     }
 
     /// The end of a picked line within `reach` mm of `p`: a grip.
@@ -322,6 +336,7 @@ impl BimApp {
             region,
             styled,
             plan,
+            surface: None,
             history: Vec::new(),
             seen,
         });
@@ -373,6 +388,30 @@ impl BimApp {
         }
         let lines = json!(sk.lines.iter().map(sent).collect::<Vec<_>>());
         let m = &self.session.model;
+        // Begun on the 3D view's (level) work plane: it stands on the level below the plane, as high above it as the plane is.
+        if let Some(surface) = sk.surface {
+            let Some((level, offset)) = bimcraft_core::workplane::host(m, surface, P2(0.0, 0.0)) else { return };
+            let (id, p) = match sk.of {
+                Of::Floor(_) => (
+                    "floor",
+                    self.typed("floor", json!({"level": level, "offset": offset, "structural": self.floor_structural, "sketch": lines})),
+                ),
+                Of::Ceiling(_) => ("ceiling", self.typed("ceiling", json!({"level": level, "offset": offset, "sketch": lines}))),
+                Of::Roof(_) => {
+                    let slope = number(&self.roof_slope).unwrap_or(30.0);
+                    ("roof", self.typed("roof", json!({"level": level, "offset": offset, "slope": slope, "sketch": lines})))
+                }
+                Of::Shaft(_) => ("shaft", json!({"level": level, "base_offset": offset, "sketch": lines})),
+                _ => return,
+            };
+            if let Some(made) = self.run(id, p) {
+                self.sketch = None;
+                self.tool = Tool::Modify;
+                self.forget_picks();
+                self.selection = made["id"].as_u64().into_iter().collect();
+            }
+            return;
+        }
         let (id, p) = match sk.of {
             Of::Floor(level) => {
                 ("floor", self.typed("floor", json!({"level": level, "structural": self.floor_structural, "sketch": lines})))
@@ -422,9 +461,19 @@ impl BimApp {
     /// the plan it began in, which it takes the window back to.
     pub(crate) fn track_sketch(&mut self) {
         let Some(sk) = &mut self.sketch else { return };
+        // Multiple Trim keeps an unchanged boundary while successive targets change. Other edits
+        // can remove or renumber that line, so never carry an unverified index into the next frame.
+        let keep_trim = matches!(self.tool, Tool::TrimTo { many: true, .. })
+            && self.drawing.trim.is_some_and(|(i, _)| sk.lines.get(i).is_some() && sk.lines.get(i) == sk.seen.get(i));
         if sk.track() {
             self.drawing.fillet.retain(|(l, _)| matches!(l, draw::Picked::Element(_)));
-            self.drawing.trim = None;
+            if !keep_trim {
+                self.drawing.trim = None;
+            }
+            self.drawing.align_reference = None;
+            if matches!(self.tool, Tool::Align(Some(_))) {
+                self.tool = Tool::Align(None);
+            }
         }
         if let Some(plan) = self.sketch_plan()
             && self.sheet != plan
@@ -434,11 +483,29 @@ impl BimApp {
         }
     }
 
-    /// The plan the sketch began in, while it is there to go back to (a plan whose level was deleted is nowhere, and holds neither the
-    /// window nor its tool).
+    /// The view the sketch began in, while it is there to go back to: a plan (one whose level was deleted is nowhere, and holds
+    /// neither the window nor its tool), or the 3D view while what it edits has a plane there (`sketch3d.rs`).
     pub(crate) fn sketch_plan(&self) -> Option<Sheet> {
         let plan = self.sketch.as_ref()?.plan;
-        matches!(plan, Sheet::Plan(key) | Sheet::Ceiling(key) if self.session.model.plan_level(key).is_some()).then_some(plan)
+        let there = match plan {
+            Sheet::Plan(key) | Sheet::Ceiling(key) => self.session.model.plan_level(key).is_some(),
+            Sheet::View3D => self.sketch_surface().is_some(),
+            _ => false,
+        };
+        there.then_some(plan)
+    }
+
+    /// Trim/Extend's and Fillet Arc's picks so far, lit as the lines picked are.
+    pub(crate) fn sketch_lit(&self) -> Vec<usize> {
+        self.drawing
+            .trim
+            .map(|(i, _)| i)
+            .into_iter()
+            .chain(self.drawing.fillet.iter().filter_map(|(l, _)| match l {
+                draw::Picked::Sketch(i) => Some(*i),
+                draw::Picked::Element(_) => None,
+            }))
+            .collect()
     }
 
     /// Ctrl+Z while sketching: the last change to the lines taken back (a line drawn, a trim, a fillet, a grip moved).
@@ -448,6 +515,10 @@ impl BimApp {
         {
             self.drawing.fillet.retain(|(l, _)| matches!(l, draw::Picked::Element(_)));
             self.drawing.trim = None;
+            self.drawing.align_reference = None;
+            if matches!(self.tool, Tool::Align(Some(_))) {
+                self.tool = Tool::Align(None);
+            }
         }
         if let Tool::SketchLine(chain) = &mut self.tool {
             chain.clear();
@@ -464,6 +535,25 @@ impl BimApp {
                 !picked.contains(&(i - 1))
             });
             sk.changed();
+        }
+    }
+
+    /// Align changes only the draft until Finish; its joined ends and local undo move with it.
+    pub(crate) fn align_sketch(&mut self, reference: Line, target: usize, line: Line) {
+        let fixed = match self.drawing.align_reference {
+            Some(draw::Picked::Sketch(i)) => Some(i),
+            _ => None,
+        };
+        let Some(sk) = &mut self.sketch else { return };
+        match bimcraft_core::align::sketch_lines(&sk.lines, target, reference, line, fixed) {
+            Ok(lines) => {
+                sk.lines = lines;
+                sk.changed();
+                self.drawing.align_reference = None;
+                self.tool = Tool::Align(None);
+                self.status = Status::default();
+            }
+            Err(text) => self.status = Status { text, error: true },
         }
     }
 
@@ -613,6 +703,51 @@ impl BimApp {
         self.draw_panel(ui, draw::Target::Sketch);
     }
 
+    /// Editing tools must remain available in the sketch's contextual ribbon.
+    pub(crate) fn sketch_modify_panel(&mut self, ui: &mut Ui) {
+        let tools = [
+            (Icon::Align, msg!("Align"), msg!("Align (AL): pick a reference line, then what to line up with it"), Tool::Align(None)),
+            (
+                Icon::Trim,
+                msg!("Trim/Extend to Corner"),
+                msg!("Trim/Extend to Corner (TR): pick two walls or two lines, on the parts to keep"),
+                Tool::Trim(None),
+            ),
+            (
+                Icon::TrimSingle,
+                msg!("Trim/Extend Single Element"),
+                msg!("Trim/Extend Single Element: pick the line to trim or extend to, then the line to change, on the part to keep"),
+                Tool::TrimTo { boundary: None, many: false },
+            ),
+            (
+                Icon::TrimMultiple,
+                msg!("Trim/Extend Multiple Elements"),
+                msg!("Trim/Extend Multiple Elements: pick the line to trim or extend to, then each line to change, on the part to keep"),
+                Tool::TrimTo { boundary: None, many: true },
+            ),
+            (Icon::Split, msg!("Split Element"), msg!("Split Element (SL): click a wall or a line where to split it"), Tool::Split),
+            (Icon::Offset, msg!("Offset"), msg!("Offset (OF): pick a wall or a line; a copy goes to the cursor's side"), Tool::Offset),
+        ];
+        panel(ui, "Modify", |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for row in tools.chunks(3) {
+                    ui.horizontal(|ui| {
+                        for (icon, label, tip, tool) in row {
+                            let active = match (&self.tool, tool) {
+                                (Tool::TrimTo { many: a, .. }, Tool::TrimTo { many: b, .. }) => a == b,
+                                (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
+                            };
+                            if small_button(ui, *icon, label, active, tip).clicked() {
+                                self.set_tool(tool.clone());
+                            }
+                        }
+                    });
+                }
+            });
+        });
+    }
+
     /// The Mode panel at the ribbon's right end: Finish and Cancel while sketching, Edit Boundary when one floor, ceiling,
     /// roof or shaft is selected.
     pub(crate) fn mode_panel(&mut self, ui: &mut Ui) {
@@ -645,6 +780,34 @@ impl BimApp {
             self.mode_width = width;
             ui.ctx().request_repaint();
         }
+    }
+
+    /// A new floor's sketch: Walls' Outline, the outline the walls of its level enclose (and the courtyards in it) put in the
+    /// sketch as lines, to edit before Finish: what the Floor tool's one click made before it sketched.
+    pub(crate) fn walls_outline_panel(&mut self, ui: &mut Ui) {
+        let Some(Of::Floor(level)) = self.sketch.as_ref().map(|sk| sk.of) else { return };
+        panel(ui, msg!("Walls"), |ui| {
+            let tip = msg!("Walls' Outline: the outline the level's walls enclose, along their centre lines, as sketch lines to edit");
+            if big_button(ui, Icon::Wall, msg!("Walls' Outline"), false, tip).clicked() {
+                self.walls_outline(level);
+            }
+        });
+    }
+
+    /// The outline level `level`'s walls enclose, and its courtyards, added to the sketch as lines; or why there's none.
+    pub(crate) fn walls_outline(&mut self, level: Id) {
+        let Some((outline, courtyards)) = bimcraft_core::floor_outline(&self.session.model, level) else {
+            self.status = Status { text: t("No walls on this level enclose an area: sketch the outline.").into(), error: true };
+            return;
+        };
+        let Some(sk) = &mut self.sketch else { return };
+        for ring in std::iter::once(&outline).chain(&courtyards) {
+            for (a, b) in geom::ring_edges(ring) {
+                sk.lines.push(SketchLine::new(a, b));
+            }
+        }
+        sk.changed();
+        self.status = Status::default();
     }
 
     /// The Floor, Ceiling, Roof and Shaft tools' Draw panel: their outline sketched instead of found from the walls.
@@ -733,10 +896,21 @@ impl BimApp {
     pub(crate) fn sketch_prompt(&self) -> Option<&'static str> {
         self.sketch.as_ref()?;
         Some(match &self.tool {
+            Tool::Align(None) => msg!("Pick a highlighted model edge or sketch line as the alignment reference."),
+            Tool::Align(Some(_)) => msg!("Pick the highlighted sketch line to move and turn onto the reference; joined ends follow."),
+            Tool::Trim(_) if self.drawing.trim.is_none() => msg!("Pick the first sketch line, on the part to keep."),
+            Tool::Trim(_) => msg!("Pick the second sketch line, on the part to keep."),
+            Tool::TrimTo { .. } if self.drawing.trim.is_none() => msg!("Pick a sketch line as the trim/extend boundary."),
+            Tool::TrimTo { .. } => msg!("Pick a sketch line to trim or extend, on the part to keep. Esc clears the boundary."),
             Tool::SketchLine(_) if self.shape() != draw::Shape::Line => return self.shape_prompt(),
             Tool::SketchLine(chain) if chain.is_empty() => "Click where the line starts.",
             Tool::SketchLine(_) => msg!("Click the line's end; the next starts there. The first point again closes the loop; Esc stops."),
             Tool::SketchPick => msg!("Click a wall: a boundary line along it."),
+            Tool::Modify if self.sketch_surface().is_some() => {
+                msg!(
+                    "Pick sketch lines (a box picks several); drag a picked line's end over its plane to move it; Shift and the middle button orbit; Delete removes them. Finish Edit Mode when every loop is closed."
+                )
+            }
             _ => {
                 msg!(
                     "Pick sketch lines (a box picks several); drag a picked line's end to move it; Delete removes them. Finish Edit Mode when every loop is closed."
@@ -758,5 +932,46 @@ fn sent(l: &SketchLine) -> serde_json::Value {
     if l.invisible {
         v["invisible"] = json!(true);
     }
+    if let Some(slope) = l.slope {
+        v["slope"] = json!(slope);
+    }
     v
+}
+
+impl BimApp {
+    /// A small palette over the view at the middle of the sketch line picked alone, in Modify: what can be done to it, each button
+    /// starting its tool as the panels' do (Add Vertex, which no panel offers while sketching, Split, Offset, Trim/Extend).
+    pub(crate) fn edge_palette(&mut self, ctx: &egui::Context) {
+        if !matches!(self.tool, Tool::Modify) {
+            return;
+        }
+        let Some(sk) = &self.sketch else { return };
+        let picked: Vec<usize> = sk.picked.iter().copied().collect();
+        let [i] = picked[..] else { return };
+        let Some(line) = sk.lines.get(i) else { return };
+        let at = self.screen(line.middle()) + egui::vec2(12.0, -44.0);
+        if !self.view_rect.contains(at) {
+            return;
+        }
+        let mut pick = None;
+        egui::Area::new(egui::Id::new("edge-palette")).order(egui::Order::Middle).fixed_pos(at).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).fill(crate::style::pal().surface).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (icon, label, tool) in [
+                        (crate::icons::Icon::AddVertex, bimcraft_i18n::msg!("Add Vertex"), Tool::Vertex { delete: false }),
+                        (crate::icons::Icon::Split, bimcraft_i18n::msg!("Split Element"), Tool::Split),
+                        (crate::icons::Icon::Offset, bimcraft_i18n::msg!("Offset"), Tool::Offset),
+                        (crate::icons::Icon::Trim, bimcraft_i18n::msg!("Trim/Extend to Corner"), Tool::Trim(None)),
+                    ] {
+                        if crate::icon_button(ui, icon, label).clicked() {
+                            pick = Some(tool);
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(tool) = pick {
+            self.set_tool(tool);
+        }
+    }
 }

@@ -151,6 +151,25 @@ fn a_wires_logical_route_follows_walls_when_requested() {
 }
 
 #[test]
+fn upstream_runs_keep_their_categories_and_guids_in_the_merged_format() {
+    let mut s = Session::new();
+    let conduit = made(&mut s, "conduit", json!({"points": [[0, 0], [3000, 0]]}));
+    let tray = made(&mut s, "cable_tray", json!({"points": [[0, 1000], [3000, 1000]]}));
+    let mut file: Value = serde_json::from_str(&s.model.to_json().unwrap()).unwrap();
+    for format in [7, 17, 18] {
+        file["format"] = json!(format);
+        let (model, left_out) = Model::read(&file.to_string()).unwrap();
+        assert!(left_out.is_empty(), "{format}: {left_out:?}");
+        assert_eq!(model.check(), Ok(()));
+        for (id, category) in [(conduit, "conduit"), (tray, "cabletray")] {
+            assert_eq!(model.guid(id), s.model.guid(id));
+            assert_eq!(model.elements.get(id).unwrap().category(), category);
+            assert!(model.run_type(model.elements.get(id).unwrap()).is_some());
+        }
+    }
+}
+
+#[test]
 fn old_circuits_and_carrier_types_migrate_without_losing_ids_or_references() {
     let mut s = Session::new();
     let (source, [a, _, _]) = loop_of_three(&mut s);
@@ -184,7 +203,9 @@ fn old_circuits_and_carrier_types_migrate_without_losing_ids_or_references() {
         let category = if ty["round"] == true { "conduit" } else { "cabletray" };
         types.get_mut(category).unwrap()[name] = ty.clone();
     }
-    for entry in file["library"].as_object_mut().unwrap().values_mut() {
+    let library = file["library"].as_object_mut().unwrap();
+    library.retain(|_, entry| entry["kind"] != "type:conduit" && entry["kind"] != "type:cabletray");
+    for entry in library.values_mut() {
         if entry["kind"] == "type:cablecarrier" {
             let name = entry["name"].as_str().unwrap();
             entry["kind"] = json!(if s.model.types.runs["cablecarrier"][name].round { "type:conduit" } else { "type:cabletray" });

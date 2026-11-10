@@ -245,7 +245,7 @@ pub(crate) fn import(cx: &mut Import, f: &Facts, g: &Gathered) {
             types,
             &p.name,
             |t| (t.width - width).abs() < 0.05 && (t.height - p.height).abs() < 0.05,
-            OpeningType { width, height: p.height, sill: p.sill },
+            OpeningType { width, height: p.height, sill: p.sill, operation: None },
         );
         let opening = Opening {
             type_name,

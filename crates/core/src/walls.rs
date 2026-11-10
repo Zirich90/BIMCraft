@@ -7,8 +7,9 @@
 
 use std::f64::consts::{PI, TAU};
 
+mod compound;
 mod index;
-pub(crate) use index::Index;
+pub(crate) use index::{Index, reach};
 
 use crate::geom::{self, P2};
 use crate::model::{Element, Function, Guid, Id, Layer, Location, Model, TOL, Wall};
@@ -46,6 +47,12 @@ impl Axis {
 
     pub fn radius(&self) -> Option<f64> {
         self.arc.map(|a| a.1)
+    }
+
+    /// An arc's centre, radius, the angle its start lies at from the centre and how far it sweeps (radians,
+    /// counter-clockwise positive); none when it's straight.
+    pub fn arc(&self) -> Option<(P2, f64, f64, f64)> {
+        self.arc
     }
 
     pub fn length(&self) -> f64 {
@@ -143,7 +150,7 @@ pub fn sweep_through(a: P2, p: P2, b: P2) -> f64 {
 
 /// How far from the exterior face of a wall of `thickness` with `layers` its location line `loc`
 /// lies. The core runs from the first structure layer to the last; without one, it's all of it.
-fn depth(thickness: f64, layers: &[Layer], loc: Location) -> f64 {
+pub fn depth(thickness: f64, layers: &[Layer], loc: Location) -> f64 {
     let mut core: Option<(f64, f64)> = None;
     let mut at = 0.0;
     for l in layers {
@@ -200,25 +207,29 @@ pub fn stacked(m: &Model, a: &Wall, b: &Wall) -> bool {
 
 /// A wall where it leaves a node: the way it goes, and where its faces' lines and its centre line
 /// are there (each running that way): the face on the counter-clockwise side of that way, the one
-/// on the clockwise side.
-struct Arm {
-    mine: bool,
-    way: P2,
-    ccw: P2,
-    cw: P2,
-    centre: P2,
-    thick: f64,
+/// on the clockwise side, and which wall's end it is (`id`, `at_end`). A run's arm at its end is one too ([`crate::runs`]),
+/// naming no wall: its `id` is 0, below every element's.
+#[derive(Default)]
+pub(crate) struct Arm {
+    pub(crate) id: Id,
+    pub(crate) at_end: bool,
+    pub(crate) mine: bool,
+    pub(crate) way: P2,
+    pub(crate) ccw: P2,
+    pub(crate) cw: P2,
+    pub(crate) centre: P2,
+    pub(crate) thick: f64,
 }
 
 /// Wall `w` leaving the node at its start, or with `at_end`, at its end.
-fn arm(m: &Model, w: &Wall, at_end: bool, mine: bool) -> Arm {
+pub(crate) fn arm(m: &Model, id: Id, w: &Wall, at_end: bool, mine: bool) -> Arm {
     let axis = Axis::of(w);
     let (ext, int) = faces(m, w);
     let s = if at_end { axis.length() } else { 0.0 };
     let t = axis.tangent(s);
     // Leaving from its end, it goes back: its interior face is on the counter-clockwise side.
     let (way, ccw, cw) = if at_end { (t * -1.0, int, ext) } else { (t, ext, int) };
-    Arm { mine, way, ccw: axis.at(s, ccw), cw: axis.at(s, cw), centre: axis.at(s, (ext + int) / 2.0), thick: ext - int }
+    Arm { id, at_end, mine, way, ccw: axis.at(s, ccw), cw: axis.at(s, cw), centre: axis.at(s, (ext + int) / 2.0), thick: ext - int }
 }
 
 /// The walls at wall `id`'s start (or `at_end`, its end), round the node counter-clockwise, its own
@@ -227,14 +238,24 @@ fn arm(m: &Model, w: &Wall, at_end: bool, mine: bool) -> Arm {
 fn arms(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> (Vec<Arm>, bool) {
     let Some(w) = m.wall(id) else { return (Vec::new(), false) };
     let node = if at_end { w.end } else { w.start };
-    let mut arms = vec![arm(m, w, at_end, true)];
+    let mut arms = vec![arm(m, id, w, at_end, true)];
     let mut through = false;
+    // A wall that refuses to join meets nothing at this end: its own square end is its whole cap.
+    if !w.join {
+        return (arms, false);
+    }
+    // A wall that refuses to join is no candidate for anyone either: neither side is mitred.
+    let joins = |o: &Wall| o.join && stacked(m, w, o);
     let candidates: Box<dyn Iterator<Item = (Id, &Wall)> + '_> = match index {
-        Some(index) => Box::new(index.neighbours(id).into_iter().filter_map(|id| Some((id, m.wall(id)?)))),
-        None => Box::new(m.elements.iter().filter_map(|(&id, e)| match e {
-            Element::Wall(w) => Some((id, w)),
-            _ => None,
-        })),
+        Some(index) => Box::new(index.neighbours_at(id, node).into_iter().filter_map(|id| Some((id, m.wall(id)?)))),
+        // The walls whose location lines come within the thickest wall's thickness of the node (those that end at it,
+        // and those it ends on: the node within their thickness), of heights it overlaps (only those join it).
+        None => {
+            let thickest = m.types.wall.values().map(|t| t.thickness).filter(|t| t.is_finite()).fold(0.0, f64::max);
+            let at = ([node.0, node.1, node.0, node.1], m.base_z(w), m.top_z(w));
+            let near = m.lookup().walls_near_at(&[at], thickest + 1.0);
+            Box::new(near.into_iter().filter_map(|id| Some((id, m.wall(id)?))))
+        }
     };
     // Where they meet is asked first: whether they overlap in height takes both walls' heights, under any roof or floor
     // they're attached to.
@@ -243,27 +264,23 @@ fn arms(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> (Vec<Arm>, bo
             continue;
         }
         if o.start.dist(node) <= TOL {
-            if stacked(m, w, o) {
-                arms.push(arm(m, o, false, false));
+            if joins(o) {
+                arms.push(arm(m, other, o, false, false));
             }
         } else if o.end.dist(node) <= TOL {
-            if stacked(m, w, o) {
-                arms.push(arm(m, o, true, false));
+            if joins(o) {
+                arms.push(arm(m, other, o, true, false));
             }
         } else {
             // A wall it ends on: the node within its thickness, between its ends.
             let ax = Axis::of(o);
             let (s, across) = ax.project(node);
             let (ext, int) = faces(m, o);
-            if s > TOL
-                && s < ax.length() - TOL
-                && (int - TOL..=ext + TOL).contains(&across)
-                && ax.distance(node, across) <= TOL
-                && stacked(m, w, o)
+            if s > TOL && s < ax.length() - TOL && (int - TOL..=ext + TOL).contains(&across) && ax.distance(node, across) <= TOL && joins(o)
             {
                 let (t, (e, i), c) = (ax.tangent(s), (ax.at(s, ext), ax.at(s, int)), ax.at(s, (ext + int) / 2.0));
-                arms.push(Arm { mine: false, way: t, ccw: e, cw: i, centre: c, thick: ext - int });
-                arms.push(Arm { mine: false, way: t * -1.0, ccw: i, cw: e, centre: c, thick: ext - int });
+                arms.push(Arm { id: other, at_end: false, mine: false, way: t, ccw: e, cw: i, centre: c, thick: ext - int });
+                arms.push(Arm { id: other, at_end: false, mine: false, way: t * -1.0, ccw: i, cw: e, centre: c, thick: ext - int });
                 through = true;
             }
         }
@@ -276,20 +293,42 @@ fn arms(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> (Vec<Arm>, bo
 /// clockwise side of the way it leaves the node round to the other. Walls ending where it ends meet
 /// it at any angle, their faces running on until they cross (no farther from the node than the
 /// thickest is thick, either way: past that, the end is square); a wall it ends on stops it at its
-/// face. Where
-/// three or more walls meet, the node itself fills between them.
+/// face. At a square compound Butt the shared cap follows the structure around the corner.
+/// Where three or more walls meet, the node itself fills between them.
 pub fn cap(m: &Model, id: Id, at_end: bool) -> Vec<P2> {
     cap_in(m, id, at_end, None)
 }
 
 fn cap_in(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> Vec<P2> {
-    let Some(w) = m.wall(id) else { return Vec::new() };
+    end_geometry(m, id, at_end, index).outline
+}
+
+#[derive(Default)]
+struct WallEnd {
+    outline: Vec<P2>,
+    butt: Option<compound::Butt>,
+}
+
+impl WallEnd {
+    fn plain(outline: Vec<P2>) -> Self {
+        Self { outline, butt: None }
+    }
+}
+
+fn end_geometry(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> WallEnd {
+    let Some(w) = m.wall(id) else { return WallEnd::default() };
     let (arms, through) = arms(m, id, at_end, index);
     let n = arms.len();
-    let Some(i) = arms.iter().position(|a| a.mine) else { return Vec::new() };
+    let Some(i) = arms.iter().position(|a| a.id == id) else { return WallEnd::default() };
     let (prev, me, next) = (&arms[(i + n - 1) % n], &arms[i], &arms[(i + 1) % n]);
     if n < 2 {
-        return vec![me.cw, me.ccw];
+        return WallEnd::plain(vec![me.cw, me.ccw]);
+    }
+    if n == 2
+        && !through
+        && let Some(end) = compound::corner(m, me, next)
+    {
+        return end;
     }
     let node = if at_end { w.end } else { w.start };
     let limit = arms.iter().map(|a| a.thick).fold(0.0, f64::max);
@@ -301,22 +340,27 @@ fn cap_in(m: &Model, id: Id, at_end: bool, index: Option<&Index>) -> Vec<P2> {
             .unwrap_or(face)
     };
     let (cw, ccw) = (meet(me.cw, prev.ccw, prev.way), meet(me.ccw, next.cw, next.way));
-    if through { vec![cw, ccw] } else { vec![cw, node, ccw] }
+    WallEnd::plain(if through { vec![cw, ccw] } else { vec![cw, node, ccw] })
 }
 
 /// Wall `id`'s centre line, an arc as chords: each end it joins others at run on (or back) to the
 /// nearest of their centre lines, so rooms close at the centre lines whatever line walls stand on.
 pub fn centre_line(m: &Model, id: Id) -> Vec<P2> {
+    centre_line_in(m, id, None)
+}
+
+/// [`centre_line`], its joins found through `index` when there is one.
+pub(crate) fn centre_line_in(m: &Model, id: Id, index: Option<&Index>) -> Vec<P2> {
     let Some(w) = m.wall(id) else { return Vec::new() };
     let axis = Axis::of(w);
     let mut line = axis.points(0.0, axis.length(), centre(m, w));
     for at_end in [false, true] {
-        let (arms, _) = arms(m, id, at_end, None);
-        let Some(me) = arms.iter().find(|a| a.mine) else { continue };
+        let (arms, _) = arms(m, id, at_end, index);
+        let Some(me) = arms.iter().find(|a| a.id == id) else { continue };
         let reach = 2.0 * arms.iter().map(|a| a.thick).fold(1.0, f64::max);
         let crossing = arms
             .iter()
-            .filter(|a| !a.mine)
+            .filter(|a| a.id != id)
             .filter_map(|a| geom::line_intersection(me.centre, me.centre + me.way, a.centre, a.centre + a.way))
             .min_by(|a, b| a.dist(me.centre).total_cmp(&b.dist(me.centre)));
         let end = if at_end { line.last_mut() } else { line.first_mut() };
@@ -370,23 +414,68 @@ pub fn layer_lines(m: &Model, id: Id) -> Vec<Vec<P2>> {
 }
 
 pub(crate) fn layer_lines_in(m: &Model, id: Id, index: Option<&Index>) -> Vec<Vec<P2>> {
-    let Some(w) = m.wall(id) else { return Vec::new() };
+    layer_geometry(m, id, index).lines
+}
+
+#[derive(Default)]
+pub(crate) struct LayerGeometry {
+    pub(crate) lines: Vec<Vec<P2>>,
+    // A core can reach beyond the finish beside it at either end.
+    butt: [Option<compound::Butt>; 2],
+}
+
+impl LayerGeometry {
+    pub(crate) fn joined(&self) -> bool {
+        self.butt.iter().any(Option::is_some)
+    }
+
+    pub(crate) fn band(&self, k: usize) -> Vec<P2> {
+        let a = &self.lines[k];
+        let b = &self.lines[k + 1];
+        let mut ring: Vec<_> = a.iter().chain(b.iter().rev()).copied().collect();
+        if k == 1 {
+            let n = ring.len();
+            if let Some(start) = &self.butt[0] {
+                [ring[0], ring[n - 1]] = start.core;
+            }
+            if let Some(end) = &self.butt[1] {
+                [ring[a.len() - 1], ring[a.len()]] = end.core;
+            }
+        }
+        ring
+    }
+
+    pub(crate) fn interfaces(&self) -> impl Iterator<Item = &[P2]> {
+        self.lines
+            .iter()
+            .skip(1)
+            .take(self.lines.len().saturating_sub(2))
+            .map(Vec::as_slice)
+            .chain(self.butt.iter().flatten().filter(|b| b.draw_seam).map(|b| b.core.as_slice()))
+    }
+}
+
+pub(crate) fn layer_geometry(m: &Model, id: Id, index: Option<&Index>) -> LayerGeometry {
+    let Some(w) = m.wall(id) else { return LayerGeometry::default() };
     let axis = Axis::of(w);
     let len = axis.length();
-    let (start, end) = (cap_in(m, id, false, index), cap_in(m, id, true, index));
-    boundaries(m, w)
+    let ends = [end_geometry(m, id, false, index), end_geometry(m, id, true, index)];
+    let lines = boundaries(m, w)
         .into_iter()
-        .map(|off| {
+        .enumerate()
+        .map(|(k, off)| {
             let mut line = axis.points(0.0, len, off);
-            if let Some(first) = line.first_mut() {
-                *first = on_cap(&axis, &start, false, off);
-            }
-            if let Some(last) = line.last_mut() {
-                *last = on_cap(&axis, &end, true, off);
+            for (i, end) in ends.iter().enumerate() {
+                let last = line.len() - 1;
+                line[if i == 0 { 0 } else { last }] = match &end.butt {
+                    Some(b) => b.turns[k],
+                    None => on_cap(&axis, &end.outline, i == 1, off),
+                };
             }
             line
         })
-        .collect()
+        .collect();
+    LayerGeometry { lines, butt: ends.map(|e| e.butt) }
 }
 
 /// A plane over the plan: its height at `q` is `z + g.0 · q.0 + g.1 · q.1`.
@@ -436,15 +525,25 @@ impl Bound {
     /// The roof or floor `id` from below (with `top`, from above), or `own` without one.
     fn of(m: &Model, id: Option<Guid>, top: bool, own: f64) -> Bound {
         let regions = match id.and_then(|id| m.elements.get(id)) {
+            // From below its underside (a shaped one's level under a variable layer), from above its top.
             Some(Element::Roof(r)) => m
-                .roof_pieces(r)
-                .unwrap_or_default()
+                .roof_prisms(r)
                 .into_iter()
-                .flat_map(|(ring, p)| {
-                    let plane = Plane { z: p.z + if top { m.roof_rise(r, &p) } else { 0.0 }, ..p };
+                .flat_map(|(ring, bottom, up)| {
+                    let plane = if top { up } else { bottom };
                     convex_pieces(&ring).into_iter().map(move |c| (c, plane))
                 })
                 .collect(),
+            // A shaped one's underside under a variable layer: level.
+            Some(Element::Floor(f)) if !top && m.floor_under(f).is_some() => {
+                let under = m.floor_under(f).map_or(Plane::flat(0.0), |(p, _)| p);
+                convex_pieces(&f.boundary).into_iter().map(|c| (c, under)).collect()
+            }
+            // A shaped one's triangles, each its own plane.
+            Some(Element::Floor(f)) if !f.shape.is_empty() => {
+                let depth = if top { 0.0 } else { m.floor_depth(f) };
+                m.shape_triangles(f).into_iter().map(|(t, p)| (t, Plane { z: p.z - depth, ..p })).collect()
+            }
             Some(Element::Floor(f)) => {
                 let face = m.floor_top(f);
                 let plane = Plane { z: face.z - if top { 0.0 } else { m.floor_depth(f) }, ..face };
@@ -583,6 +682,26 @@ pub fn heights(m: &Model, w: &Wall) -> (f64, f64) {
     let lo = pts.iter().map(|q| base.at(*q)).fold(f64::INFINITY, f64::min);
     let hi = pts.iter().map(|q| top.at(*q)).fold(f64::NEG_INFINITY, f64::max);
     (lo, hi)
+}
+
+/// The sides of the notches wall `id`'s doors and windows cut where they rise past its top, as Revit lets them: a line across
+/// the wall from face to face at each jamb whose head reaches the top there, which a plan seeing the wall from above draws.
+pub fn notches(m: &Model, id: Id) -> Vec<[P2; 2]> {
+    let Some(w) = m.wall(id) else { return Vec::new() };
+    let guid = m.guid(id);
+    let (axis, (ext, int), base) = (Axis::of(w), faces(m, w), m.own_base(w));
+    let mut out = Vec::new();
+    for e in m.lookup().referrers(&guid).filter_map(|k| m.elements.get(k)) {
+        let (Element::Door(o) | Element::Window(o)) = e else { continue };
+        let Some(t) = m.opening_type(e).filter(|_| o.host == guid) else { continue };
+        let head = base + o.sill + t.height;
+        for s in [o.offset - t.width / 2.0, o.offset + t.width / 2.0] {
+            if head >= top_at(m, w, s) - 1e-6 {
+                out.push([axis.at(s, int), axis.at(s, ext)]);
+            }
+        }
+    }
+    out
 }
 
 /// A part of a wall's solid: a ring in plan, from a bottom plane up to a top one; of a curved wall,

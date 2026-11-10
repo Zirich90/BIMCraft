@@ -37,6 +37,7 @@ impl BimApp {
             View { scale: room(w, size.0).min(room(h, size.1)), cx: size.0 / 2.0, cy: size.1 / 2.0, width: w, height: h }
         };
         let Some((view, local)) = self.canvas.navigate(ui, &response, rect, id, fit) else { return };
+        let writing = self.writing();
         let papers = &mut self.paper;
         if !matches!(&papers.drawn, Some((m, s, _)) if Arc::ptr_eq(m, &model) && *s == id) {
             let d = sheet::draw(&model, id).unwrap_or_else(|| Drawing::new(view));
@@ -61,6 +62,7 @@ impl BimApp {
             origin: rect.min + vec2(view.px(P2(0.0, size.1)).0, view.px(P2(0.0, size.1)).1),
             k: (view.scale / DENSITY) as f32,
             paper: true,
+            hide: writing,
         };
         let drawn = |q: Pos2| ((q.x - at.origin.x) / at.k, (q.y - at.origin.y) / at.k);
         let pick = |q: Pos2| d.pick(drawn(q), PICK / at.k);
@@ -86,6 +88,13 @@ impl BimApp {
         let sheet_rect = Rect::from_two_pos(at.origin, rect.min + vec2(view.px(P2(size.0, 0.0)).0, view.px(P2(size.0, 0.0)).1));
         p.rect(sheet_rect, 0.0, Color32::WHITE, Stroke::new(1.0, pal().border), StrokeKind::Outside);
         paint(&p, at, &d, &self.selection, hovered, self.thin, &pictures);
+        // While a note is written here, the pointer is its editor's.
+        if self.writing_in(id) {
+            self.paper.drag = None;
+            self.note_canvas(ui, &response, &p, at, &d);
+            self.nav_bar(ui, rect, id);
+            return;
+        }
         // Where a dragged view would go: its frame, moved.
         if let Some(by) = by {
             for vp in &self.selection {
@@ -118,9 +127,22 @@ impl BimApp {
             _ => None,
         };
         if response.double_clicked()
+            && let Some(note) = hovered.filter(|h| crate::notes::is_note(&model, *h))
+        {
+            self.edit_note(note);
+            return;
+        }
+        if response.double_clicked()
             && let Some(open) = hovered.and_then(view_of)
         {
-            self.open_sheet(open);
+            // A 3D view opens in the 3D tab from its own camera; another view opens as its own tab.
+            match hovered.and_then(|id| match model.elements.get(id) {
+                Some(Element::Viewport(v)) if matches!(model.elements.get(v.view), Some(Element::View3D(_))) => model.elements.id(v.view),
+                _ => None,
+            }) {
+                Some(view) => self.open_3d(Some(view)),
+                None => self.open_sheet(open),
+            }
             return;
         }
         if let Some(q) = self.clicked_at(&response) {

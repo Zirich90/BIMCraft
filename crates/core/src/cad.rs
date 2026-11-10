@@ -13,6 +13,11 @@ use crate::geom::P2;
 use crate::pen::Pen;
 use crate::render::Rgb;
 
+/// What reads a DWG drawing for a session: the DXF the file at a path becomes, and notes on what the read left out, or why it
+/// can't be read. The core reads no DWG of its own; the apps hand their `Session` one (`bimcraft-dwg`, which reads it in a
+/// child process), and a session without one says to save the drawing as DXF.
+pub type DwgReader = Arc<dyn Fn(&std::path::Path) -> Result<(Vec<u8>, Vec<String>), String> + Send + Sync>;
+
 /// Drawings one project may hold.
 pub const MAX_CADS: usize = 64;
 /// What a project's drawings may hold among them, bytes of DXF.

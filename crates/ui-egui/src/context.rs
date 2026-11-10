@@ -48,6 +48,8 @@ pub(crate) enum Action {
     Cancel,
     /// Enter: a spline or a polyline made of the points clicked so far.
     Finish,
+    /// Enter: the detail lines selected are a custom fill pattern's (Fill Patterns' New Pattern > Custom).
+    FinishPick,
     ZoomToFit,
     ZoomIn,
     ZoomOut,
@@ -66,6 +68,13 @@ pub(crate) enum Action {
     CreateCarrierFromWire,
     ConnectEquipmentToWire,
     AttachExistingWire,
+    /// The camera selected in a plan: open its 3D view.
+    OpenView,
+    /// The 3D view's Work Plane dialog.
+    WorkPlane,
+    /// The selected walls' and runs' joins refused (Revit's Disallow Join), or taken up again.
+    DisallowJoin,
+    AllowJoin,
 }
 
 impl Action {
@@ -76,6 +85,7 @@ impl Action {
             Action::Move => "Move",
             Action::Cancel => "Cancel",
             Action::Finish => msg!("Finish Drawing"),
+            Action::FinishPick => "Finish",
             Action::ZoomToFit => "Zoom to Fit",
             Action::ZoomIn => "Zoom In",
             Action::ZoomOut => "Zoom Out",
@@ -93,6 +103,10 @@ impl Action {
             Action::CreateCarrierFromWire => msg!("Create Carrier from Wire"),
             Action::ConnectEquipmentToWire => msg!("Connect Equipment to Wire"),
             Action::AttachExistingWire => msg!("Attach Existing Wire"),
+            Action::OpenView => msg!("Open Camera View"),
+            Action::WorkPlane => msg!("Set Work Plane…"),
+            Action::DisallowJoin => msg!("Disallow Join"),
+            Action::AllowJoin => msg!("Allow Join"),
         }
     }
 
@@ -100,7 +114,7 @@ impl Action {
     pub(crate) fn shortcut(self) -> Option<&'static str> {
         match self {
             Action::Cancel => Some("Esc"),
-            Action::Finish => Some("Enter"),
+            Action::Finish | Action::FinishPick => Some("Enter"),
             Action::Move => Some("MV"),
             Action::ZoomToFit => Some("ZF"),
             Action::SelectAllInstances => Some("SA"),
@@ -158,6 +172,9 @@ impl BimApp {
         if self.finishable() {
             first.insert(0, Item::new(Action::Finish, true));
         }
+        if self.picking_pattern_lines() {
+            first.insert(0, Item::new(Action::FinishPick, true));
+        }
         let mut groups = vec![first];
         if self.wire_and_equipment().is_some() {
             groups.push(vec![Item::new(Action::ConnectEquipmentToWire, true)]);
@@ -166,12 +183,6 @@ impl BimApp {
             if self.sheet == Sheet::View3D {
                 groups.push(vec![Item::new(Action::Move, true)]);
             }
-            groups.push(vec![
-                Item::new(Action::EditType, self.type_subject().is_some()),
-                Item::new(Action::SelectAllInstances, true),
-                Item::new(Action::Delete, true),
-            ]);
-            // Detail lines, regions and notes group; a group comes apart.
             let m = &self.session.model;
             if let [id] = self.selection.as_slice() {
                 if matches!(self.sheet, Sheet::Plan(_) | Sheet::Ceiling(_) | Sheet::View3D)
@@ -192,26 +203,59 @@ impl BimApp {
                     groups.push(vec![Item::new(Action::AttachExistingWire, m.carrier_wire_candidates(*id).is_ok_and(|v| !v.is_empty()))]);
                 }
             }
-            let groupable = self.selection.iter().all(|id| m.elements.get(*id).is_some_and(bimcraft_core::groups::holds));
-            if groupable || self.group_selected() {
-                groups.push(vec![Item::new(Action::CreateGroup, groupable), Item::new(Action::Ungroup, self.group_selected())]);
+            // A camera picked in a plan: open its 3D view, or delete it.
+            let camera =
+                matches!(self.selection.as_slice(), [id] if matches!(m.elements.get(id), Some(bimcraft_core::model::Element::View3D(_))));
+            if camera {
+                groups.push(vec![Item::new(Action::OpenView, true), Item::new(Action::Delete, true)]);
+            } else {
+                groups.push(vec![
+                    Item::new(Action::EditType, self.type_subject().is_some()),
+                    Item::new(Action::SelectAllInstances, true),
+                    Item::new(Action::Delete, true),
+                ]);
+                // Detail lines, regions and notes group; a group comes apart.
+                let groupable = self.selection.iter().all(|id| m.elements.get(*id).is_some_and(bimcraft_core::groups::holds));
+                if groupable || self.group_selected() {
+                    groups.push(vec![Item::new(Action::CreateGroup, groupable), Item::new(Action::Ungroup, self.group_selected())]);
+                }
             }
+            // Walls and runs mitre against what they meet; any of them may refuse (Revit's Disallow
+            // Join). Each item is offered when some selected element would change by taking it.
+            let joins: Vec<bool> = self
+                .selection
+                .iter()
+                .filter_map(|id| match m.elements.get(*id) {
+                    Some(bimcraft_core::model::Element::Wall(w)) => Some(w.join),
+                    Some(e) => e.run().map(|r| r.join),
+                    _ => None,
+                })
+                .collect();
             if !self.linked_cads().is_empty() {
                 groups.push(vec![Item::new(Action::ReloadCad, true)]);
             }
             // What the view on screen hides and paints.
-            if self.graphic_view().is_some() {
+            if self.graphic_view().is_some() && !camera {
                 groups.push(vec![
                     Item::new(Action::HideElement, true),
                     Item::new(Action::HideCategory, true),
                     Item::new(Action::OverrideGraphics, true),
                 ]);
             }
+            if !joins.is_empty() {
+                groups.push(vec![
+                    Item::new(Action::DisallowJoin, joins.iter().any(|j| *j)),
+                    Item::new(Action::AllowJoin, joins.iter().any(|j| !*j)),
+                ]);
+            }
         }
         let zoom = vec![Item::new(Action::ZoomToFit, true), Item::new(Action::ZoomIn, true), Item::new(Action::ZoomOut, true)];
         match self.sheet {
             Sheet::Plan(_) | Sheet::Ceiling(_) | Sheet::Section(_) | Sheet::Paper(_) => groups.push(zoom),
-            Sheet::View3D => groups.push([vec![Item::new(Action::HomeView, true)], zoom].concat()),
+            Sheet::View3D => {
+                groups.push(vec![Item::new(Action::WorkPlane, self.sketch.is_none())]);
+                groups.push([vec![Item::new(Action::HomeView, true)], zoom].concat());
+            }
             Sheet::Schedule(_) | Sheet::Table(_) => {}
         }
         groups
@@ -224,10 +268,11 @@ impl BimApp {
             Action::Move => self.set_tool(Tool::Move(None)),
             Action::Cancel => self.escape(),
             Action::Finish => self.finish_open_shape(),
+            Action::FinishPick => self.finish_pattern_lines(),
             Action::ZoomToFit => self.fit(),
             Action::ZoomIn => self.zoom_view(1.25),
             Action::ZoomOut => self.zoom_view(0.8),
-            Action::HomeView => self.orbit.camera = None,
+            Action::HomeView => self.home3d(),
             Action::EditType => self.edit_type(),
             Action::SelectAllInstances => self.select_all_instances(),
             Action::HideElement => self.hide_selection(false),
@@ -285,11 +330,39 @@ impl BimApp {
                     }
                 }
             }
+            Action::WorkPlane => self.open_work_plane(),
             Action::ReloadCad => {
                 for cad in self.linked_cads() {
                     self.run("reload_cad", serde_json::json!({"cad": cad}));
                 }
             }
+            Action::OpenView => {
+                if let Some(&id) = self.selection.first() {
+                    self.open_3d(Some(id));
+                }
+            }
+            Action::DisallowJoin => self.set_joins(false),
+            Action::AllowJoin => self.set_joins(true),
+        }
+    }
+
+    /// Turn the joins of every selected wall and run off or on, as one command: the flag acts on the
+    /// whole element, both ends alike, and is saved with it.
+    fn set_joins(&mut self, join: bool) {
+        let ids: Vec<bimcraft_core::model::Id> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.session
+                    .model
+                    .elements
+                    .get(*id)
+                    .is_some_and(|e| matches!(e, bimcraft_core::model::Element::Wall(_)) || e.run().is_some())
+            })
+            .collect();
+        if !ids.is_empty() {
+            self.run("modify", serde_json::json!({"ids": ids, "join": join}));
         }
     }
 

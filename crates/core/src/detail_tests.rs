@@ -502,6 +502,12 @@ pub(crate) fn sweep_payloads(s: &mut Session) -> (Payloads, Payloads) {
     let repeat = id_of(&run(s, "repeating_detail", json!({"type": "Grp", "start": [0, 4000], "end": [4000, 4000], "spacing": 1000})));
     let floor = id_of(&run(s, "floor", json!({"sketch": square(0.0, 0.0, 8000.0)})));
     run(s, "linework", json!({"view": 100000, "id": 100002, "at": [4000, 95], "style": "Wide Lines"}));
+    // Two lines of their own (the others are joined, filleted and trimmed) and a locked dimension between them: what is typed
+    // into it, and Align's lock against it.
+    let (low, high) =
+        (line(s, json!({"start": [0, -2000], "end": [2000, -2000]})), line(s, json!({"start": [0, -1500], "end": [2000, -1500]})));
+    let dim = id_of(&run(s, "dimension", json!({"refs": [{"id": low}, {"id": high}], "at": [1000, -1750]})));
+    run(s, "dimension_constraint", json!({"id": dim, "locked": [0]}));
     let bow = json!([[[0, 0], [4000, 4000]], [[4000, 4000], [4000, 0]], [[4000, 0], [0, 2000]], [[0, 2000], [0, 0]]]);
     let open = json!([[[0, 0], [1000, 0]], [[1000, 0], [1000, 1000]]]);
     let far = json!([[[0, 0], [1e300, 0]], [[1e300, 0], [0, 1e300]], [[0, 1e300], [0, 0]]]);
@@ -535,6 +541,16 @@ pub(crate) fn sweep_payloads(s: &mut Session) -> (Payloads, Payloads) {
         ("detail_line", json!({"control": [[0, 0], [1, 1]], "knots": [0, 0, 1]})),
         ("detail_line", json!({"fit": [[0, 0], [0, 0], [0, 0]], "start_tangent": [0, 0], "end_tangent": [1e300, 0]})),
         ("detail_line", json!({"start": [0, 0], "end": [1000, 0], "cloud": 100, "insulation": 100, "revision": 5, "centre_mark": "yes"})),
+        // Typed lengths, Align's lock, and a 3D dimension to an edge of no size.
+        ("dimension_value", json!({"id": dim, "value": 1e300})),
+        ("dimension_value", json!({"id": dim, "value": 800, "segment": 1e300})),
+        ("dimension_value", json!({"id": dim, "value": 800})),
+        ("align", json!({"id": high, "reference": [[0, -2000], [2000, -2000]], "line": [[0, -1500], [2000, -1500]], "lock": true})),
+        (
+            "align",
+            json!({"id": low, "reference": [[0, -1500], [2000, -1500]], "line": [[0, -2000], [2000, -2000]], "lock": "x", "to": u64::MAX}),
+        ),
+        ("dimension_3d", json!({"refs": [{"at": [0, 0, 0]}, {"at": [1000, 0, 0], "edge": [[0, 0, 0], [0, 0, 0]]}], "at": [0, -500, 0]})),
         // Edits of them.
         ("split", json!({"id": a, "at": [1e300, 0]})),
         ("vertex", json!({"id": poly, "at": [1000, 1000], "delete": true})),
@@ -552,6 +568,12 @@ pub(crate) fn sweep_payloads(s: &mut Session) -> (Payloads, Payloads) {
             json!({"id": 100000, "graphics": {"linework": [{"element": "x", "from": [1e300, 0], "to": [0, 0], "style": "No Such Style"}]}}),
         ),
         ("detail_group", json!({"type": "Grp", "at": [1e300, 0], "angle": 1e300, "mirrored": 5})),
+        // Text: its types, its runs, its formatting.
+        ("modify", json!({"id": note, "runs": [{"from": 0, "to": 1e300, "bold": true}], "override_format": true})),
+        ("modify", json!({"id": note, "runs": [{"from": 2, "to": 1}], "type": "Nope"})),
+        ("modify", json!({"id": note, "text": "Fixed ő Ж 漢", "size": 3})),
+        ("text", json!({"text": "x".repeat(5000), "at": [0, 0], "type": 5})),
+        ("text", json!({"text": "\u{0}\t\n", "at": [0, 0], "runs": [{"from": 0, "to": 1, "italic": "yes"}]})),
     ];
     let targeted = vec![
         // Each command once as it is meant to be used, so that the base has what it needs to do something.
@@ -563,10 +585,27 @@ pub(crate) fn sweep_payloads(s: &mut Session) -> (Payloads, Payloads) {
         ("offset", json!({"id": a, "distance": 100, "toward": [0, 1]})),
         ("split", json!({"id": a, "at": [1000, 0]})),
         ("join_polyline", json!({"ids": [a, tail]})),
+        (
+            "line_pattern",
+            json!({"name": "Graphic", "segments": [
+                {"offset": {"length": 4, "count": 9, "distance": 0.5}},
+                {"wave": {"length": 6, "frequency": 2, "amplitude": 1}},
+                {"zigzag": {"length": 6, "frequency": 3, "amplitude": 1}},
+                {"text": {"length": 12, "size": 2, "text": "Gas"}}, {"dot_length": 1}
+            ]}),
+        ),
         ("line_pattern", json!({"name": "Fence", "segments": [{"dash": 4}, {"space": 1}]})),
         ("line_style", json!({"name": "Fence Line", "pen": 3})),
         ("fill_pattern", json!({"name": "Hatch", "lines": [{"angle": 45, "spacing": 10}]})),
         ("filled_region_type", json!({"name": "Hatched", "foreground": "Sand"})),
+        ("text_type", json!({"name": "Title", "like": "5mm", "font": "IBM Plex Mono", "bold": true, "border": true, "border_pen": 3})),
+        (
+            "text",
+            json!({"text": "Bold\nlines", "at": [100, 100], "type": "3.5mm", "override_format": true, "runs": [{"from": 0, "to": 4, "bold": true}]}),
+        ),
+        ("text_type", json!({"name": "X", "font": "Comic", "size": 1e300, "width_factor": -1, "border_offset": 1e9, "border_pen": 99})),
+        ("text_type", json!({"name": "2.5mm", "delete": true, "rename": "x", "color": "#zz"})),
+        ("text_type", json!({"name": "3.5mm", "rename": "2.5mm"})),
         ("filled_region", json!({"sketch": square(0.0, 0.0, 500.0), "type": "Sand"})),
         ("export_fill_patterns", json!({"names": ["Sand"]})),
         ("import_fill_patterns", json!({"text": "*Hatch\n45,0,0,0,10\n"})),

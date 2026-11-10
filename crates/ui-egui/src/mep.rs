@@ -267,7 +267,22 @@ impl BimApp {
         panel(ui, "Electrical", |ui| {
             self.buttons(ui, &[Self::fixture_button("equipment"), Self::fixture_button("device"), Self::fixture_button("lighting")]);
         });
-        panel(ui, msg!("Cable Carrier & Wire"), |ui| {
+        panel(ui, msg!("Symbols"), |ui| {
+            let tip = msg!(
+                "Load AREI Symbols: the Belgian AREI/RGIE's plan symbols (Table 2.23) as families, named in the project's language; loading them again changes nothing"
+            );
+            if big_button(ui, Icon::LoadFamily, "Load AREI Symbols", false, tip).clicked() {
+                self.run("symbol_set", serde_json::json!({"set": "arei"}));
+            }
+        });
+        panel(ui, msg!("Conduit & Wire"), |ui| {
+            let conduit = (
+                Icon::Conduit,
+                "Conduit",
+                msg!("Conduit (CN): click its start and its end; a chain of clicks makes a conduit for each step"),
+                Tool::Run("conduit", None),
+            );
+            let tray = (Icon::CableTray, "Cable Tray", msg!("Cable Tray (CT): click its start and its end"), Tool::Run("cabletray", None));
             let carrier = (
                 Icon::CableTray,
                 "Cable Carrier",
@@ -280,7 +295,7 @@ impl BimApp {
                 msg!("Wire (EW): click its start and its end; a chain of clicks makes a wire for each step"),
                 Tool::Run("wire", None),
             );
-            self.buttons(ui, &[carrier, wire]);
+            self.buttons(ui, &[conduit, tray, carrier, wire]);
         });
     }
 

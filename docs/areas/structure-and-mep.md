@@ -7,7 +7,30 @@ Structure (`runs.rs`, `structure.rs`; the design for the five discipline tabs is
 (top, centre or bottom) at the start, `end_offset` at the end (level when none), `system` the name of the system it is in: a beam, a
 strip footing, a pipe (Plumbing), and what the other tabs draw (cable carriers, wires, down conductors, data cabling) as further
 `Element` variants over the same struct, as `Door` and `Window` share `Opening`; `model::run_arm!` is the pattern for any of them, so a
-place that treats runs alike names no category, and a new category is a line there. Its type is `Types::runs[category][name]`, a `RunType`
+place that treats runs alike names no category, and a new category is a line there.
+Joins: runs of one category lying flat whose heights overlap meet as walls do — mitred end to end at any angle, one ending on
+another's span stopping at its face (`runs::outline`, `runs::cap`, as `walls::cap` shapes a wall's; `runs::arms` finds the
+neighbours through `walls::Index`'s tiles for runs, or among every run when no index is given), and a strip footing also stops at
+a wall's face (a wall never changes for a run: its own outline knows no runs; the footing's top touching the wall's base is the
+joint). Runs meet strictly in height, as two walls do, but a footing meets a wall by that touch. `join` is each run's and each
+wall's Allow Join, on unless turned off: an unjoined run's ends stay square and it stretches for no one (`relocate` passes it by).
+The outline is the one source for what every view draws — the plan's fill and seams, the seen-below and overhead pictures, the
+snaps' corners, the 3D prism (and a round run's tube, cut by the same end planes, `runs::end_cuts` and `runs::clip_tube`, its
+cap layer first) and the sections — so a joint is the same everywhere. Its line (`start`–`end`) never changes: a join only
+shapes the outline. IFC still writes a run's section swept along its axis (a reader comes back to the line and section it was
+given), so a joint shows in the plan, the 3D view and the sections, not in an exported body. A run's end may be dragged with
+`move {end}`, one run alone, and the runs joined there follow as walls' do (an end on an end goes with it; an end on the span
+slides along its own line onto the crossing). Moved whole, a run's end that lay on a neighbour's line runs on or is cut back
+to their new crossing, as a wall's does, and the neighbour keeps its own axis and only stretches to it — whether the pair is
+two runs of one category or a strip footing meeting a wall. At a corner where a wall and a strip footing end together, with
+another element also ending there, the wall's end and the footing's go together too, as two walls' do; a footing simply
+carrying on under a wall keeps its length, so a wall dragged along its own axis may be shorter than the footing it carries.
+Glue: a strip footing under a wall sticks to it as Revit's does — its line the
+wall's (same direction and place, within `TOL`), its top on the wall's base — and while that holds it rides the wall in plan
+(`relocate` moves it by the wall's own transformation) and keeps its top on the wall's base when the wall's base moves
+(`modify`, `glue::on_base`). Nothing is stored: the condition is read from the geometry (`glue`), so moving the wall or the
+footing away lets go, putting them back glues again, and deleting the wall leaves the footing where it is. Only `stripfooting`
+glues; a sloped one (an `end_offset`) doesn't; a footing changed by hand soon no longer meets its line or its base and lets go. Its type is `Types::runs[category][name]`, a `RunType`
 (`width` across by `depth` deep, or round, in a `material` of the library). The section is square to the axis, so a sloped run is
 `depth / cos θ` deep vertically (`Geom::half`). `runs::Geom` is the one place that knows the geometry (centre line, `footprint`,
 `prism` for a rectangle, `tube` for a round one, `z_span`); plans, sections (a prism is cut like any solid; a tube by the plane
@@ -30,18 +53,30 @@ the Structure tab's button; every other `set_tool` clears it); CL is the structu
 elsewhere, as in Revit. IFC writes a run as an extrusion along its own axis (`Step::body_along`, `aim`) of the class and predefined type
 the one table `runs::IFC` gives its category (import reads the same table back, `runs::from_ifc`), each structural element with
 `LoadBearing` in its `Pset_*Common`, a run's system as an `IfcSystem` (named for it, its GlobalIds following the name) the runs in it
-are assigned to by an `IfcRelAssignsToGroup`, its `Justification` and `Category` in `BIMCraft_Run`, and its material as an `IfcMaterial`.
+are assigned to by an `IfcRelAssignsToGroup`, its `Justification` and `Category` in `BIMCraft_Run`, and its material as an `IfcMaterial`. A beam, a column, a structural column and a
+pad footing carry their section on their type, the IFC4 way (`Step::typed_member`, `write_types`): the `IfcBeamType`, `IfcColumnType` or
+`IfcFootingType` is related by `IfcRelAssociatesMaterial` to an `IfcMaterialProfileSet` of one `IfcMaterialProfile`, holding the type's
+material (a beam type's; a column type has none, so the material is `$`) and its profile, an `IfcRectangleProfileDef` of the width by the
+depth or an `IfcCircleProfileDef` of half the width, in millimetres as every length is. Each occurrence is related to an
+`IfcMaterialProfileSetUsage` of that set (one for each cardinal point, shared by the occurrences placed by it): a beam's cardinal point is
+the line its heights are on, the top (8), the middle (5) or the bottom (2) of its section, a column's and a footing's the middle (5). The
+beam has no other material association, so the importer reads a run's material through the usage (`element_material`). The profile
+definition (`Step::section_profile`, keyed by `Section`) is written once for a section, and the type's profile and its occurrences' bodies
+share it; two types of one name and two sections (a column's and a structural column's) are two type objects. A strip footing, a pipe and
+the other runs have no profile set, only the plain material.
 Import (`import::run_in`) finds a run's axis as the direction its body's points spread furthest in (power iteration on their
 covariance), so a beam rolled about its axis comes in as the box round it; an axis that stands (a riser) has its width along east and
 runs up; the justification BIMCraft wrote puts the heights back on the line they were typed at (`Geom::half`), none meaning the middle;
 a system comes from the IfcSystem the product is assigned to, and its category from the class and type, or BIMCraft's `Category`
 where a class has several; `LoadBearing` makes a column or a floor structural.
 
+**Sizing** is a command with no model behind it, so it needs no connectors: `circuit` (`nbr5410.rs`, its tables in `nbr5410/tables.rs` as NBR 5410:2004 prints them: Tabelas 36 and 37 current capacity for methods A1 to D, 40 and 41 temperature and soil, 42 and 45 grouping, 47, 48 and 58) sizes one electrical circuit for copper: the design current from watts or VA, the demand and power factors and the phases at the voltage `system` it is given (it reads nothing from the model), then the smallest section and breaker with I_B ≤ I_n ≤ I_Z (which gives I_2 = 1.45 I_n ≤ 1.45 I_Z for the breakers of NBR NM 60898) and a voltage drop within the limit (4 %, from the conductor's resistance at its working temperature and 0.1 ohm/km), with the neutral and the protective conductor. A section or breaker already chosen is never made smaller. It does not check aluminium, trays (methods E and F), several layers, short circuit, harmonics or the conditions of a reduced neutral, and says so; a circuit in the model and a panel schedule come after it. `conduit_fill` (`conduit.rs`, its catalogues in `conduit/tables.rs`) checks a conduit's fill: the conductors of a circuit (phases, neutral, protective; by outside diameter) over the conduit's inside, at most 53 % for one cable, 31 % for two and 40 % for three or more (NBR 5410), and the smallest size of a family that takes them. The dimensions are the makers' own (Amanco Wavin PVC, Elecon steel, Corfio flexible cable), each family naming its document, page and address; the inside diameter is derived (outside less twice the wall); a cable the catalogue lacks (EPR, above 240 mm²) leaves the fill pending, never guessed. Trays are not sized. `drain_size` and `vent_size` (`drainage.rs`) size sanitary drains and vents as NBR 8160 asks, by the fixture units (UHC) they carry, with the standard's own tables: Tabela 3 (the units and smallest drain of each fixture), 5 (branches), 7 (building drains and collectors by slope), 6 (stacks by the building's floors), 8 (branch vents), 2 (vent stacks and headers by the DN served, its units and the longest length of each vent DN) and 1 (a trap's longest run to its vent). A drain is never smaller than its fixtures' own drains or than one flowing into it (`min_dn`), and a building drain is DN 100 at least. They are stateless, so none of this needs a pipe network; a network that carries the units along the runs comes with connectors. `storm_size` (`storm.rs`) sizes storm drains as NBR 10844 asks: the flow Q = I·A/60 from a rainfall and a roof area, a downpipe by the inner diameter of the standard's Figure 3 abacuses (read curve by curve: the water depth in the gutter, the downpipe's length and a sharp-edged or funnel outlet; 70 mm inside at least; off the chart nothing is read) and a horizontal drain by Manning at two thirds full (n 0.011, which reproduces its Table 4 within 1 %; 0.5 % slope at least). `water_size` (`water.rs`) sizes a cold water pipe of PVC soldável as NBR 5626 asks: the design flow of the fixtures by the method the project chooses (weights, Q = 0.3 √ΣP, or every fixture at once), the smallest DN within 3 m/s, the Darcy-Weisbach head loss over the length and the equivalent length of the fittings, and the pressure left (10 kPa at least at a point of use). `reservoir_size` (`reservoir.rs`) sizes a building's water reservation as NBR 5626:2020 asks: the potable volume is `days` of the day's consumption (24 h the least, three days at most unless the project shows how the quality is kept), a fire reserve is kept apart and added, and the supply has to refill the day in 6 h (3 h for a single-family house). It checks the compartments of an elevated reservoir (two, a house excepted), the smallest against the greatest peak over a maintenance, two independent pumps and the spare of several towers. The standard gives no litres per person, no split between the lower and the upper reservoir and no Forchheimer diameter, so the consumption and the split are the project's (each marked a configurable assumption), the usual 60 % is offered only as a practice suggestion, and an input not given leaves its check `pending` instead of stopping the others; every check says which of four kinds it is (current requirement, historical reference, engineering practice, configurable assumption). `hydrant_size` (`hydrant.rs`) sizes hydrants and hose reels as IT 22/2025 of the CBPMESP asks: the system type and fire reserve of Tabela 3 by occupation column and built area, the flow of the two most unfavourable jets of Tabela 2's type, and a pipe's speed (5 m/s at most), Hazen-Williams head loss (Tabela 1) and the head needed at its start. `load_points` (`loads.rs`) lists what a dwelling's rooms must have as NBR 5410:2004 item 9.5.2 asks: one ceiling lighting point per room (100 VA up to 6 m², 60 VA more for each whole 4 m² above) and the general-use outlets by the room's kind, which its name says or `kind` gives (a bathroom 1; kitchen, pantry, service area and laundry one for each 3.5 m of perimeter; room and bedroom one for each 5 m; veranda 1; the others 1 up to 6 m² and by perimeter above), with their power (600 VA each for the first 3 points of a bathroom, kitchen, pantry, service area or laundry and 100 VA after, or for the first 2 by the alternative where those rooms have more than 6 points together; 100 VA a point elsewhere) on the points a room has. It reads the model's rooms (inside the walls' finish) or the rooms it is given, and changes nothing. From the model it counts the power outlets and the luminaires that stand in each room (`Rooms::room_at`: the room whose boundary at the walls' centre lines holds the component's point, so a device on a wall's face is in the room on that side; standing in the last phase, primary design options), so a room drawn with too few outlets, or with no luminaire, is not `ok`; where the model has no outlet, or no luminaire, at all, it takes the least instead, and `counted` says which it counted. It leaves out the exceptions to the lighting point and to a veranda's outlet, where the outlets stand, and the TUE, and says so. Its numbers are data, not code: `data/load-points.json` holds one rule set for each standard (NBR 5410:2004, the default and only one so far), each row naming its standard and item, and a test fails on one that names none or on a kind of room left without a row. `standard` picks the set and the answer names it and each room's source, so a country's rules come in as a new set of rows and the sum (`RuleSet` in `loads.rs`) stays the same. IEC 60364 leaves the count of a dwelling's outlets to national rules, which is why the sets are by country. `dps_check` (`dps.rs`) works out the surge protection (DPS) of a power line as NBR 5410:2004 asks: it is required where the line is overhead (or the installation has an overhead line) and the region is AQ2 (more than 25 days of thunderstorms a year), or in any AQ3 region (5.4.2.1.1), unless the project takes a calculated, only material, risk, which the standard never allows where people's safety or health may be at risk; every external signal line asks for it at the entry. When required it gives where it stands by its purpose (the line's surges, at the entry or the main board, or the meter box of an existing individual unit; direct lightning, at the entry), the connection scheme or schemes of Figure 13 by the earthing (TT, TN-S, TN-C, IT) and the neutral, the least discharge (5 kA for each mode, 20 or 10 kA neutral to PE of scheme 3) and impulse (12.5 kA; 50 or 25 kA there) currents, and the connecting conductors (4 mm² copper, 16 mm² against direct lightning, 0.5 m in all). With the earthing it gives the least continuous operating voltage Uc of Tabela 49 for each pair of points the device connects (1.1 Uo; Uo between the neutral and the PE; √3 Uo phase to PE in IT; U in IT without a neutral), in volts when the phase-to-neutral voltage `uo` is given. With `system` (the nominal voltage) it gives the impulse withstand of Tabela 31 by category of product (IV to I) and the most the protection level Up may be, that of category II (equipment of use); a signal line at the entry needs 1.5 kV at least (its note 3). It also gives the follow current between neutral and PE (100 A at least in TN and TT) and the short-circuit the DPS must withstand (6.3.5.2.4 e), and, with `before_dr`, scheme 3 only for TT (6.3.5.2.6 b). It leaves out the overcurrent device of the DPS and its coordination, and says so; it changes nothing. `demand` (`demand.rs`) works out an installation's demand `D = a + b + c + d + e + f + g + h + i` and the category of service it asks of its utility. NBR 5410 gives no demand factors, so the numbers are the utility's own and the command names its utility and the edition (`utility` is required; only CPFL is there, GED 13 version 2.24 of 18/09/2020, for CPFL Paulista, Piratininga, Santa Cruz and RGE; another is refused until its tables are added from its standard): lighting and outlets (Tabela 2 by built area, or declared above 250 m², Tabela 3; Tabela 18 for other buildings), showers, taps and irons (Tabela 4), boilers (5), dryers, ovens and dishwashers (6), stoves (7), window air conditioners (8, and 9 for commercial use), motors by rank (14, 15 and 10), special equipment at a power factor of 0.75 (11) and hydromassage (10). The category of Tabela 1A (127/220 V) or 1B (220/380 V) comes of the installed load up to 25 kW and of D above, with its breaker, cable, conduit and earthing conductor. The GED's own Example 3 is a test (46.1 kW, D about 33 kVA, C3). It leaves out the other columns of Tabela 1, the cables of 1D and 1E and the starting of motors (Tabela 13), and says so; it changes nothing. For `utility` ENEL (ET 1569 version 01, 29/01/2024; low voltage only) it works out no demand, since the specification leaves it to the designer (item 7.7.2): it frames the supply by the installed load in Anexo A (`network` aerial, 127/220 V) or D (underground, surface, 127/220 V) and gives the category, the power made available, the breaker, the connection and entry conductors, the earthing conductor and the measurement; where two categories hold the load it names both and `phases` picks one; a demand the designer gives is carried as it is. It also has Anexo C (`aerial_120_240`) and E (`underground_submersible`, which prints no power made available but the junction box), framed the same way, and Anexo B (`aerial_delta`, 120/240 V delta with a neutral), which goes by the designer's demand current (`demand_current_a`) and gives the smallest breaker that holds it, the row serving one, two or three phases (`phases`). It leaves out the conduits, the poles and the meter box of the annexes. For `utility` CELESC (N-321.0001, revision of December 2025) it works out no demand either: the standard classes a unit by its installed load (items 5.3.2.1 to 5.3.2.4) and leaves a demand, where a three-phase unit needs one, to the designer (Tabela 01, note 1). It gives the category of Tabela 01 for `network` 220/380 (A single-phase at 220 V up to 13 kW, B two-phase up to 25 kW, C three-phase up to 75 kW, with the demand printed beside it) or 220/440 (A, and M single-phase on three wires up to 50 kW), with the breaker, the phases and wires, the connection branch in copper and aluminium, the entry branch and the earthing conductor in copper and copper-clad steel; `phases` takes the supply an appliance asks for whatever the load, and a designer's demand above the one printed is said. It leaves out the conduits, the mast and the load branch of Tabela 01, Tabela 02 (220 V without a neutral) and the probable demand of a building of several units (N-321.0003). `dr_check` (`dr.rs`) says which circuits NBR 5410:2004 asks additional protection by a high-sensitivity residual-current device (30 mA at most) for, from the points each serves (`place`: bath, external, kitchen, laundry, service, garage, wet, dry; `kind`: outlet, lighting, fixed): every point where there is a bathtub or a shower; outlets in external areas; internal outlets that may feed equipment outdoors; in a dwelling every point of a kitchen, laundry, service area, garage or other wet internal area, but for lights 2.5 m up or more (outside a dwelling, only their outlets); outlets only up to 32 A. An IT circuit that must not be cut is left out. It gives each circuit its reasons, and judges the device it has (`residual`) against 30 mA. It takes its circuits as a list, since a circuit is not an element yet, and changes nothing; it leaves out the further rules for the volumes of a bathroom and for swimming pools, and says so.
+
+**Electrical settings** (`electrical.rs`) are the tables circuits, panels and connectors will name, as Revit's Electrical Settings: `Voltage` (`nominal`, and the band `min` to `max` a device may read within), `DistributionSystem` (`phases` 1 to 3, `wires` the line conductors and the neutral and not the protective one, and the voltages it supplies by name: `l_l` between lines, `l_n` to the neutral, `l_g` to earth, and `ground`, how it is earthed as IEC 60364-1 names it) and `WireType` (`material`, `temperature`, `insulation`, a `note` saying where the ampacities come from, and `sizes`, a row for each section with its `ampacity`). Every section is in mm² whatever the project's units; a size a standard gives in AWG or kcmil is converted and keeps its name as `label`. Each is a map of `Model` (`voltages`, `distribution_systems`, `wire_types`), a library entry (`Kind::Voltage`, `Kind::DistributionSystem`, `Kind::WireType`, so each has an id and a GUID, comes in with Insert from File and is renamed with `rename_entry`), and has a command that makes, edits, renames and deletes it and, without a `name`, lists it (`voltage`, `distribution_system`, `wire_type`); `inspect` lists all three. A system names voltages, so `Model::lib_refs_mut` hands them out (a file holds their GUIDs, a rename follows) and `Model::check` refuses a system that names one the project lacks, saying which and listing the ones it has, and `voltage` refuses to delete one a system supplies; with three phases `l_l` must be about root three times `l_n`. `Model::voltage_range`, `system_voltages` and `wire_ampacity` are what circuits will ask: the band of a voltage, the voltages a system supplies (the ones a circuit on it may have) and the ampacity of a section in a wire type's table. A new project starts with `data/electrical.json`, data and not code: 230/400 V, 127/220 V, 220/380 V and 277/480 V, and copper wires of NBR 5410:2004 Tabelas 36 and 37 (PVC 70 °C and XLPE or EPR 90 °C, seeded from `nbr5410/tables.rs`: method B1, two loaded conductors, a test keeps them equal) and of NFPA 70 Table 310.16 (THHN 90 °C, THW 75 °C); their ampacities are the contributor's and unchecked, and one number for a section cannot say how a wire is laid, so a wire type's `note` says. `start_system` and `start_wire` name the ones a new panel or circuit starts with for the project's units (Europe's in metric, North America's in feet and inches). None of it goes to IFC: the tables are project data, and what they produce (voltage, current, section) will go in the device's property set once circuits exist. On the desktop, Manage > Electrical Settings (`ui-egui/src/electrical.rs`) is one dialog with a tab for each table: rows to add and delete, a voltage chosen from the project's own for each line of a system, and a wire type's table of sections below its fields. It is a draft, applied by OK or Apply as one undo step (`Session::transaction`) through the three commands, in an order the core accepts (`renames::plan`, which the other Manage dialogs use, orders each table's renames and deletes; the voltages are made before the systems that name them and taken away after the systems that no longer do). A system's voltages are held by their rows' keys, so one renamed in the dialog is still the one named. A blank or repeated name, a voltage a system supplies being deleted, and what the core refuses are said inside the dialog, which stays open. Not yet: circuits, panels and the load schedule, connectors in families.
+
 The discipline tabs after Structure add data to this, no engine code of their own. Plumbing: `pipe` (PI), types in PVC and copper
-(`Types::runs["pipe"]`, outside diameters, so a pipe's `width` is its diameter and its schedule says Diameter). Electrical:
-`cablecarrier` (`cable_carrier`, CC; Cable Carrier / КНС) and `wire` (EW), by their outside size. One carrier category holds round
-conduits and rectangular trays and channels; `runs::ifc_shape` writes them as `IfcCableCarrierSegment` of predefined type
-`CONDUITSEGMENT` or `CABLETRAYSEGMENT` according to their section. Lightning protection (NBR 5419):
+(`Types::runs["pipe"]`, outside diameters, so a pipe's `width` is its diameter and its schedule says Diameter). Electrical: `conduit`
+(CN), `duct` (DU: a rectangular or round duct, written as `IfcDuctSegment`; only a Revit import makes them in practice) `cabletray` (CT, `cable_tray`: the one rectangular run) and `wire` (EW), by their outside size. Lightning protection (NBR 5419):
 `downconductor` (DC, may stand: a riser down a wall) and `groundconductor` (GC), two runs of one IFC class that `BIMCraft_Run`'s `Category`
 tells apart; an air terminal, an earthing electrode and an inspection box are components of their own family categories, written as
 `IfcBuildingElementProxy` of the object type `Category::ifc` names, so the product's name (not its object type) holds `Family:Type` and
@@ -55,13 +90,172 @@ one of no type reads as the smoke detector), a manual call point, a sounder and 
 tab places them, and the Component tool too (FA, DS, HD, CP, SR, ES, AU, MO, VC). A fixture or a
 device is a component of a family whose `family::Category` says what it is (a sanitary fixture, a floor drain, a pipe fitting, a pipe
 accessory…); `Category::ifc` is its IFC class, predefined type and, where IFC has no class (lightning protection), the object type a
-proxy carries, and `Category::from_ifc` reads the same table back, so a category is one row, in `family.rs`. The starter families are
+proxy carries, and `Category::from_ifc` reads the same table back, so a category is one row, in `family.rs`. A family's `kind`
+(`Category::kinds`: `wc`, `lav`, `sink`… for a sanitary fixture, `floor_drain`… for a drain, `bend`, `tee`… for a fitting, the names the
+sizing commands count fixtures by) says which one it is, and `Family::ifc` writes that kind's predefined type in place of the
+category's `.NOTDEFINED.`; the import reads it back with `Category::kind_of`, the first kind of a predefined type two share. The starter families are
 `fixtures.rs` (original forms, named in the project's language; a fitting or a valve is centred on its pipe, along x, so placing it at the
 pipe's height lines them up; a wall device, a board and a luminaire carry their `Mounting Height` in their type, so the Fixture tool
 places them at the level and they stand where they hang). The desktop's `mep.rs` has one tool for every fixture and device, `Tool::Fixture(key)`: the families of the
 kinds its `FixtureTool` names, listed in its Type Selector and placed as the Component tool places them (`placing` takes the tool's
 kinds), and the tabs' ribbon panels; a fixture's two-letter shortcut is in `mep::FIXTURES`, not `SHORTCUTS`, since no command makes
 one. Edit Type of a run type also sets whether it is round (a diameter, no depth) and its material.
+
+Reinforcement (`rebar.rs`, `model::Rebar`, `Element::Rebar`, category `rebar`, the `rebar` command; tests in `rebar_tests.rs`). A bar is one
+element: a round bar of `diameter` mm (3 to 100) bent along `path` (points in mm, `z` over its level), of steel `grade` (CA-50 unless
+told), with the `host` it reinforces (a beam, a column, a footing or a floor, held as a `Guid`, and it goes when its host does). A hoop
+is a bar whose last point is its first; a layer of bars, or hoops along a beam, is one command with `count` and `step`, which makes one
+element for each (IFC has one `IfcReinforcingBar` for each, and a bar schedule counts them). It has no type: the diameter and the grade
+are its own, and the bends are sharp, with no hooks, so its length is the sum of its pieces (`rebar::length`) and its weight that
+length of steel at 7850 kg/m³ (`rebar::weight_kg`). Nothing checks that it lies inside its host: `reinforce` places bars inside by construction. The schedule of category `rebar` lists Id, Level, Grade, Diameter,
+Length, Count, Weight and Host, and grouped by Grade, Diameter and Length with Count and Weight totalled it is a bar schedule. IFC
+writes each as an `IfcReinforcingBar` (`SteelGrade`, `NominalDiameter`, `CrossSectionArea`, `BarLength`) with a body of an
+`IfcSweptDiskSolid` along an `IfcPolyline`, aggregated (`IfcRelAggregates`) to its host, or contained in its storey when it has none;
+import reads the same back, with the host found by the aggregation. The 3D view draws a tube along each straight piece
+(`rebar::tubes`, built with a round run's tube), which the concrete round a bar hides: look at bars with their host hidden. A section draws each bar it cuts as a
+dot over the host's poché (`render::section_in` keeps them out of the host's pieces, which would swallow them); a plan draws them too (`render::bar_in_plan`).
+
+Importing a structural program's IFC (Eberick, Cype and the like; tests in `eberick_tests.rs`, written by hand, never from anyone's project). Each
+product is named by its mark, so a name that is not its type's (BIMCraft names a product by its type, and writes it as its object type too) is its
+`Mark` parameter, for the categories in `import::MARKED` (beams, columns, structural columns, footings, strip footings and floors; not stairs,
+which BIMCraft calls "Stair"). The single values of every property set that is not BIMCraft's (`BIMCraft_*`, `RoomSeparation`; `Project Parameters`
+is read by its names as written) are project parameters named for the property, a character a formula can't say turned into a space
+(`parameter_name`: "Cargas de parede (G2)" is "Cargas de parede G2"), lengths in the file's unit made millimetres; `LoadBearing` is left out because
+it already makes a column or a floor structural. The cover Eberick sets (`Cobrimento`, `ConcreteCover`) is therefore on the host as a length, for the
+rules that will arm it. A run is found in its body as the way it spreads furthest, except where the body is one extruded profile and the extrusion is
+not up: then it runs along the extrusion (`Reader::extrusion`), because a beam between two columns can be shallower than it is deep, and its body then
+spreads furthest up. A strip footing, a plan outline stood up, is still read by its shape. A landing slab that belongs to no stair is a floor.
+
+Bars by rules (`reinforce.rs`, the `reinforce` command; tests in `reinforce_tests.rs`). The engineer says how many bars, how thick and how far
+apart; the module lays them out in the host's own frame (`Frame`: along, across, up) inside the cover and checks that what is asked fits, with the
+message saying what to change. It holds geometry and no standard's table: a spacing or a count is never decided here (that is design), and the
+clearance between bars (`clearance`, their thickness and at least 20 mm unless told) is the only rule it brings. Parameters are read with serde types
+that deny unknown fields (`Row`, `Pitch`, `Stirrup`, `ColumnBars`, `Mesh`, `Grid`), by key, so a key that is not the host's is refused with the host named.
+The cover is `{top, bottom, sides}` (Revit's faces: the top and bottom faces of a beam, a footing or a floor, the ends of a column, and all round
+the rest) or one number, and where none is given the host's `Cobrimento` or `ConcreteCover` parameter (a length in mm, as the import of an Eberick IFC
+leaves it) is the cover. A spacing is the most between bars: `spread` and `stations` place them evenly from end to end, so the count follows the length
+(Revit's Maximum Spacing) and `ends` gives closer stirrups in the first and last `length` mm. A stirrup is a closed loop; with `hook` it runs on past
+its first corner to a tail turned into the section at each end (`stirrup`). A beam has `bottom` and `top` rows, `stirrup`, `skin` and `anchor`; a
+column `bars` (`x` and `y` along each face, corners counted; a round one, `count` round its circle), `stirrup` (a round one's a polygon of 24 sides), `ties`
+(across a rectangular section; with `hook` a tail at each end turned toward the other axis) and `anchor`; a footing a `mesh` of two layers with `hook`
+turning their ends up (a round one's bars stop at its circle, `half` in `footing`); a floor `bottom` and `top` meshes (`hook` turning their ends up from the
+bottom one and down from the top one, square to the slab's top) whose bars stop a cover short of its outline and of its
+openings (`chords`, a scan line through the outline and the openings together; a bar parallel to an opening's edge and nearer it than the cover keeps
+its cover from the ends only). A sloped floor's layers are measured from its top face, square to it (`off`, and its secant for the height plumb), so the
+cover and the thickness are the type's and its bars follow the slope; a mesh on a slope is one plane's bars. Round beams and strip footings are refused. Each bar is a `rebar` element of the host with a `layer`
+(`bottom`, `top`, `skin`, `stirrup`, `bars`, `tie`, `mesh x`, `mesh y`, `bottom x`, `top y`, ...); reinforcing a host again replaces its bars that have a layer
+and leaves the ones with none, which were drawn by hand, and one command makes up to `rebar::MAX_BARS`. A bar's layer is in the project file and the
+schedule (a field a bar schedule may show), not in IFC. What it does not do: bends other than a hook, laps and splices, bars of a round beam, and any check
+against a standard. A section shows a bar in its plane as a strip along it and one it crosses as a dot (the cut of the bar's tube, `section_in`); a bar
+beyond the cut stays hidden by the concrete it is in.
+
+More of `reinforce`. `hosts` arms a list (`rebar::MAX_HOSTS`, 1000) alike in one command: every host's bars are made before any is replaced, so one that refuses (its refusal names its category and id) arms none, and `rebar::MAX_BARS_ALL` (20000) caps all of them
+together. A `hook` on a beam's `bottom` and `top` rows is the straight leg in mm turned up from the bottom bars and down from the top ones at each end
+(a number for both, or `{start, end}`), and on a column's `bars` a leg turned into the section along the way across the face the bar is on
+(`{below, above}`); `legs` reads it, with its own words when it is not a length, and a leg that does not stay inside the stirrup (a column's: stop
+short of the middle) is refused. The bends are sharp, as every bar's are, and each leg is a piece of the path, so the length and the weight count it.
+A `reinforcement_preset` is `reinforce::Preset`, a kind of host (`KINDS`) and the parameters that kind takes, in `Model::reinforcement` and as a library
+entry (`Kind::ReinforcementPreset`, so it has an id and a GUID, comes in with Insert from File and is renamed with `rename_entry`); it is checked
+for its keys and its size when saved (`Preset::check`, `MAX_PRESETS`) and against a host only when it arms one. `reinforce` with `preset` takes its parameters
+and lets any given with it replace them, key by key; a preset of another kind than the host is refused, saying both. Plans: a bar of the plan's level
+is drawn from above, solid when the cut plane is over its lowest point and dashed when it is over the plane and under the view range's top, a bar
+that stands (a column's) as a dot, and bars that lie on one another (a column's stirrups, one over the next) once.
+
+Bends beyond a hook. `bottom.bent` `{count, angle?, top?}` (`Bent`, `bent_up`) takes `count` of a beam's inner bottom bars (the two at the corners hold the
+stirrups and stay straight; the others are picked evenly) and bends them up at each end: along the top face for `top` mm from the end (a fifth of the
+length unless told), down a slope of `angle` degrees (15 to 75, 45 unless told) to the bottom row's level and along it. They are on the layer `bent`,
+have no hook, count as bottom steel in the check, and are refused where the slopes meet in the middle, where the section is too shallow to rise
+in, and where one comes within the clearance of a top bar at the top. `bars.jog` `{by, from_top, slope?}` (`Jog`, `step`, `stepped`) steps a column's
+bars `by` mm toward the axis (a corner bar along both faces, a face bar across its own, a round column's radially), the step starting `from_top` mm below
+the top and running `slope` mm up for each mm across (6 unless told); the points of the bar above the step move with it, including a hook's leg, and
+the bars at their new places are checked against one another for the clearance.
+
+The check (`reinforce/norm.rs`). `check` `"NBR 6118"`, with `aggressiveness` (1 to 4) and `fck` (MPa), makes `reinforce` return `notes`: where the bars
+made fall short of the usual limits for the kind of host (Table 7.2's cover by class; for a beam the 4 % most, the 0.15 % least up to C30, skin bars over 600 mm
+deep, stirrups of 5 mm to a tenth of the width at most min(0.6 d, 300) apart; for a column bars of 10 mm to an eighth of the side, 4 bars or 6 round,
+centres at most min(2 sides, 400), 0.4 to 8 % of steel, stirrups of 5 mm or a quarter of the bars' at most min(200, the side, 12 bars) apart; for a floor
+bars of at most an eighth of the thickness at most min(2 h, 200) apart). A note never refuses: an engineer may know better, and the bars are made.
+It reads only the bars made, so a limit that needs shear, the load or the aggregate is not in it. The numbers are typed from handbooks and course material
+that print them, not from the standard's text, which is paid for, and the item numbers are the 2014 edition's at the level of the chapter's item: check
+one against a copy before relying on it. The desktop's Check row (Standard, Aggressiveness class, fck) shows the notes inside the dialog, which stays
+open, with the bars made, so a field can change and OK remake them.
+
+The Reinforce dialog (`crates/ui-egui/src/reinforce.rs`, Structure > Reinforcement, RF; tests in `tests/reinforce.rs`). It opens on the one beam, column,
+structural column, footing or floor selected (anything else says what to select), with the form of its kind (`BEAM`, `COLUMN`, `FOOTING`, `FLOOR`: tables of
+groups of fields, each field the path of the parameter it sets, such as `bottom.count`). Every field is text: a count is a whole number, a bar size is mm,
+a length is read in the project's units (`Units::parse`); a field left empty is not sent, a group with none filled is left out, and the command is the one
+that says what is missing. OK builds the parameters and runs `reinforce` as one undo step; a refusal is the command's own words, shown inside the dialog
+(a status box in the view's corner could lie over its buttons) with the dialog left open and the project unchanged, and a field that is not a number is
+named before the command is asked. It takes any number of elements selected, of one form (a mixed selection says so), and arms them with one `hosts` command; Remove Bars removes the bars of all. What was typed is kept for the next element of the same form (not in the project, not on disk). The Preset row lists the project's presets of the form: choosing one fills the fields (`ReinforceDialog::load`, the reverse of `params`, lengths in the project's units), Save Preset keeps the fields as they are under the name typed (`reinforcement_preset`, the parameters without the hosts), and Delete Preset takes the chosen one away; each keeps the dialog open. Remove Bars, shown
+when the element has bars the command made (those with a layer), deletes them and leaves the ones drawn by hand. The fields' accessible names are
+"Group: Field" (`Bottom bars: Count`), and the cover's is `Cover`, its label having a colon so that no two nodes carry the name.
+
+**Connectors.** A family's `connectors` (`family::Connector`, a list for any discipline; today the electrical device's) say what
+a placed device draws: `kind` `power` or `switch`, `system` `power-balanced`, `power-unbalanced` or `switch`, `poles` (1 to 3),
+`voltage`, `load_va`, `power_factor` and a `classification`. The numbers are numbers or formulas over the family's parameters, so a
+type sets its load (the starter luminaires' `Load` parameter) and an instance parameter lets one component set its own; a
+`power-unbalanced` connector's `load_va` may be a list, one load for each pole, and a single number is shared out evenly.
+`Family::check` refuses a family of two `power` connectors, a kind and system that don't go together, poles, voltage, power factor
+or load out of range for any type, and a load on a switch. A connector is a part (`HasPart`: an id and a GUID, kept by place
+while the family is edited), and a family without any reads and places as it always did. A component's `element_json` carries
+`connectors` worked out for its type (`Family::connector_values`: `load_va` in all, `load_va_by_phase`), which a circuit will sum;
+there are no circuits, panels or fitting-to-pipe joins yet. `Model::warnings` (shown by
+`inspect`; `Model::check` stays an error only) says which lighting, outlet or switch family in use holds no connector, so its devices
+count as zero load. IFC writes each device with a connector `Pset_ElectricalDeviceCommon` (`NumberOfPoles`, and for a power
+connector `PowerFactor` and `RatedVoltage`) and `BIMCraft_Connector` (`System`, `Classification`, `LoadVA`, `LoadVAPhase1`…); IFC
+import doesn't read them back.
+
+**Connectors with a place** are where a pipe, a data cable or an earthing conductor meets a family, the first piece of the MEP
+network (#169). Besides `power` and `switch`, a connector's `kind` is `pipe`, `data` or `earthing`; `system` is only a power or a
+switch connector's. A `pipe` connector has a `domain` (`cold`, `hot`, `waste`, `vent`, `storm`, `gas`), a `flow` (`in`, `out`,
+`both` the default), `at` (mm, in the family's axes: x along it, y to its left, z up from its base), `direction` (the way its
+pipe leaves it, any length but none; worked out as a unit vector) and `size` (its DN, mm, up to `MAX_CONNECTOR_SIZE`); a `data` or
+`earthing` connector has `at` and may have the other two; an electrical one may have `at` and `direction`, never a `domain` or a
+`size`, and only a `power` one carries a load. Each of `at`, `direction` and `size` is a number or a formula over the family's
+parameters, and `name` says which it is for people. `Model::component_connectors` places them where a component stands
+(mirrored, turned and raised with it), and `element_json` gives `at` and `direction` in the model. The starter WC, washbasin,
+bathtub, kitchen sink, shower and floor drain carry their waste (out, DN 100 for the WC, 50 for the sink, 40 for the rest) and
+their cold and hot water (in, DN 20); the starter elbow, tee and gate valve have a connector at each end, of their diameter and
+with no domain, which a pipe fitting's or accessory's alone may leave out: it takes the domain of the pipe it joins, as Revit's
+fitting takes its pipe's system. IFC writes the electrical device's set from an electrical connector only, so a fixture with
+pipe connectors is no electrical device; IFC ports (`IfcDistributionPort`) come with the network. A file
+from before reads as it did; file format 18 is the one that has these connectors, so a build that reads up to 17 refuses a
+project saved by this one, saying it is from a newer BIMCraft, instead of failing on a `pipe` connector it doesn't know.
+
+**The pipe network** (`network.rs`, the `network` command; piece 3 of #169) is worked out from the model each time it is asked
+for and never stored, as wall joins are, so it can't go stale and changes no file. Pipes' centre-line ends and the components'
+pipe connectors within `tolerance` (1 mm by default) are one node; a node on another pipe's length, away from its ends, splits
+that pipe into two edges without splitting the element. A pipe fitting's or accessory's connectors are joined through it (as a
+fitting's linked connectors carry a system through it in Revit); a fixture's are not, since its waste and its water are networks of
+their own. The reply has the nodes (what meets at each), the edges, the groups of joined elements with their pipes' systems and
+their connectors' domains, the open ends (an end or a connector meeting nothing, as Revit's Show Disconnects marks) and warnings
+that never refuse the model, since a drawing in progress has open ends: two pipe systems in one network, two connector domains in
+one, a pipe met along its length with no fitting, and, in a network with a waste connector, a pipe leaving a node downhill narrower
+than one coming down to it. A query works on 200,000 pipe ends and connectors at most (`MAX_POINTS`), and looks for nodes along
+pipes through the plan's metre squares each lies across, 4,000,000 of them for all the pipes together (`MAX_CELLS`): a small file
+of pipes kilometres long on the diagonal would fill billions, so past it the query is refused, naming the pipe across the most and
+saying to ask for one `level`. It has no shortcut, since Revit has no tool for it. IFC's ports say the same with
+`IfcRelConnectsPorts` between two `IfcDistributionPort`s; writing them is piece 8. A pipe's `width` is its outside diameter and a
+connector's `size` its DN, so they aren't compared. Conduits and the other electrical runs are not in it yet: their routes are
+piece 6.
+
+**The fixtures library** (`plumbing.rs`, `data/plumbing.json`) holds what the sizing commands know of each kind of fixture, the way `data/electrical.json` holds the electrical settings: its design flows in L/s (cold, and hot where a source gives one; `hot_flow` is `null` until one does, never guessed), its weight (the method of weights of `water_size`), its units of contribution and the smallest DN of its drain (`drain_size`), each with the source it comes from (`water_source`, `drain_source`). `plumbing::validate` refuses a row with no source, an empty or repeated kind, or a number that is not positive and finite, and a test runs it over the shipped file; the library reads as empty if the file fails it, so a bad row shows as "no fixture" and never as a wrong number. `water::fixture` and `drain_size`'s `drainage::fixture` are views of it, and the commands list its kinds in their errors. A project's own values are a later step.
+
+### Timber wall framing
+
+`timber_framing` reads one isolated straight wall, its chosen structural layer and its only hosted rectangular window.
+Supply their ids or GUIDs as `wall`, `layer` and `window`. Supply `spacing`, stud/plate `thickness`, layer `depth` and
+`header_height` in mm. The window cut provides the rough opening. The layout uses flush end studs, a grid measured
+from the wall start, one bottom and two top plates, one king and jack per jamb, a sill, and a header over the jacks.
+Only whole grid pieces that fit between the adjacent framing faces are included. Attached walls, wall junctions and
+layouts above 4096 grid stations are outside this command.
+
+Each member and clear bay has a `key` scoped to the returned wall and layer GUIDs. Its `xz` is
+`[left, right, bottom, top]` in mm, measured along the wall and up from its base. Every rectangle spans the returned
+`depth`. For model coordinates, start at `origin` on the interior face of the framing layer, move along `x_axis`,
+into the layer along `depth_axis`, and up. Repeating the query creates no project elements or Undo steps.
+A bay key names its vertical region and adjacent members. A placement whose bay disappears on a new query
+keeps its last intended position for conflict review. Outlet and niche placement are exercised as test consumers.
 
 `Element::Wire` (`wire`, EW) is both the physical cable and its optional logical connection: a `source` component and ordered
 `devices`, by GUID, with `system` as its loop or panel label, `cable` as its make and `reserve` as a percentage.

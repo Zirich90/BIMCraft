@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cad::{Cad, Colors};
 use crate::cloud::{self, Cloud};
-use crate::engine::{Command, Run, Session};
+use crate::engine::{Command, Files, Run, Session};
 use crate::favorites::{self, FamilyEntry, Favorites, MaterialEntry};
 use crate::fills::{FillPattern, FilledRegion, FilledRegionType, Target};
 use crate::geom::{self, P2};
@@ -22,20 +22,22 @@ use crate::library::Kind as LibKind;
 use crate::lines::{DetailLine, LineStyle};
 use crate::massing;
 use crate::model::{
-    CEILING_HEIGHT, CadImport, Ceiling, CeilingType, Column, ColumnType, Component, DEFAULT_HEIGHT, DimKind, Dimension, Element, Extrusion,
-    Face, Facing, Floor, FloorType, Grid, Guid, Id, Key, Landing, Layer, Level, Line, Location, MAX_COORD, MAX_POINTS, MAX_SLOPE, MAX_TEXT,
-    Mass, Model, NOTE_SIZE, Note, Opening, OpeningType, PARAMETER_CATEGORIES, ParameterKind, Pattern, PlanView, PointCloud,
-    ProjectParameter, RAMP_SLOPE, RAMP_WIDTH, RISER, Railing, RailingType, Ramp, Reference, Roof, RoofType, Room, RoomSeparator,
-    STAIR_WIDTH, Schedule, Section, SectionBox, Shaft, Sheet, Side, Spot, Stair, TOL, TREAD, Tag, View3D, Viewport, Wall, WallType,
-    heading, paper,
+    CEILING_HEIGHT, CadImport, Ceiling, CeilingType, Column, ColumnType, Component, DEFAULT_HEIGHT, DimKind, Dimension, Dimension3D,
+    Element, End, Extrusion, Face, Facing, Floor, FloorType, Grid, Guid, Id, Key, Landing, Layer, Level, Line, Location, MAX_COORD,
+    MAX_POINTS, MAX_SLOPE, MAX_TEXT, Mass, Model, Note, Opening, OpeningType, Orient, PARAMETER_CATEGORIES, ParameterKind, Pattern,
+    Perspective, PlanView, PointCloud, ProjectParameter, RAMP_SLOPE, RAMP_WIDTH, RISER, Railing, RailingType, Ramp, Rebar, Ref3, Reference,
+    Roof, RoofType, Room, RoomArea, RoomSeparator, STAIR_WIDTH, Schedule, Section, SectionBox, Shaft, Sheet, Side, Spot, Stair, TOL, TREAD,
+    Tag, Unbound, View3D, Viewport, Wall, WallType, heading, paper,
 };
 use crate::paint;
 use crate::phasing;
+use crate::rebar;
 use crate::render::Drawing;
 use crate::sketch::{self, SketchLine};
 use crate::texture::{self, Kind, Picture, Texture};
 use crate::units::Units;
 use crate::walls::{self, Axis, stacked};
+use crate::workplane::{Surface, WorkPlane};
 use crate::{pdf, render, schedule, sheet, snap, stairs, view3d};
 
 type R = Result<Value, String>;
@@ -128,12 +130,29 @@ fn surface_query(s: &mut Session, p: &Value) -> R {
 }
 
 const fn edit(id: &'static str, label: &'static str, aliases: &'static [&'static str], params: &'static str, run: Run) -> Command {
-    Command { id, label, aliases, params, run, undoable: true }
+    Command { id, label, aliases, params, run, undoable: true, menu: None, files: Files::None }
 }
 
 /// A command that is no undo step: it only reads, or replaces the whole project.
 const fn other(id: &'static str, label: &'static str, params: &'static str, run: Run) -> Command {
-    Command { id, label, aliases: &[], params, run, undoable: false }
+    Command { id, label, aliases: &[], params, run, undoable: false, menu: None, files: Files::None }
+}
+
+/// An [`edit`] that touches the disk.
+const fn edit_files(
+    id: &'static str,
+    label: &'static str,
+    aliases: &'static [&'static str],
+    params: &'static str,
+    run: Run,
+    files: Files,
+) -> Command {
+    Command { id, label, aliases, params, run, undoable: true, menu: None, files }
+}
+
+/// An [`other`] that touches the disk.
+const fn other_files(id: &'static str, label: &'static str, params: &'static str, run: Run, files: Files) -> Command {
+    Command { id, label, aliases: &[], params, run, undoable: false, menu: None, files }
 }
 
 pub static ALL: &[Command] = &[
@@ -176,55 +195,80 @@ pub static ALL: &[Command] = &[
         "{} list ODS-added types without model instances; built-in unused types and placeholders are excluded",
         catalogue_pending,
     ),
-    edit(
+    edit_files(
         "catalogue_link",
         "Link Catalogue",
         &[],
         "{path:string|null} bind an ODS catalogue (import existing or create new); null unlinks without deleting the file",
         catalogue_link,
+        Files::Conditional,
     ),
-    edit(
+    edit_files(
         "catalogue_sync",
         "Synchronize Catalogue",
         &[],
         "{read_only?:bool} accept new ODS rows and protect existing model rows; read_only skips workbook writes",
         catalogue_sync,
+        Files::Conditional,
     ),
-    other(
+    other_files(
         "catalogue_export",
         "Export Catalogue",
         "{path} export cable, carrier and family type GUIDs, dimensions and product data to the first ODS sheet",
         catalogue_export,
+        Files::Write,
     ),
-    edit(
+    edit_files(
         "catalogue_import",
         "Import Catalogue",
         &[],
         "{path, conflicts?: error|update|copy} import first ODS sheet; copied products receive local GUIDs; resolve conflicting products by update or separate copy",
         catalogue_import,
+        Files::Read,
     ),
     other(
         "new",
         "New",
-        "{name?, language?: en|pt|es} an empty project with Level 1 (0) and Level 2 (3000), named in its language (Nível 1, \
-         Nível 2 in Portuguese; Nivel 1, Nivel 2 in Spanish)",
+        "{name?, language?: en|pt|es|sv|cs|fr|nl} an empty project with Level 1 (0) and Level 2 (3000), named in its language (Nível 1, \
+         Nível 2 in Portuguese; Nivel 1, Nivel 2 in Spanish; Nivå 1, Nivå 2 in Swedish; Niveau 1, Niveau 2 in Dutch)",
         new,
     ),
-    other("open", "Open", "{path, read_only?:bool} a .bimcraft project; read_only disables catalogue writes", open),
+other_files(
+        "open",
+        "Open",
+        "{path, read_only?:bool} a .bimcraft project (under 256 MiB), or an .ifc (under 512 MiB) read into a new one (its `elements` by \
+         category, `generic` the components of IFC classes BIMCraft has no element for, `skipped` what was left out and why)",
+        open,
+        Files::Read,
+    ),
     other("highrise", "Synthetic Highrise", "{storeys?: 20} replace the project with an original 1–80 storey performance sample", highrise),
     other(
+        "tower",
+        "Reference Tower",
+        "{storeys?: 100, plate?: reference|small, annotation?: false, sheets?: false} replace the project with the original reference tower \
+         of 1–100 storeys, about 10,000 elements and 195 rooms a storey: the baseline the core is measured on \
+         (docs/spatial-core-plan.md); the `small` plate, 36 × 36 m, is the one compared with Revit (tools/revit-crosscheck). \
+         With `annotation`, each storey's plan is detailed too: about 2,000 detail lines, text notes, filled regions and \
+         dimensions on its walls; with `sheets`, a drawing set: each storey's floor plan, ceiling plan and two enlarged \
+         halves on sheets of their own (A1-001 to A4-100), with general notes, and the project's 3D view, elevations, \
+         section and schedules (A0-000, A5- to A7-)",
+        tower,
+    ),
+    other_files(
         "autosave",
         ui_msg!("Autosave"),
         "{path} atomically write a recovery snapshot, keeping the project path and undo history",
         autosave,
+        Files::Write,
     ),
-    other(
+    other_files(
         "recover",
         "Recover Autosave",
         "{path, project?} open and validate a recovery snapshot; Save targets `project`, or asks for Save As without it",
         recover,
+        Files::Read,
     ),
-    edit(
+    edit_files(
         "insert",
         "Insert from File",
         &[],
@@ -237,8 +281,9 @@ pub static ALL: &[Command] = &[
          patterns), fill patterns, filled region types and detail groups a detail line, a filled region or a group uses. Returns `ids` {there: here}, \
          `copies`, `library`, `left_out`",
         insert_from,
+        Files::Read,
     ),
-    edit(
+    edit_files(
         "link",
         "Link Model",
         &["LK"],
@@ -249,20 +294,25 @@ pub static ALL: &[Command] = &[
          elevations, on this project's levels at the same height. `path` is read now and again by `reload`, and kept as given: \
          a relative one is relative to this project's file. `name` defaults to the file's. Returns `id`, `name`, `elements`",
         link_model,
-    ),
-    other(
+        Files::Read,
+    )
+    .menu("Manage > Link Model"),
+    other_files(
         "reload",
         "Reload Links",
         "{id?} read the file of the link `id`, or of every link, again: for a project that changed on disk. Returns `reloaded` \
          (the names) and `failed` ({name, error})",
         reload,
+        Files::Read,
     ),
-    other(
+    other_files(
         "save",
         "Save",
-        "{path?} .bimcraft saves the project (Save As with a path); .ifc exports IFC4; .svg or .png exports the lowest level's \
-         plan; .pdf prints every sheet, a page each",
+        "{path?} .bimcraft saves the project (Save As with a path); .ifc exports IFC4; .glb exports the default 3D view's scene as \
+         glTF 2.0 (metres, y up, a node for each element named by its id, GUID and category in `extras`; returns `elements` and \
+         `triangles`); .svg or .png exports the lowest level's plan; .pdf prints every sheet, a page each",
         save,
+        Files::Write,
     ),
     other("undo", "Undo", "{count?} takes back the last `count` steps (1 by default)", undo),
     other("redo", "Redo", "{count?} does again the last `count` steps undone (1 by default)", redo),
@@ -274,9 +324,10 @@ pub static ALL: &[Command] = &[
          plane stretches over (south-west corner, then north-east), where sections, elevations and the 3D view show it \
          (without one, the model's, a metre past it)",
         level,
-    ),
-    edit("grid", ui_msg!("Grid"), &["GR"], "{start: [x,y], end: [x,y], name?} names follow the last grid: 1, 2… or A, B…", grid),
-    edit(
+    )
+    .menu("Architecture > Level"),
+    edit("grid", ui_msg!("Grid"), &["GR"], "{start: [x,y], end: [x,y], name?} names follow the last grid: 1, 2… or A, B…", grid).menu("Architecture > Grid"),
+    edit_files(
         "point_cloud",
         "Point Cloud",
         &[],
@@ -287,21 +338,23 @@ pub static ALL: &[Command] = &[
          where its file's coordinates put it; `offset` raises its middle over the level, `angle` turns it. Returns its id, the \
          scan's name, the points kept and read, and where its middle was in the file",
         point_cloud,
+        Files::Read,
     ),
-    edit(
+    edit_files(
         "import_cad",
         "Import CAD",
         &[],
         "{path | cad, name?, level?, view?, at?: [x, y], position?, units?, scale?, angle?, layers?, colors?, link?} brings in a \
-         DXF drawing (`path`: an ASCII DXF of any version; save a DWG as DXF first) or places one the project holds again (`cad`, \
+         DXF drawing (`path`: an ASCII DXF of any version, or a DWG, which the desktop and the command line read as DXF) or places one the project holds again (`cad`, \
          its name), as an element in every plan of `level`, or with `view` (a plan) in that view only. `units` of the drawing: \
          auto (the default: what its file says, else mm), mm, cm, m, in or ft; or `scale`, mm to each of its units. `position`: \
          center (the default: the middle of the drawing on `at`, the origin unless given) or origin (its origin on `at`); \
          `angle` turns it about `at`, degrees. `layers`: visible (the default: those its file has on and thawed), all, or a list \
          of those to show. `colors`: preserve (the default), invert or black. `link: true` remembers the file, so `reload_cad` \
          and opening the project read it again. Returns its id, the drawing's name, its unit, entities and layers, its extents \
-         in the model, how many entities lie far from the rest (they're left out of its extents) and what was left out",
+         in the model, how many entities lie far from the rest (they're left out of its extents) and what was left out, with `notes` on what a DWG's read left out",
         import_cad,
+        Files::Read,
     ),
     edit(
         "cad_layers",
@@ -312,13 +365,14 @@ pub static ALL: &[Command] = &[
          Visibility/Graphics, by the drawing's name)",
         cad_layers,
     ),
-    edit(
+    edit_files(
         "reload_cad",
         "Reload CAD",
         &[],
         "{cad} reads a linked CAD drawing's file again, so every import of it shows what the file holds now (opening the project \
          does too). Returns whether it changed",
         reload_cad,
+        Files::Read,
     ),
     other(
         "cad_query",
@@ -331,32 +385,36 @@ pub static ALL: &[Command] = &[
         "wall",
         msg!("Wall"),
         &["WA"],
-        "{points: [[x,y],…], closed?, type?, level?, top_level?, height?, base_offset?, arc?, location?, attach_top?, \
-         attach_base?} one wall per segment of its location line; up to the next level, or `height` mm tall (unconnected), or up \
-         to `top_level`. `arc`: degrees each turns from its start to its end, counter-clockwise (180, a half circle bulging to \
+        "{points: [[x,y],…], closed?, type?, level?, top_level?, top_offset?, height?, base_offset?, arc?, location?, attach_top?, \
+         attach_base?, room_bounding?} one wall per segment of its location line; up to the next level, or `height` mm tall (unconnected), or up \
+         to `top_level`, `top_offset` mm above it (0; negative, below it; the top must stay above the base). `arc`: degrees each turns from its start to its end, counter-clockwise (180, a half circle bulging to \
          its right). `location`: the line of it the points are on: centre (the default), core-centre, exterior-finish, \
          interior-finish, exterior-core or interior-core; its exterior side is to the left of its start to its end, so walls \
          drawn clockwise face out. `attach_top`, `attach_base`: a roof or floor its top follows from below, or its base stands \
-         on",
+         on. `room_bounding`: false for a wall rooms run past (a low wall, a balustrade); true, the default, bounds them",
         wall,
-    ),
+    )
+    .menu("Architecture > Wall"),
     edit(
         "door",
         ui_msg!("Door"),
         &["DR"],
         "{at: [x,y] | wall: id, offset?, type?, family?, level?, mark?, flip_facing?, flip_hand?} in the wall under `at`, \
          or in `wall` centred `offset` mm from its start; with `family`, a door family's `type` (its first by default), \
-         which sizes the opening and draws the door",
+         which sizes the opening and draws the door; it may rise past a low wall's top, as Revit lets it",
         door,
-    ),
+    )
+    .menu("Architecture > Door"),
     edit(
         "window",
         "Window",
         &["WN"],
         "{at: [x,y] | wall: id, offset?, sill?, type?, family?, level?, mark?, flip_facing?} like door; `sill` defaults to the \
-         type's (a family's `Sill Height`)",
+         type's (a family's `Sill Height`) and must be under the wall's top, while its head may rise past the top, as Revit \
+         lets it (the wall is notched up to its top)",
         window,
-    ),
+    )
+    .menu("Architecture > Window"),
     edit(
         "floor",
         ui_msg!("Floor"),
@@ -371,7 +429,8 @@ pub static ALL: &[Command] = &[
          and `shaft` too, and `modify`, `move` and `edit_boundary` of any of them: they are refused, saying which edges); a \
          file that has one still opens, and works until a command changes its outline",
         floor,
-    ),
+    )
+    .menu("Architecture > Floor"),
     edit(
         "ceiling",
         ui_msg!("Ceiling"),
@@ -380,7 +439,8 @@ pub static ALL: &[Command] = &[
          `offset` mm (2600) above the level, open through `openings` (holes inside it, apart): in the room around `point`, out \
          to its walls' faces and round the walls standing inside it, or along `boundary`. Reflected ceiling plans show it",
         ceiling,
-    ),
+    )
+    .menu("Architecture > Ceiling"),
     other(
         "sketch",
         "Sketch",
@@ -403,7 +463,8 @@ pub static ALL: &[Command] = &[
          floors, ceilings and roofs it passes through, from `base_offset` above the level up to the next level, or `height` \
          mm, or up to `top_level`",
         shaft,
-    ),
+    )
+    .menu("Architecture > Shaft"),
     edit(
         "edit_boundary",
         "Edit Boundary",
@@ -414,6 +475,59 @@ pub static ALL: &[Command] = &[
          outline and holes it has now, as the lines to edit. The outline must be simple, as `floor` says; a line that \
          crosses itself is found as two that cross are",
         edit_boundary,
+    ),
+    edit(
+        "edit_shape",
+        "Modify Sub Elements",
+        &[],
+        "{id, points?: [{at: [x,y], z, id?}, …], lines?: [{a: [x,y], b: [x,y], id?}, …], absolute?} gives a floor's top, or a \
+         flat roof's by footprint (its underside following), its shape anew, all at once: points `z` mm above (negative, below) where its top would be without them (with `absolute`, \
+         at that elevation), and split lines it folds along, between which it's flat triangles, merged where neighbours lie \
+         in one plane: falls to drains, ridges, valleys. Its outline's and openings' corners stay at 0 unless a point is \
+         there; a line's end that is no point and no corner becomes a point at the height the top has there. Sent back with \
+         its `id`, a point or a line keeps it. A shaped floor has no slope arrow, a shaped roof no `slope`. Without `points` or `lines`, gives the \
+         shape: its points and lines with their ids, its corners at their heights, how many planes (`faces`) and its top's \
+         lowest and highest (`top`, mm above zero)",
+        edit_shape,
+    ),
+    edit(
+        "add_point",
+        "Add Point",
+        &[],
+        "{id, at: [x,y], z?, absolute?, offset?} a point on a floor's or flat roof's top: `offset` mm over the top as it is \
+         there now (Revit's Along Surface), or `z` mm above where it would be without its shape (with `absolute`, at that \
+         elevation); with neither, at the height the top has there now. Within a millimetre of a point it has, sets that \
+         one's height",
+        add_point,
+    ),
+    edit(
+        "add_split_line",
+        "Add Split Line",
+        &[],
+        "{id, a: [x,y], b: [x,y]} a line a floor's or flat roof's top folds along; an end that is no point of its shape and no corner of its \
+         outline or an opening becomes a point, at the height the top has there now",
+        add_split_line,
+    ),
+    edit(
+        "reset_shape",
+        "Reset Shape",
+        &[],
+        "{id} takes a floor's or roof's points and split lines all off: it's flat at its offset again",
+        reset_shape,
+    ),
+    edit(
+        "falls",
+        "Falls",
+        &[],
+        "{id, drains: [[x,y], …], fall: 1.5, ridges?: [[[x,y], [x,y]], …]} gives a floor's or flat roof's top falls to its \
+         drains, at no less than `fall` %: `ridges` (each from the outline, an opening or another ridge to another) split it \
+         into parts, each needing a drain; in a part each drain takes what is nearest it, a ridge runs at the top's height \
+         where two meet, a valley runs from each drain to each corner of its part (round an opening's corners, which lie on \
+         the drain's cone, where it can't see straight), and each drain goes down as far as `fall` takes its farthest corner. \
+         Its shape is given anew (points and split lines, as `edit_shape` would); the reply gives each drain's depth, how many \
+         planes (`faces`) and its top's lowest and highest. Refused, saying why and where: a corner a drain can reach only \
+         over the outline or a ridge, or a plane that can't fall as asked to a drain",
+        falls,
     ),
     edit(
         "mass",
@@ -491,9 +605,20 @@ pub static ALL: &[Command] = &[
         "room",
         ui_msg!("Room"),
         &["RM"],
-        "{point: [x,y], level?, name?, number?} bounded by the walls and the room separation lines around the point",
+        "{point: [x,y], level?, name?, number?, top_level?, limit_offset?, base_offset?, frozen?} bounded by the walls and the \
+         room separation lines around the point (walls the level's `computation_height` cuts; separation lines whatever their \
+         height). Placed where nothing encloses it, or in a space another room has (two rooms can't share one; the first \
+         keeps it), it is placed unbounded, a 1000 mm square, and the reply has a `warning`. Its height is Revit's: from \
+         `base_offset` mm over its level (0) up to `limit_offset` mm over its upper limit `top_level` (null: Not Bounded, \
+         over its own level). Unless given, 300 mm under the level above (`top_level` that level, `limit_offset` -300), or \
+         with none above, not bounded and 2500 mm tall. `elements` gives its `unbounded_height` and `volume_m3`, its area \
+         times that height. \
+         `frozen` (a yes or no; also `modify {id, frozen}`) keeps the boundary the room has now: it keeps its size whatever \
+         the walls do, and the walls are never searched for it again, which saves time in a project of many rooms. Unfrozen, \
+         it follows the walls again. Only an enclosed room can be frozen",
         room,
-    ),
+    )
+    .menu("Architecture > Room"),
     edit(
         "room_separator",
         "Room Separator",
@@ -504,13 +629,91 @@ pub static ALL: &[Command] = &[
         room_separator,
     ),
     edit(
+        "rebar",
+        "Rebar",
+        &[],
+        "{points: [[x,y,z],…], diameter, host?, grade?, layer?, closed?, count?, step?, level?} a reinforcing bar bent along `points` \
+         (mm; z over the level), `diameter` mm thick (3 to 100), of steel `grade` (CA-50 unless told). `host` is the beam, \
+         column, footing or floor it reinforces (the level is then its level) and it goes with; `closed` joins the last point \
+         to the first, a hoop. With `count` bars (up to 1000), each is `step` [dx,dy,dz] from the last: a layer of bars, or \
+         hoops along a beam. Returns their ids. Its schedule lists \
+         Grade, Diameter, Length and Weight (kg, of steel at 7850 kg/m³), and a grouped one is a bar schedule",
+        rebar_bars,
+    ),
+    edit(
+        "reinforce",
+        "Reinforce",
+        &[],
+        "{host | hosts: [id, …], preset?, cover?, grade?, grade_stirrup?, clearance?, …} bars by rules for a beam, a column, a footing or a floor: the engineer \
+         says how many, how thick and how far apart (no standard's number sets them) and it lays them inside the cover and checks \
+         that they fit, saying what to change. All: `cover` (mm: one number, or {top, bottom, sides}, top and bottom the faces of a \
+         beam, a footing or a floor and the ends of a column; else the host's Cobrimento or ConcreteCover parameter), `grade` \
+         (CA-50), `grade_stirrup` (the stirrups' and ties'), `clearance` (least mm between bars; their thickness, at least 20, \
+         unless told). A spacing is the most between bars: they are spread evenly, so the last is where the first is from the \
+         other end. Beam: `bottom` and `top` {count, diameter, hook?} (`hook`, the straight leg in mm turned up from the bottom bars and down from the top ones at both ends, or {start, end}); `bottom.bent` {count, angle?, top?} bends `count` of the inner bottom bars up at each end (layer `bent`): they run `top` mm along the top face from each end (a fifth of the length unless told), slope down `angle` degrees (15 to 75, 45 unless told) and run along the bottom, and have no hook; `stirrup` {diameter, spacing, ends?: {length, spacing}, hook?} \
+         (`ends` closer in the first and last `length` mm; `hook` a tail in mm at the ends); `skin` {diameter, spacing} up each \
+         side between the rows; `anchor` {start?, end?} mm the bars run past the ends (0 flush, none a cover short). Column: \
+         `bars` {diameter, x?, y?, hook?, jog?} (`hook`, a leg turned into the section at the foot and the top, or {below, above}; `jog` {by, from_top, slope?} steps the bars in `by` mm toward the axis, starting `from_top` mm below the top and running `slope` mm up for each mm across (6 unless told), to leave room for the column above; bars along each face across its width and across its depth, corners counted, \
+         2 each; a round column takes `count` instead of x and y, evenly round its circle, with hoops of 24 sides), `stirrup`, `ties` {diameter, hook?} \
+         across a rectangular section between bars that are not at a corner (`hook`, a tail in mm at each end), `anchor` {below?, above?}. \
+         Footing: `mesh` {x?, y?: {diameter, spacing}, hook?} (hook turns the ends up; a round footing's bars stop at its circle). Floor: `bottom` and \
+         `top` {x?, y?: {diameter, spacing}, hook?} (bars along east and north; `hook`, a leg turned up from a bottom mesh and down from a top one), \
+         stopping a cover short of its outline and its openings; a sloped floor's bars follow its top, the cover square to it. \
+         The bars are `rebar` elements of the host, each on a `layer`; reinforcing again replaces the ones it made and leaves \
+         any drawn by hand. `check` \"NBR 6118\" (with `aggressiveness` 1 to 4 for the cover, and `fck` in MPa) adds `notes` to the reply where the bars made fall short of that standard's usual limits (cover, bar sizes and spacings, stirrups, least and most steel, skin bars): they are notes, never a refusal, the numbers typed from handbooks and not the standard's text, so check one against a copy before relying on it. `preset` names a `reinforcement_preset` of the host's kind, whose parameters stand for the ones not given here. `hosts` arms each of a list alike (up to 1000, and 20000 bars in all); if one refuses, none is armed, \
+         and the refusal names it. Returns ids, count, hosts, removed, weight_kg and notes",
+        reinforce_host,
+    ),
+    edit(
+        "reinforcement_preset",
+        "Reinforcement Presets",
+        &[],
+        "{name?, kind?: beam|column|footing|floor, params?, rename?, delete?: true} a named set of the parameters `reinforce` takes for \
+         one kind of host (`params`: its `cover`, `grade`, `grade_stirrup`, `clearance` and what its kind takes, and not `host`), kept in \
+         the project; `reinforce` with `preset` takes it and lets what is given with it replace its own. Without `name`, lists them. \
+         It is not checked against any host until it arms one",
+        reinforcement_preset,
+    ),
+    edit(
+        "voltage",
+        "Voltage Definitions",
+        &[],
+        "{name?, nominal?, min?, max?, rename?, delete?: true} a voltage of the project's electrical settings, in volts: `nominal`, and the \
+         band a device may read within, `min` to `max` (10 per cent either way unless given). Without `name`, lists them. A voltage a \
+         distribution system names cannot be deleted; renamed, the systems follow",
+        voltage,
+    ),
+    edit(
+        "distribution_system",
+        "Distribution Systems",
+        &[],
+        "{name?, phases?: 1|2|3, wires?, l_l?, l_n?, l_g?, ground?, rename?, delete?: true} a distribution system of the project's \
+         electrical settings. `wires` counts the line conductors and the neutral, not the protective one (3 phases: 3 or 4). `l_l`, `l_n` \
+         and `l_g` name the voltages between two lines, a line and the neutral, and a line and earth (at least one; `l_l` from 2 phases; with 3 \
+         phases `l_l` is about 1.73 times `l_n`), each a `voltage` of the project; \"\" takes one away. `ground` is the earthing: TN-S, TN-C, \
+         TN-C-S, TT or IT. A voltage the project lacks is refused, and the refusal lists the ones it has. Without `name`, lists them",
+        distribution_system,
+    ),
+    edit(
+        "wire_type",
+        "Wire Types",
+        &[],
+        "{name?, material?: copper|aluminium, temperature?, insulation?, note?, sizes?: [{section, ampacity, label?}], rename?, delete?: true} \
+         a wire type of the project's electrical settings: a conductor's `material`, working `temperature` (°C) and `insulation`, and \
+         its table, `sizes`: the `section` of each row in mm² (smallest first, never less than the row before) and the `ampacity` it \
+         carries in amperes, with a `label` for how its standard names it (12 AWG). Giving `sizes` replaces the table. `note` says where the \
+         ampacities come from. Without `name`, lists them",
+        wire_type,
+    ),
+    edit(
         "column",
         ui_msg!("Column"),
         &["CL"],
         "{at: [x,y], type?, angle?, level?, top_level?, height?, base_offset?} a column, its width along `angle` degrees; up to \
          the next level, or `height` mm tall, or up to `top_level`",
         column,
-    ),
+    )
+    .menu("Architecture > Column"),
     edit(
         "structural_column",
         ui_msg!("Structural Column"),
@@ -570,12 +773,40 @@ pub static ALL: &[Command] = &[
         cable_carrier,
     ),
     edit(
+        "duct",
+        ui_msg!("Duct"),
+        &["DU"],
+        "{points: [[x,y],…], closed?, type?, level?, offset?, end_offset?, justify?: top|centre|bottom, system?} a duct for each \
+         segment of the points: its section the type's (category duct: `width` across by `depth` deep, or round, `width` the \
+         diameter), its `justify` line (centre by default) `offset` mm over the level at its start (0: at the level) and \
+         `end_offset` at its end (the same: level), for a single segment; the same point twice and two heights make one stand \
+         upright. `system` names the system it belongs to (\"Supply air\", \"Exhaust\")",
+        duct,
+    ),
+    edit(
+        "conduit",
+        ui_msg!("Conduit"),
+        &["CN"],
+        "{points: [[x,y],…], closed?, type?, level?, offset?, end_offset?, justify?: top|centre|bottom, system?} a conduit (eletroduto) \
+         for each segment of the points, as `pipe` lays them: round, `width` its outside diameter; `system` names its circuit",
+        conduit,
+    ),
+    edit(
+        "cable_tray",
+        ui_msg!("Cable Tray"),
+        &["CT"],
+        "{points: [[x,y],…], closed?, type?, level?, offset?, end_offset?, justify?: top|centre|bottom, system?} a cable tray (eletrocalha) \
+         for each segment of the points, as `pipe` lays them: its section the type's `width` across by `depth` deep",
+        cable_tray,
+    ),
+    edit(
         "wire",
         ui_msg!("Wire"),
         &["EW"],
         "{points: [[x,y],…], closed?, type?, level?, offset?, end_offset?, justify?: top|centre|bottom, system?, source?, devices?: [id,…], cable?, reserve?, along_walls?, carrier?, local_offset?} a wire (the one \
          physical and logical cable) for each segment of the points, as `pipe` lays them: round, `width` its outside diameter; `system` \
-         names its circuit or shield; `source` and `devices` give the panel-to-device loop it carries; `carrier` is the cable carrier it runs in. +         Optional `start_connection: {device: id|GUID, point: [x,y,z]}` connects equipment at a local point to the first segment; mount: {host: id|GUID, face} defines a supported contact line as for cable_carrier",
+         names its circuit or shield; `source` and `devices` give the panel-to-device loop it carries; `carrier` is the cable carrier it runs in. \
+         Optional `start_connection: {device: id|GUID, point: [x,y,z]}` connects equipment at a local point to the first segment; mount: {host: id|GUID, face} defines a supported contact line as for cable_carrier",
         wire,
     ),
     edit(
@@ -688,7 +919,8 @@ pub static ALL: &[Command] = &[
          going on as `turn` says: 0 straight on, 90 or -90 turned left or right, 180 or -180 back beside it, to its left or right. \
          With `railings`, a railing down each side too",
         stair,
-    ),
+    )
+    .menu("Architecture > Stair"),
     edit(
         "ramp",
         ui_msg!("Ramp"),
@@ -698,7 +930,8 @@ pub static ALL: &[Command] = &[
          `width` wide (1200), at `slope` percent (8.33, 1 in 12), as long as that makes it; with landings `at` mm up, turning \
          as a stair's do, and with `railings`, a railing down each side. Solid down to its level",
         ramp,
-    ),
+    )
+    .menu("Architecture > Ramp"),
     edit(
         "railing",
         ui_msg!("Railing"),
@@ -708,24 +941,29 @@ pub static ALL: &[Command] = &[
          going where it goes; or along `path`, `base_offset` mm above the level. Its type sets how high its rail stands over \
          what it runs along, and how far apart its balusters are",
         railing,
-    ),
+    )
+    .menu("Architecture > Railing"),
     edit(
         "roof",
         ui_msg!("Roof"),
         &[],
-        "{level?, boundary?: [[x,y],…], courtyards?: [[[x,y],…],…] | sketch?: [[[x,y],[x,y]],…], slope?, overhang?, gables?: [edge, …], gable?, offset?, \
+        "{level?, boundary?: [[x,y],…], courtyards?: [[[x,y],…],…] | sketch?: [[[x,y],[x,y]],…], slope?, slopes?: [degrees, …], overhang?, gables?: [edge, …], gable?, offset?, \
          extrusion?, openings?: [[[x,y],…],…], join?, type?} a roof on `level` (by default the one above the lowest), its \
          base `offset` mm above it. Over `boundary` or else the walls of the level below, `overhang` mm (500) past their \
          faces, round any `courtyards` (holes in it, inside it and apart, with eaves of their own; over the walls, by \
          default each loop of them standing free inside, joined to none of the outer ones and with no room in it): flat \
          at `slope` 0, else every edge sloping up at `slope` degrees (30), hips, valleys and ridges where the slopes meet, \
          but the edges in `gables` (edge i runs from point i to the next, the courtyards' edges numbered on after the \
-         boundary's) left upright, gable ends; `gable` leaves a rectangle's short ends upright. Or with `extrusion` {line: \
+         boundary's) left upright, gable ends; `gable` leaves a rectangle's short ends upright. `slopes`: a slope in \
+         degrees (up to 75) for each edge, numbered as `gables` are, 0 for an edge that takes `slope`; none, every edge \
+         does; the eaves stay level and an edge in `gables` stays upright whatever its slope. A `sketch` line may carry \
+         a `slope` for the edges along it. Or with `extrusion` {line: \
          [[x,y],[x,y]], profile: [[along, up],…], from?, to}: its underside's profile in the upright plane through `line`, \
          along it from its start and up from the base, swept square to it from `from` (0) to `to` mm to its left. \
          `openings` are holes through it in plan; with `join`, a roof it runs into, it ends where it meets that one's top",
         roof,
-    ),
+    )
+    .menu("Architecture > Roof"),
     edit(
         "dormer",
         ui_msg!("Dormer"),
@@ -735,28 +973,116 @@ pub static ALL: &[Command] = &[
          the front, under a gable roof of its own sloping `slope` degrees (30) that runs back into the host; the host open \
          under it, and with `window` (a window type) a window in its front. Replies with its roof, walls and window",
         dormer,
-    ),
+    )
+    .menu("Architecture > Dormer"),
     edit(
         "dimension",
         ui_msg!("Aligned Dimension"),
         &["DI"],
-        "{refs: [ref, …], at: [x, y], level?, kind?: aligned|angular|radial} aligned (the default): the distances between \
-         parallel references, along a line through `at`; angular: the angle between two references that meet, on the side \
-         of `at`; radial: a round column's radius, toward `at`. A ref is {id, face?}: a wall's centre (the default), left or \
-         right face (of its start-to-end direction), start or end; a door's or window's centre, or its jamb toward its wall's \
-         start or end; a grid's line; a straight detail line, or its start or end (radial: a circle or an arc of one). Or a \
-         point [x, y] on one of those (for radial, on a round column's edge). It follows what it measures",
+        "{refs: [ref, …], at: [x, y], level?, kind?: aligned|linear|angular|radial|diameter|arc_length, orient?: \
+         horizontal|vertical} aligned (the default): the distances between parallel references, along a line through `at` \
+         (between points, along the first two; points and lines, square to the lines); linear: the same with its line \
+         horizontal or vertical as `orient` says, or without one as `at` lies: east or west of the points, vertical, else \
+         horizontal (its lines must run square to it); angular: the angle between two references that meet, on the side \
+         of `at`; radial: a round column's, curved wall's, circle's or arc's radius, toward `at`; diameter: the same \
+         across, through its centre; arc_length: how long a curved wall's centre line or face, or an arc, is along it \
+         (all of it, or with two point refs after it, between them), its line an arc through `at`. A ref is {id, face?}: a wall's centre (the default), left or right face (of its \
+         start-to-end direction), start or end; a door's or window's centre, or its jamb toward its wall's start or end; \
+         a column's or structural column's centre line along its angle (the default; west to east at angle 0), `across`, \
+         its centre line square to that (south to north), its left or right face (of its angle's direction: north or \
+         south), or its start or end cap (west or east); a round column has only its two centre lines (radial: its edge); \
+         a grid's line; a straight detail line, or its start or end (radial: a circle or an arc of one). With `point: \
+         start|end`, {id, face?, point} is the point at that end of the line: a wall's centre line's end, a face's \
+         corner, a column's corner or centre line's end, a grid's, a detail line's (of any shape) or a jamb's end. Or a \
+         point [x, y] on one of those lines (for radial and diameter, on a round edge; for arc_length, on the arc), or \
+         {endpoint: [x, y]}, the end of one nearest it, within 100 mm, found in the plan of `level` as it draws it: among \
+         the walls and columns its cut plane passes through, whatever level they stand on (a column from a level below \
+         that runs up through it too), their doors and windows, the grids and the plan's detail lines. It follows what it \
+         measures",
         dimension,
+    ),
+    edit(
+        "dimension_3d",
+        ui_msg!("Aligned Dimension in 3D"),
+        &[],
+        "{refs: [ref, ref], at: [x, y, z], view?, type?} an aligned dimension in a 3D view (the default 3D view unless `view` \
+         names another, by name or id), kept by the view and drawn in it and on a sheet that holds it: how far apart its two \
+         references are, along a line through `at` moved square off them. A ref is {at: [x, y, z]}, a point of the model, or \
+         {at, edge: [[x, y, z], [x, y, z]]}, a point on an edge, which it measures square to (from a point, to the edge's line; \
+         between two parallel edges, how far apart they are). `type` is a dimension type, the aligned one's unless told. On the \
+         desktop, Aligned Dimension (DI) in the 3D view runs it. Returns its id and its length",
+        dimension_3d,
     ),
     edit(
         "text",
         ui_msg!("Text"),
         &["TX"],
-        "{text, at: [x, y], view?, size?, angle?, leader?: [x, y]} a text note, its first line's top left at `at`, in a view \
-         by name or id: a level's plan (the lowest by default; `at` in plan mm), a section or an elevation (`at` along its \
-         line from its start, and up), or a sheet by number (`at` in paper mm). `size` is its capitals' height on paper, \
-         mm (2.5); `angle` degrees counter-clockwise; with `leader`, a line to that point. Lines break at \\n",
+        "{text, at: [x, y], view?, type?, angle?, leader?: [x, y], override_format?, runs?: [{from, to, bold?, italic?, \
+         underline?}, …]} a text note, its first line's top left at `at`, in a view by name or id: a level's plan (the lowest \
+         by default; `at` in plan mm), a section or an elevation (`at` along its line from its start, and up), or a sheet by \
+         number (`at` in paper mm). Lettered as its text `type` says (2.5mm unless told; `text_type` lists and makes them: \
+         its font, its size, its border), turned `angle` degrees counter-clockwise; with `leader`, a line to that point. \
+         Lines break at \\n. With `override_format`, each run makes characters `from` up to `to` (counted in characters, a \
+         line break one) bold, italic or underlined (true), or not (false), whatever the type says; they stay when the \
+         type changes, and `modify` with a new `text` alone keeps them on what didn't change. Font and size are the type's",
         text_note,
+    ),
+    edit(
+        "text_type",
+        "Text Types",
+        &[],
+        "{name?, font?, size?, bold?, italic?, underline?, width_factor?, color?, border?, border_offset?, border_pen?, \
+         like?, rename?, delete?: true} a text type of the project's: its `font`, any the system has, or one BIMCraft carries \
+         (IBM Plex Sans, IBM Plex Mono, BIMCraft Lettering: single-stroke capitals); Arial, the default, letters on any system \
+         (where it isn't installed, Liberation Sans, Arimo, Helvetica or the like stands in, else IBM Plex Sans), and a font a \
+         file names that this system hasn't is stood in for likewise. Its capitals' height on paper (`size`, mm, 2.5 for a new \
+         one), bold, italic and underlined or not (a family's own bold and italic faces where it has them), `width_factor` (1: \
+         as the font draws it), its colour (\"#rrggbb\" or [r, g, b], black unless told), and whether a border is drawn round \
+         its notes, `border_offset` mm on paper out from their text (where a leader starts too; 1), in pen `border_pen` (0 to \
+         16; 1). A new one starts as `like` says, or as 2.5mm Arial. A project starts with 2.5mm, 3.5mm and 5mm. `rename` \
+         renames it, its notes following; `delete` takes it away while no note is of it. Without `name`, it lists every type, \
+         the fonts this system has, and the font that letters each type here (`drawn_with`)",
+        text_type,
+    ),
+    edit(
+        "dimension_constraint",
+        "Dimension Constraints",
+        &[],
+        "{id, equal?: bool, locked?: [segment, …]} an aligned or linear dimension's constraints, as Revit's EQ and padlocks: \
+         `equal` keeps its segments equal (what it measures to between its first and last moves to keep them so, its ends \
+         staying); `locked` lists the segments (counted from 0, west to east or south to north) kept at the lengths they \
+         have now. After any command, what a constrained dimension measures to moves with what the command moved, or the \
+         command is refused, saying which dimension can't be kept",
+        dimension_constraint,
+    ),
+    edit(
+        "dimension_text",
+        "Dimension Text",
+        &[],
+        "{id, segment?, prefix?, suffix?, above?, below?, replace?} a dimension's text, as Revit's Dimension Text: what goes \
+         before and after its numbers, over and under them, or in place of them. With `segment` (its numbers counted from 0, \
+         west to east or south to north, as `labels` lists them), that one's own, over the dimension's where it says \
+         something; an empty text clears it, and a segment with none left goes back to the dimension's",
+        dimension_text,
+    ),
+    edit(
+        "dimension_type",
+        "Dimension Types",
+        &[],
+        "{name?, like?, rename?, delete?: true, …values} a dimension type of the project's, as Revit's type parameters, \
+         lengths mm on paper. Graphics: `string` continuous|baseline|ordinate (Dimension String Type; baseline lines \
+         `baseline_spacing` apart, 7), `tick` diagonal|arrow|open_arrow|dot|none, `tick_size` (2), `line_pen` and `tick_pen` \
+         (0 to 16; 4 and 7), `color` (\"#rrggbb\" or [r, g, b]), `line_extension` past the outer witness lines (0.8), `witness` \
+         gap_to_element|fixed (Witness Line Control), `witness_length` when fixed (5), `witness_gap` off what it measures \
+         (0.6), `witness_extension` past the dimension line (0.8), `centre_mark` on radial and diameter ones. Text: `font` (as \
+         text types take; Arial), `text_size` (2.5), `bold`, `italic`, `underline`, `width_factor` (1), `text_offset` off \
+         the line (1), `background` opaque|transparent, `read` up_then_left|up_then_right (Read Convention), `units` (mm, cm, \
+         m, in, ft, ft-in; null for the project's) and `decimals` (0 to 6; null as the units show), `radius_symbol` (R), \
+         `diameter_symbol` (Ø), `equality_text` (EQ). A new one starts as `like` says, else as the default. A project starts \
+         with `Diagonal - 2.5mm Arial` (aligned, linear, angular and arc length dimensions start in it) and `Arrow - 2.5mm \
+         Arial` (radial and diameter ones). `rename` renames it, its dimensions following; `delete` takes it away while no \
+         dimension is of it. Without `name`, it lists every type",
+        dimension_type,
     ),
     edit(
         "spot",
@@ -766,6 +1092,15 @@ pub static ALL: &[Command] = &[
          what stands on the level at `at` (or of `host`), following it; in a section or an elevation, of its point `at`, \
          along and up",
         spot,
+    ),
+    edit(
+        "spot_slope",
+        ui_msg!("Spot Slope"),
+        &[],
+        "{at: [x, y], view?, host?} a spot slope in a level's plan (the lowest by default): how steeply the top of the floor \
+         or roof at `at` (or `host`) falls there, %, an arrow pointing downhill; it follows the top. The reply gives `slope` \
+         and `toward`, the way down in plan (null on the level)",
+        spot_slope,
     ),
     edit(
         "tag",
@@ -799,9 +1134,43 @@ pub static ALL: &[Command] = &[
         "sheet",
         "Sheet",
         &[],
-        "{number?, name?, size?: A0|A1|A2|A3|A4} a sheet of paper, landscape (A3 by default), with a title block; numbers \
-         run A101, A102…",
+        "{number?, name?, size?: ISO A0–A4|ISO B1–B4|ARCH A–E|ARCH E1–E3|ANSI A–E|SUPER B|width x height in mm, title_block?, \
+         fields?: {KEY: text}} a sheet of paper (A3 by default), with a title block: the built-in one, or the project's \
+         `title_block` of that name (see `title_block`), its sheet fields filled in from `fields`, or with `title_block` \
+         \"none\" (or false) none at all: no border, title box or folding marks, for one drawn on the sheet itself; named \
+         sizes landscape, custom ones as given, 100 to 1219.2 mm a side and, with a title block, wide enough for the \
+         standard's title block and margins (210 mm, 211.75 under ANSI); numbers run A101, A102…. `modify` changes them \
+         later: `title_block` (\"\" or true for the built-in, \"none\" or false for none), `fields` (a key's value null \
+         to clear it)",
         new_sheet,
+    ),
+    edit(
+        "title_block",
+        "Title Blocks",
+        &[],
+        "{name?, like?, rename?, delete?: true, path?, units?: auto|mm|cm|m|in|ft, width?, height?, font?, lines?, fills?, \
+         texts?, fields?} a title block of the project's own, as Revit's title block families with labels, which a sheet names to be \
+         drawn with it in its bottom right corner, inside the border, in place of the built-in title box. Without `name`, the \
+         project's title blocks, its title fields' values and the automatic fields. All lengths are mm on paper from the title \
+         block's bottom left corner: `width` and `height` its box; `font` what letters its texts (Arial unless told; any the system has); `lines` [{points: [[x, y], …], closed?, pen?: 0 to 16 (1)}]; \
+         `fills` [{rings: [[[x, y], …], …]}], filled through (a logo); `texts` [{at: [x, y] on the baseline, text, size?: \
+         capitals mm (2.5), angle?: degrees, align?: left|center|right, width_factor?: 0.1 to 10 (1), color?: [r, g, b]}]. A text may name fields as `{KEY}`: the automatic ones \
+         (PROJECT, SHEET_NAME, SHEET_NUMBER, SCALE, DATE, SHEET_INDEX, SHEET_COUNT, REVISION) or the title block's `fields` \
+         [{key, label?, scope?: sheet|project, default?}]: a project field has one value for every sheet (`title_values`), a \
+         sheet field each sheet's own (`sheet`'s and `modify`'s `fields`). `path` reads a DXF (or a DWG, which the desktop and the \
+         command line read as DXF) drawn at full size on paper, in `units` (auto: the file's own, else mm): its lines, arcs, \
+         circles and polylines as lines, its solid hatches as fills, its texts as texts, moved to its extents' corner, which \
+         become its box; each key its texts name becomes a sheet field, or keeps the field it was. A new one starts as the \
+         built-in title box drawn as one (`like` another), and what's given goes over it",
+        title_block,
+    ),
+    edit(
+        "title_values",
+        "Project Information",
+        &[],
+        "{values?: {KEY: text or null}} the project's values of its title blocks' project fields (and of an automatic field, \
+         DATE say, to give every sheet that instead): a key's null clears it. Without `values`, what they are",
+        title_values,
     ),
     edit(
         "place",
@@ -872,7 +1241,7 @@ pub static ALL: &[Command] = &[
         "type",
         "Edit Type",
         &[],
-        "{category: wall|floor|ceiling|door|window|column|structuralcolumn|footing|roof|railing|beam|stripfooting|pipe|cablecarrier|\
+        "{category: wall|floor|ceiling|door|window|column|structuralcolumn|footing|roof|railing|beam|stripfooting|pipe|duct|conduit|cabletray|cablecarrier|\
          wire|downconductor|groundconductor|cable, name, thickness? | width?, height?, sill? | width?, depth?, round?, \
          material? | height?, spacing?} creates the type, or changes it everywhere it's used. A column's, a structural column's or \
          a footing's type is a `width` by `depth`, or `round` (`width` across); a run's (a beam's, a pipe's, a cable carrier's…) too, \
@@ -884,13 +1253,14 @@ pub static ALL: &[Command] = &[
          have `layers` too, from the top down; a layer's `material` is one of the library's (see `material`)",
         edit_type,
     ),
-    edit(
+    edit_files(
         "material",
         "Materials",
         &[],
-        "{name, color?: \"#rrggbb\" | [r, g, b], cut?, surface?, texture?: {kind?, size?: [w, h], angle?, offset?: [x, y], path?, \
+        "{name, color?: \"#rrggbb\" | [r, g, b], transparency?: 0-100, cut?, surface?, texture?: {kind?, size?: [w, h], angle?, offset?: [x, y], path?, \
          image?} | null, rename?, delete?: true} a material of the project's library, created or changed: its colour in shaded 3D \
-         views, the pattern its cut shows in plans and sections (where a layer is wide enough to hold it), and the one its \
+         views, its `transparency` there (percent of what lies behind it that shows through, 0 opaque; the starter Glass has 70), \
+         the pattern its cut shows in plans and sections (where a layer is wide enough to hold it), and the one its \
          surfaces show at its size in the building (a floor's top in plan, a ceiling's underside in its ceiling plan). Patterns: \
          none, solid, diagonal, crosshatch, horizontal, vertical, grid, brick, concrete, insulation, or the name of one of the \
          project's fill patterns (see `fill_pattern`), kept while the material shows it and renamed with it. Its `texture` is what its \
@@ -901,8 +1271,10 @@ pub static ALL: &[Command] = &[
          takes the texture away. `rename` renames it, the layers using it following; `delete` takes it away, while no layer \
          uses it. `inspect` lists the library and the pictures",
         material,
-    ),
-    edit(
+        Files::Conditional,
+    )
+    .menu("Manage > Materials"),
+    edit_files(
         "favorite",
         "Favorites",
         &[],
@@ -912,7 +1284,9 @@ pub static ALL: &[Command] = &[
          made of), under another name with `as`; `load` a favorite into the project, under another name with `as`, or over \
          one it has already with `replace`; `delete` one from the favorites; `list` them (the default)",
         favorite,
-    ),
+        Files::Conditional,
+    )
+    .menu("Manage > Favorites"),
     edit(
         "paint",
         "Paint",
@@ -933,34 +1307,86 @@ pub static ALL: &[Command] = &[
          in mm, yes or no as true or false). Off a category, that category's elements lose their values of it; deleted, every \
          element does; renamed, they follow it. `inspect` lists them",
         parameter,
-    ),
-    edit(
+    )
+    .menu("Manage > Project Parameters"),
+    edit_files(
         "family",
         "Load Family",
         &[],
-        "{name, category?: furniture|casework|plumbing|lighting|generic|door|window, parameters?: [{name, kind?: length|number|\
+        "{name?, category?: furniture|casework|plumbing|lighting|generic|door|window, parameters?: [{name, kind?: length|number|\
          angle|yesno|material, instance?, value?, formula?}], types?: {type: {parameter: value}}, forms?: [{plane?: xy|xz|yz, \
          profile?: [[a, b], …], circle?: {centre: [a, b], radius}, axis?: [[a, b], [a, b]], from?, to, material?, visible?, \
-         void?}], symbols?: [{line?: [[x, y], …] | arc?: {centre: [x, y], radius, from?, to}, visible?}], rename?, delete?: \
-         true, path?, save?} a family of \
-         the project's, BIMCraft's own parametric component: created, changed, or loaded from the .json file at `path` (a family \
-         as `inspect` shows it, with its `name`). Its forms are profiles drawn in its own axes (x along a component's angle, y \
-         to its left, z up from its base) and swept: `xy` up from `from` to `to`, `xz` along y, `yz` along x. With an `axis`, a \
-         line in that plane, the profile is turned about it instead, `from` to `to` degrees (up to 360, right-handed from the \
-         axis' first point toward its second; it can't cross the axis): a pipe, a bowl, a lamp shade. A `void` is no solid: it \
-         cuts the solid forms listed before it that it passes through, a hole, a notch, a sink's bowl, and is never seen \
-         itself (forms listed after it are whole). A `door` or `window` family stands in a wall, placed with `door` or `window` \
-         and a `family`: its forms are drawn in the opening's axes (x along the wall from the middle of the opening, y across \
-         it, 0 in the middle of the wall and + toward its exterior, z up from the sill), it must have length parameters \
+         void?}], symbols?: [{line?: [[x, y], …] | arc?: {centre: [x, y], radius, from?, to} | text?: {at: [x, y], height, value, align?: left|center|right} | dot?: {centre: [x, y], radius}, visible?}], form?: {id | guid, …a \
+         form's fields}, symbol?: {id | guid, …a symbol's fields}, delete_form?: [id | guid, …], delete_symbol?: [id | guid, …], \
+         operation?: swing|double-swing|sliding|double-sliding|folding|fixed (a door's or window's, for IFC and schedules), \
+         kind?: which fixture or fitting it is, for IFC's predefined type (plumbing: wc|lav|sink|laundry|shower|bath|bidet|urinal; \
+         drain: floor_drain|floor_waste|roof_drain; pipefitting: bend|tee|cross|transition|coupling; \"\" clears it), \
+         ifc?: {class, predefined?, object_type?} | null (the IFC class a generic family's components go out as, which one \
+         opened from IFC remembers: `IFCPLATE`, `CURTAIN_PANEL`; one IFC4 lacks goes out as a proxy that names it), \
+         connectors?: [{kind: power|switch|pipe|data|earthing, name?, system?: power-balanced|power-unbalanced|switch, \
+         domain?: cold|hot|waste|vent|storm|gas, flow?: in|out|both, at?: [x, y, z], direction?: [x, y, z], size?, poles?: 1-3, \
+         voltage?, load_va?, power_factor?, classification?}], rename?, delete?: true, dry_run?, path?, save?} a family of \
+         the project's, BIMCraft's own parametric component: created, changed, read, or loaded from the .json file at `path` (a \
+         family as `inspect` shows it, with its `name`). Without `name` it lists the project's families, each its category and \
+         how many types, forms and symbols it has; with only a `name` it reads one — its definition, each of its types' \
+         parameter values worked out, and `warnings` — and changes nothing: no undo step, no file. `dry_run` reads a change the \
+         same way and replies what it would do (`changes`: the parameters and types added, taken away and changed, the forms \
+         and symbols replaced, patched and deleted by id, the `rename`) instead of doing it; a change that's refused comes back \
+         as an error, as it would without it. `form` merges its fields over the one form of that `id` or `guid` (a `null` takes \
+         a field away; its place, its id and its GUID stay), `delete_form` takes those forms away; `symbol` and `delete_symbol` \
+         do the same for symbols — where `forms` and `symbols` still replace whole lists. Every reply carries `warnings`: what's \
+         worth knowing and doesn't stop the change (a void cutting no solid, a form outside the opening or thicker than its \
+         wall, a door's or window's plan with no symbols). Its forms are profiles drawn in its own axes (x along a component's \
+         angle, y to its left, z up from its base) and swept: `xy` up from `from` to `to`, `xz` along y, `yz` along x. With an \
+         `axis`, a line in that plane, the profile is turned about it instead, `from` to `to` degrees (up to 360, right-handed \
+         from the axis' first point toward its second; it can't cross the axis): a pipe, a bowl, a lamp shade. A `void` is no \
+         solid: it cuts the solid forms listed before it that it passes through, a hole, a notch, a sink's bowl, and is never \
+         seen itself (forms listed after it are whole). A `door` or `window` family stands in a wall, placed with `door` or \
+         `window` and a `family`: its forms are drawn in the opening's axes (x along the wall from the middle of the opening, y \
+         across it, 0 in the middle of the wall and + toward its exterior, z up from the sill), it must have length parameters \
          `Width` and `Height` (the opening it makes; `Sill Height` is a window's default sill), and its formulas read \
-         `Wall Thickness`, the wall's. Its `symbols` are the lines its plan draws (a door's swing: a `line`, an `arc` in \
-         degrees from +x counter-clockwise). Sizes are mm, or \
+         `Wall Thickness`, the wall's. Sizes are mm, or \
          formulas over its parameters as Revit's are: `Width / 2`, `if(Depth > 600, 4, 2)`, with + - * / ^, < > = <= >=, if, \
          and, or, not, min, max, abs, sqrt, round, roundup, rounddown, sin, cos, tan (degrees). A parameter is each type's, or \
          with `instance` each component's. `types` merges into its types (a null takes one away); `parameters` and `forms` \
          replace its own; `material` is a material's name or a material parameter's; `visible` a yes/no parameter or formula. \
-         `inspect` lists the families",
+         `inspect` lists the families. A device's `connectors` say what it draws: one `power` connector at most (a second is \
+         refused), `voltage` in volts, `load_va` in VA (a number or a formula over its parameters, so each type has its load; \
+         `power-unbalanced` may take a list, one load for each pole), `power_factor` over 0 up to 1, and its `classification` \
+         (`lighting`…); a `switch` connector carries no load; both have a `system`. A `pipe` connector is where a pipe \
+         meets the family: its `domain` (cold or hot water, waste, vent, storm, gas), its `flow` (`in` as water into a basin, `out` as \
+         waste from a WC, `both` the default), `at` (where it is, mm, in the family's axes: x along it, y to its left, z up from its \
+         base), `direction` (the way the pipe leaves it, any length but none) and `size` (its DN, mm); a `data` or `earthing` \
+         connector has `at` and may have `direction` and `size`; an electrical one may have `at` and `direction`. Each of `at`, \
+         `direction` and `size` is a number or a formula over the family's parameters. A component reports them as \
+         `connectors` in `elements`, with `at` and `direction` in the model, where it stands; a \
+         lighting, outlet or switch family without one counts as zero load, which `inspect` warns of; `connectors` replace \
+         their own, as `parameters`, `forms` and `symbols` do. The `symbols` of a family of any category are what its plan \
+         draws besides its forms, in its own axes, turned and moved (and mirrored) with the component or opening and hidden at \
+         coarse detail: each one `line` (points), `arc` (degrees from +x counter-clockwise, up to a full turn), `text` or `dot`, \
+         one of them, with `visible` a yes/no parameter or formula. A `text` is lettered in BIMCraft's own strokes, capitals \
+         `height` mm tall, `at` the middle of the line of text vertically (`align` says whether `at` is where it starts, its \
+         middle or its end); its anchor moves with the component but its letters always read upright, left to right, never \
+         turned or mirrored; `{Parameter Name}` in its \
+         `value` is replaced by that parameter's value (a name the family lacks is refused), up to 256 characters. A `dot` is \
+         a solid disc in ink of a radius above zero. Symbols draw in the plan and ceiling plan of the component's level whatever height \
+         it has, and on no other level's. IFC leaves symbols out",
         family,
+        Files::Conditional,
+    )
+    .menu("Manage > Family Editor"),
+    edit(
+        "symbol_set",
+        "Load Symbol Set",
+        &[],
+        "{set: arei, names?: en|nl|fr} loads a set of families that are plan symbols and nothing else, each of one type \
+         `Standard` with no forms: `arei` is the Belgian AREI/RGIE's graphical symbols (Table 2.23: switches, sockets, light \
+         points, appliances, sources, domotics, protection), 76 families, switches in the switch category, sockets in outlet, \
+         luminaires in lighting and the rest generic. `names` is the language of their names, English, Dutch or French as the \
+         source prints them; as given none, French in a French project and English otherwise. A family the project has by \
+         that name stays as it is, so loading twice changes nothing; the reply lists `loaded` and `kept`. Place them as \
+         components",
+        symbol_set,
     ),
     edit(
         "component",
@@ -971,7 +1397,8 @@ pub static ALL: &[Command] = &[
          with `mirrored` flipped across its own x axis; `params` sets its instance parameters (`modify` merges into them, a null \
          taking one back to the family's). `provision` records billable quantities and a system: planned and nonspatial positions need no `at` and have no geometry or snaps; placed positions require `at` and quantity 1. An optional host is another component or run. connection_sides restricts free cable entries in equipment-local directions; omitted/empty permits any side",
         component,
-    ),
+    )
+    .menu("Architecture > Component"),
     edit(
         "equipment",
         ui_msg!("Equipment"),
@@ -992,6 +1419,8 @@ pub static ALL: &[Command] = &[
         "Modify",
         &[],
         "{id | ids: [id,…], …fields} change fields as `elements` shows them, of one element or several; `level` and `top_level` may be names. \
+         `join: false` on a wall or a run turns off its joins: its ends stay square and it neither stretches with its neighbours nor pulls \
+         them (Revit's Disallow Join). \
          A filled region's or a floor's model pattern is set by `pattern_origin` [x, y], plan mm, where its lines start, and \
          `pattern_angle`, degrees counter-clockwise (both shown by `elements`); to put a pattern line of one on a reference \
          line, Model::align_pattern gives the `pattern_origin` that does. A floor's, a ceiling's, a roof's or a shaft's \
@@ -1005,6 +1434,28 @@ pub static ALL: &[Command] = &[
         "{from: id, ids: [id,…]} gives the elements in `ids` the type of `from` (and, for components, its family), as Revit's Match \
          Properties does; only elements of `from`'s category take it, the rest come back in `skipped`. Returns {modified, skipped}",
         match_properties,
+    ),
+    edit(
+        "align",
+        ui_msg!("Align"),
+        &["AL"],
+        "{id, reference: [[x,y],[x,y]], line: [[x,y],[x,y]], lock?: true, to?: id} aligns an element's picked line with a \
+         reference in plan: turns by the smaller angle about the picked line's midpoint, then moves it onto the reference, keeping \
+         its size. Doors and windows slide along their host wall; they cannot turn independently. With `lock`, Revit's padlock: \
+         the line and the reference (of element `to`, else whatever has a line along it) are kept on one line after every \
+         command, as a locked dimension keeps its length; refused when that can't hold with the other locks. Returns {aligned, \
+         angle, by, line} (the picked line where it went), and the lock's id",
+        align_element,
+    ),
+    edit(
+        "dimension_value",
+        ui_msg!("Dimension Value"),
+        &[],
+        "{id, value, segment?} types a length into an aligned or a linear dimension's segment (the first unless told), as a \
+         click on its number does: what the segment ends at (its second reference, as the dimension runs west to east or south \
+         to north) moves along the dimension so the segment is `value` mm; a locked segment is locked at it, and the other \
+         locks hold, or it is refused. Returns {id, moved, by}",
+        dimension_value,
     ),
     edit(
         "move",
@@ -1132,9 +1583,11 @@ pub static ALL: &[Command] = &[
         "line_pattern",
         "Line Patterns",
         &[],
-        "{name?, segments?: [{dash: mm} | {space: mm} | \"dot\", …], rename?, delete?: true} a line pattern of the project's: \
-         a dash or a dot then a space, again and again, each dash and space 0.05 to 100 mm long on paper, so it reads the \
-         same at any scale. A project starts with Dash, Long Dash, Dot, Dash Dot, Hidden and Centre; Solid is a line with \
+        "{name?, segments?: [{dash: mm} | {space: mm} | \"dot\" | {dot_length: mm} | {offset: {length, count, distance}} | {wave: {length, frequency, amplitude}} | {zigzag: {length, frequency, amplitude}} | {text: {length, size, text}}, …], rename?, delete?: true} a line pattern of the project's: \
+         1–32 freely ordered graphic segments, each 0.05–100 mm long on paper, so it reads the \
+         same at any scale. Offsets have 2–9 lines spaced symmetrically; frequency is cycles per segment, 0.1–100; \
+         amplitude and spacing are mm. Text uses bundled IBM Plex Sans, size is maximum capital height (shrinks to fit length), \
+         1–256 single-line characters, following the curve. All graphics preserve the centerline. A project starts with Dash, Long Dash, Dot, Dash Dot, Hidden and Centre; Solid is a line with \
          none. `rename` renames it, the line styles using it following; `delete` takes it away, while no style uses it. \
          Without `name`, it lists every pattern",
         line_pattern,
@@ -1149,20 +1602,37 @@ pub static ALL: &[Command] = &[
          Thin Lines, Medium Lines, Wide Lines, Hidden Lines, Centre Lines and Overhead Lines. `rename` renames it, the lines \
          drawn in it following; `delete` takes it away, while no line is drawn in it. Without `name`, it lists every style",
         line_style,
-    ),
+    )
+    .menu("Manage > Line Styles"),
     edit(
         "fill_pattern",
         "Fill Patterns",
         &[],
-        "{name?, target?: drafting|model, lines?: [{angle, spacing, origin?: [x, y], shift?, dashes?: [mm, -mm, …]}, …], rename?, \
-         delete?: true} a fill pattern of the project's, as Revit's (and a PAT file's): families of parallel lines, each at \
+        "{name?, target?: drafting|model, lines?: [{angle, spacing, origin?: [x, y], shift?, dashes?: [mm, -mm, …]}, …], \
+         drawn?: scale | null, rename?, delete?: true} a fill pattern of the project's, as Revit's (and a PAT file's): families of parallel lines, each at \
          `angle` degrees through `origin`, its lines `spacing` apart and each `shift` along from the last, whole or dashed \
          (`dashes`: a dash's length, a space's as a negative one, 0 a dot); no lines, it fills solid. A drafting pattern's \
          lengths are mm on paper, the same at any scale; a model pattern's mm in the building. A project starts with Solid \
          fill, Diagonal Up and Down, Crosshatch, Diagonal Crosshatch, Horizontal, Vertical, Sand, Brick 225 x 75 and Tile 300. \
          `rename` renames it, the region types filling with it following; `delete` takes it away while no type uses it. \
+         `drawn` is the scale (1 : n, its n) of the view one made of lines (`make_fill_pattern`) was drawn in: such a one given \
+         a new `target` and no `lines` is rescaled, a drafting one being the drawing on paper at that scale; null forgets it. \
          Without `name`, it lists every pattern",
         fill_pattern,
+    )
+    .menu("Manage > Fill Patterns"),
+    edit(
+        "make_fill_pattern",
+        "Make Fill Pattern",
+        &[],
+        "{ids, from: [x, y], to: [x, y], name, target?: model|drafting} a fill pattern made of the detail lines `ids` (all of \
+         one view), as pyRevit's Make Pattern makes one: the rectangle between corners `from` and `to` (in the view's terms) \
+         is the tile the pattern repeats, and what of the lines lies outside it is cut off. Each line becomes a family that \
+         runs on into the next tiles' copies of itself; one at a slope that never meets itself again is turned to the \
+         simplest slope within 0.25° that does (else the nearest, at most 48 tiles across or up). A model pattern (the \
+         default) is as drawn; a drafting one is the drawing on paper, at the view's scale. The tile is 0.05 to 100000 \
+         each way, and holds at most 256 lines. It returns the pattern's `name` and the `pattern`",
+        make_fill_pattern,
     ),
     edit(
         "linework",
@@ -1176,7 +1646,7 @@ pub static ALL: &[Command] = &[
          edge, `from` and `to`, or with `remove` how many were `removed`",
         linework,
     ),
-    edit(
+    edit_files(
         "import_fill_patterns",
         "Import Fill Patterns",
         &[],
@@ -1187,13 +1657,34 @@ pub static ALL: &[Command] = &[
          up to its first 2000 patterns. It returns those `imported`, those `left_out` (the first 100, each with why) and \
          `left_out_count`, all of them",
         import_fill_patterns,
+        Files::Read,
     ),
-    other(
+    other_files(
+        "export_crosscheck",
+        "Export Cross-Check",
+        "{path?} the project's levels, walls (by their centre lines), floors, shafts, doors, windows and rooms as plain \
+         numbers in mm, which tools/revit-crosscheck builds again in another BIM tool to hold its numbers against ours \
+         (compare_crosscheck): written to `path`, or returned as `description` without it",
+        export_crosscheck,
+        Files::Write,
+    ),
+    other_files(
+        "compare_crosscheck",
+        "Compare Cross-Check",
+        "{path? | text?} another tool's numbers of the project export_crosscheck described, a table `kind,id,quantity,value` \
+         (rooms' enclosed, area_m2, perimeter_m; walls' length_m, openings; floors' area_m2, volume_m3), from the file at \
+         `path` or `text`, held against the project's own: how many were `compared`, those that `differ` (ours and \
+         theirs), and those `only_ours` and `only_theirs`, the first 100 of each with their counts",
+        compare_crosscheck,
+        Files::Read,
+    ),
+    other_files(
         "export_fill_patterns",
         "Export Fill Patterns",
         "{path?, names?: [name, …]} the project's fill patterns (those `names` says, else all but the solid ones, which a PAT \
          file can't hold) as a PAT file in mm, written to `path`, or returned as `text` without it",
         export_fill_patterns,
+        Files::Write,
     ),
     edit(
         "filled_region_type",
@@ -1295,14 +1786,25 @@ pub static ALL: &[Command] = &[
         delete_type,
     ),
     edit(
+        "rename_type",
+        "Rename Type",
+        &[],
+        "{category?: wall|floor|door|window|column|roof|ceiling|railing|…, family?, type, name} renames a type of a category \
+         (`category` and `type`) or one of a family's types (`family` and `type`) to `name`, as Rename in Type Properties does: \
+         the elements of it, and what else names it, follow, and it keeps its GUID; refused for a name another type of it has. \
+         Text types and filled region types rename with `rename` on `text_type` and `filled_region_type`",
+        rename_type,
+    ),
+    edit(
         "purge",
         "Purge Unused",
         &["PU"],
-        "{kinds?: [type|family|material|picture|filter|template, …], dry_run?} takes out what nothing uses, again for what that \
+        "{kinds?: [type|family|material|picture|filter|template|titleblock, …], dry_run?} takes out what nothing uses, again for what that \
          leaves unused: types and families unless `kinds` says; a category keeps a type and a family a type; with `dry_run` it \
          lists what would go and changes nothing",
         purge,
-    ),
+    )
+    .menu("Manage > Purge Unused"),
     edit(
         "line_weights",
         "Line Weights",
@@ -1316,7 +1818,8 @@ pub static ALL: &[Command] = &[
          wider at finer scales; at 1 : 100, pen 4 is 0.18 mm and pen 10 0.35 mm). Without any, it says what they are, each \
          scale named as the project's units name it, and `own` whether the project has set them",
         line_weights,
-    ),
+    )
+    .menu("Manage > Line Weights"),
     edit(
         "object_styles",
         "Object Styles",
@@ -1329,7 +1832,8 @@ pub static ALL: &[Command] = &[
          seen pen 4; a door's and a window's cut 6, a railing seen 6, a mass 4 both). Without either, it says each model \
          category's, `own` whether the project has set it apart",
         object_styles,
-    ),
+    )
+    .menu("Manage > Object Styles"),
     edit(
         "units",
         "Project Units",
@@ -1338,36 +1842,100 @@ pub static ALL: &[Command] = &[
          millimetres, centimetres, metres, fractional inches, decimal feet, or feet and fractional inches (to 1/16\"); areas \
          in m², or ft² with inches and feet. The model, and every command, keep millimetres",
         units,
+    )
+    .menu("Manage > Project Units"),
+    edit(
+        "room_area",
+        "Area and Volume Computations",
+        &[],
+        "{at?: centre|finish} where the project measures its rooms' areas, perimeters and IFC spaces, as Revit's Area and \
+         Volume Computations: at the walls' centre lines (`centre`, as a project starts) or at their finish faces \
+         (`finish`, the floor inside the walls: the área útil Brazilian codes ask for). Rooms keep their points; only their \
+         measured outline changes. IFC spaces carry both areas in Qto_SpaceBaseQuantities whichever is chosen",
+        room_area,
+    )
+    .menu("Manage > Room Area Computation"),
+    edit(
+        "georeference",
+        "Project Location",
+        &[],
+        "{crs?, eastings?, northings?, height?, rotation?, scale?, description?, geodetic_datum?, vertical_datum?, map_projection?, \
+         map_zone?, clear?: true} where the project lies on a map, as IFC's map conversion to a projected coordinate reference \
+         system: the CRS by name (an EPSG code, `EPSG:31983`) and what else is known of it, the map point of the project's origin \
+         (`eastings`, `northings`, `height`, mm), how far the project's x axis is turned from the map's east (`rotation`, degrees \
+         counterclockwise) and a distance on the map over the same in the project (`scale`, 1 as it starts). A project with none \
+         takes one with `crs`; what isn't given keeps its value. `clear` takes it away. With nothing, it says it (null for none). \
+         IFC import keeps the file's (moved with the model where the import brings it near the origin) and export writes it back as \
+         IfcMapConversion to an IfcProjectedCRS in metres; the model's own coordinates and drawings don't move",
+        georeference,
     ),
     edit(
         "language",
         "Project Language",
         &[],
-        "{code?: en|pt|es} the language the project's drawings speak (a stair's UP, a title block's SCALE, a schedule's \
+        "{code?: en|pt|es|sv|cs|fr|nl} the language the project's drawings speak (a stair's UP, a title block's SCALE, a schedule's \
          headings) and new names come in (levels, sections, elevations, sheets, rooms, schedules): English, Brazilian \
-         Portuguese or Spanish. What's already named stays named",
+         Portuguese, Spanish, Swedish, Czech, French or Dutch. What's already named stays named",
         language,
-    ),
-    other("inspect", "Inspect", "{} levels, element counts, types, warnings and undo history", inspect),
+    )
+    .menu("Manage > Project Language"),
+    edit(
+        "standard",
+        "Technical Standards",
+        &[],
+        "{set?: nbr|iso|ansi|eu|jis, adapt_all?: bool, adapt_line_weights?: bool, adapt_object_styles?: bool, adapt_units?: bool} configures the project's technical standard (NBR, ISO, ANSI, EU, JIS) \
+         and adapts line weights (pens), sheet layouts, object styles, and dimensioning conventions. \
+         NBR includes NBR 16861, NBR 16752, NBR 17006, NBR 17067, NBR 17068, and NBR 6492. \
+         The numbers each standard sets (margins, folds, pens, per-category pens) came with the contribution that added them and \
+         have not been checked against the standards named. Without `set`, reports the current standard and available standards",
+        standard,
+    )
+    .menu("Manage > Technical Standards"),
     other(
+        "timber_framing",
+        "Timber Wall Framing",
+        "{wall, layer, window, spacing, thickness, depth, header_height} read the framing members and clear bays of a straight isolated wall. \
+         Select its structural layer and one rectangular window by id or GUID. Supply lengths in mm. Dimensions are measured from the interior layer face. \
+         Each xz rectangle [left,right,bottom,top] spans the layer depth. Keys are local to the returned wall and layer GUIDs.",
+        crate::timber::query,
+    ),
+    other(
+        "inspect",
+        "Inspect",
+        "{brief?} levels, element counts, types, warnings and undo history; with `brief` the library is its size only \
+         (`library`), not its types, materials, families, parameters and images, which is most of the answer",
+        inspect,
+    ),
+    other_files(
         "render",
         "Render",
-        "{view?: a level's, section's or elevation's name or id, a sheet's number, or {3D}, ceiling?, width?, height?, path?, \
-         azimuth?, elevation?, revision?: token} a level's floor plan (with `ceiling`, its reflected ceiling plan, looking up from 2300 mm), a section, an elevation, a sheet (at 5 px a paper mm), or the 3D view seen from \
+        "{family?, type?, mode?: 3d|plan|elevation, wall_thickness?, view?: a level's, section's or elevation's name or id, a sheet's \
+         number, or {3D}, ceiling?, width?, height?, path?, \
+         azimuth?, elevation?, eye_elevation?, revision?} a family on its own with `family` — its `type` (the first by default) standing in a \
+         model of its own, in a wall `wall_thickness` mm thick (200) if it's a door's or a window's, nothing of this project's \
+         touched or left behind: `3d` (as seen from the south-east), `plan` (what its symbols draw) or `elevation` (front-on, \
+         as seen from the north), a PNG as `pngBase64` or at `path`. Without it: a level's floor plan (with `ceiling`, its \
+         reflected ceiling plan, looking up from 2300 mm), a section, an elevation, a sheet (at 5 px a paper mm), or the 3D view seen from \
          `azimuth` degrees round from east (counter-clockwise) and `elevation` degrees up (by default from the south-east, \
-         30° up), as a PNG (pngBase64), or written to a path: .png, .svg for a plan, .pdf for a sheet. A plan, section, \
+         30° up), fitted; in perspective (see `perspective`) through its lens, and with `eye_elevation` from an eye that high \
+         (mm) looking at the same point, as a PNG (pngBase64), or written to a path: .png, .svg for a plan, .pdf for a sheet. A plan, section, \
          elevation or sheet that could not draw something as asked (a fill pattern too dense for the view, more ink behind \
          a region than is kept above it) says so in the reply's `notes`. Returns the model revision used to render. A supplied stale revision is rejected before writing output",
         render_view,
+        Files::Conditional,
     ),
-    edit(
+    edit_files(
         "schedule",
         ui_msg!("Schedule"),
         &[],
-        "{name?, category?, fields?, filters?, sort?, grouped?, path?} a schedule view, as Revit's View > Schedules makes one, \
-         and its table: columns, rows, the `elements` each row lists, and totals (and a .csv file with a path). A new one needs `name` and `category`: rooms, \
+        "{name?, category?, categories?, fields?, filters?, sort?, grouped?, path?} a schedule view, as Revit's View > Schedules makes one, \
+         and its table: columns, rows, the `elements` each row lists, and totals (and a .csv file with a path, or an .xlsx workbook for a path ending .xlsx). A new one needs `name` and `category`: rooms, \
          doors, windows, walls, floors, ceilings, roofs, columns, structural columns, footings, beams, strip footings, components, \
-         stairs, ramps, railings or levels; `category` \
+         stairs, ramps, railings or levels, or `multicategory`, as Revit's Multi-Category Schedule: a row for each element of \
+         `categories` ([\"walls\", \"doors\"…]; none, every built one but rooms, levels and masses), with the fields they share \
+         (Category, Family, Type, Level, Count, Width, Height, Length, Thickness, Area: a wall's length by its height, a door's \
+         width by its height; Material: its type's structure layer's, a run's type's, a family's), each empty where its \
+         category has none; `category` \
          alone reads its own (Room Schedule, Door Schedule, Window Schedule, Wall Schedule, Floor Schedule, Level Schedule, \
          each the project's once changed). `fields`: its columns, in order, each a field's name (`available` lists them: its \
          category's own, Count, project parameters, a component's family's parameters) or {name, formula?, kind?: \
@@ -1380,6 +1948,7 @@ pub static ALL: &[Command] = &[
          `grouped`, a row for each set of the sort fields' values: Count and totals summed, and a field whose values differ \
          left empty. Each one given replaces the last; `fields: []` goes back to its category's",
         schedule,
+        Files::Write,
     ),
     edit(
         "graphics",
@@ -1389,9 +1958,15 @@ pub static ALL: &[Command] = &[
          …], show?: […], hide_elements?: [id, …], show_elements?: […], categories?: {category: override | null, …}, elements?: \
          {id: override | null, …}, filters?: [{filter, hidden?, projection?, cut?, halftone?, transparency?}, …], phase?: name \
          | null, phase_filter?: name | null, options?: {set: option | null, …}, layers?: {drawing: [layer, …] | null, …}, template?: name | null, \
+         background_grid?: {visible?, main?: {enabled?, color?: [r,g,b], pen?: 0..16}, sub?: {enabled?, color?, pen?}, \
+         spacing?: [X,Y] (mm), divisions?: [X,Y] (1..1000), rotation?: degrees (-360..360)} | null, \
          reset?: true} what a view hides and how it draws the rest, as Revit's Visibility/Graphics does; with \
          none of those, the view's settings as they are. A category hidden (walls, floors, rooms, grids, dimensions, levels…, \
-         in any case, singular or plural) leaves all its elements out of that view, and `hide_elements` the elements given. An \
+         in any case, singular or plural) leaves all its elements out of that view, and `hide_elements` the elements given. \
+         In a 3D view rooms are hidden unless shown (`show: [rooms]`), every new 3D view so; shown, each is a \
+         see-through solid. Subcategories are hidden and shown as categories are, and go with their category: under rooms, `roomreference` (the \
+         cross at each room's point, hidden unless shown, as Revit's Rooms > Reference) and `roomseparator` (room separation \
+         lines). An \
          override is {hidden?, projection?: style, cut?: style, halftone?, transparency?}, a style {color?, weight? (a pen, \
          0 to 16: 0 a hairline, the thinnest line the screen or printer draws at any scale; 1 to 16 widths on paper from 0.10 to \
          4 mm, 4 being 0.18 mm and 10 0.35 mm, a cut wall's outline), dash? (solid, dashed, dotted), fill?, foreground?, background?}, a colour [r, g, b] or \"#rrggbb\". \
@@ -1423,6 +1998,58 @@ pub static ALL: &[Command] = &[
         section_box,
     ),
     edit(
+        "perspective",
+        "Perspective",
+        &[],
+        "{view?: a 3D view's name or id ({3D} unless given), on?: true | false (true unless given), lens?: mm} a 3D view seen \
+         in perspective, as through a camera, or with `on: false` parallel (axonometric) again, as the ViewCube's Toggle to \
+         Perspective and Toggle to Parallel do. `lens` is the focal length it is seen through, 10 to 600 mm on a 35 mm camera \
+         (whose 36 mm of film is the picture's width): 35 unless given or set before; turned off, it keeps it. The eye stands \
+         back from the middle of the picture as far as the lens and the zoom say; `render` takes how high it stands",
+        perspective,
+    ),
+    edit(
+        "graphic_display_options",
+        "Graphic Display Options",
+        &["GD"],
+        "{view?: a 3D view's name or id ({3D} unless given), edges?: true | false, silhouette?: px, ambient_shadows?: true | \
+         false} how a 3D view draws its edges and shadows, as Revit's Graphic Display Options: `edges`, the lines where its \
+         surfaces meet in Shaded (on unless turned off; Hidden Line always draws them); `silhouette`, an outline that many \
+         pixels wide (a whole number, 0 to 10; 0, the default, for none) round what stands in front of what is further off \
+         or of nothing; `ambient_shadows`, soft shadows where faces meet inside a corner (off unless turned on). What is left \
+         out stays as it was; with none of them it only says what the view has",
+        graphic_display_options,
+    ),
+    edit(
+        "camera",
+        ui_msg!("Camera"),
+        &[],
+        "{eye?: [x, y, z], target?: [x, y, z], lens?: mm, view?: a 3D view's name or id, name?} a 3D camera as Revit's \
+         Camera tool makes one: with `eye` (where the camera stands, mm) and `target` (what it looks at, mm) it makes a new \
+         named perspective 3D view looking from `eye` at `target` through `lens` (35 mm unless given, 10 to 600), named \
+         `name` or by number (\"Camera 1\", \"Camera 2\"…). With `view` too, it gives that 3D view the camera instead (its \
+         id stays; `{3D}` may be given one): a point left out stays as that camera has it, so `lens` alone or one point \
+         alone changes just that, and a view without a camera yet needs both. With `view` and none of `eye`, `target` or \
+         `lens` it reads the camera back: `eye`, `target`, `lens` and whether the view is in perspective (null eye/target \
+         for a view with no camera yet). The eye is never on the target, so the view always has a direction to look in",
+        camera,
+    ),
+    edit(
+        "work_plane",
+        "Work Plane",
+        &[],
+        "{view?: a 3D view's name or id ({3D} unless given), level?: a level's name or id, points?: [[x, y, z], [x, y, z], \
+         [x, y, z]], surface?: {point: [x, y, z], normal: [x, y, z]}, offset?: mm} what a 3D view sketches on, as Revit's \
+         Work Plane > Set: a level; the plane through three `points` (not along a line), facing up unless upright; or a \
+         surface of the model, a point of it and the way it faces (a wall's face, picked). Any of them may be moved `offset` mm \
+         along its normal (up, for a level; 0 unless given), and may lie at any angle, upright too: what a tool may sketch on \
+         it is up to the tool (a floor, a ceiling, a roof and a shaft need a level plane, and stand on the highest level at or \
+         below it). Given only `offset`, the plane as it is is moved by that instead. Given nothing, it's the lowest level \
+         again, as it is until set. A level deleted takes its work plane with it. Says the plane: a point of it (`origin`), its \
+         `normal`, its height at the origin where it isn't upright (`z`) and its `slope` in degrees from level",
+        work_plane,
+    ),
+    edit(
         "filter",
         "View Filter",
         &[],
@@ -1439,16 +2066,19 @@ pub static ALL: &[Command] = &[
         "template",
         "View Template",
         &[],
-        "{name, from?: a level's, section's, elevation's or 3D view's name or id, controls?: [categories, filters, range, \
-         phase, options, scale, detail, style], view_range?: {top?, cut?, bottom?, depth?}, phase?, phase_filter?, options?, \
+        "{name, from?: a level's, section's, elevation's or 3D view's name or id, like?: another template's name, \
+         kind?: plan | section | 3d | null, rename?, controls?: [categories, filters, range, \
+         phase, options, scale, detail, style, background_grid], view_range?: {top?, cut?, bottom?, depth?}, phase?, phase_filter?, options?, \
          scale?: 1 | … | 100000, detail?: coarse | medium | fine, visual_style?: shaded | hidden_line | wireframe, \
-         hide?, show?, categories?, filters?, reset?, delete?: true} a view template, as Revit's: settings under a name for \
-         views to follow with `graphics {template}`. `from` takes a view's categories (hidden and overridden), filters and, a \
+         background_grid?: grid settings as in graphics, hide?, show?, categories?, filters?, reset?, delete?: true} a view template, as Revit's: settings under a name for \
+         views to follow with `graphics {template}`. `kind` is the views it is for (plans, elevations and sections, or 3D \
+         views; null, any), which `from` sets; `like` makes a new one a copy of another (Duplicate); `rename` names it anew, \
+         and its views follow it under that name. `from` takes a view's categories (hidden and overridden), filters and, a \
          plan's, view range, its phase and phase filter, its design options, its scale, detail level and visual style; \
-         `controls` is what views following it get from it (all eight unless it says) and cannot change for themselves: its \
+         `controls` is what views following it get from it (all nine unless it says) and cannot change for themselves: its \
          categories, its filters, a plan's view range, its phase with its phase filter, its design options, its scale (`scale` \
          command), its detail level (`detail`), its visual style (`visual_style`). `hide`, `show`, `categories`, `filters`, \
-         `phase`, `phase_filter`, `options`, `scale`, `detail`, `visual_style` and `reset` change it as they change a view; \
+         `phase`, `phase_filter`, `options`, `scale`, `detail`, `visual_style`, `background_grid` and `reset` change it as they change a view; \
          `view_range` merges into its range. Changed, every view following it follows. Gone, they keep their own settings. \
          `name` alone reads one",
         view_template,
@@ -1470,7 +2100,8 @@ pub static ALL: &[Command] = &[
          `graphics` has it, without hidden) is how a phase filter draws what it says overridden; the first two statuses \
          start halftone and dashed red. Replies with the phases, `now` and the overrides",
         view_phases,
-    ),
+    )
+    .menu("Manage > Phasing"),
     edit(
         "phase_filter",
         "Phase Filter",
@@ -1481,7 +2112,8 @@ pub static ALL: &[Command] = &[
          Demolished and Show Previous + New; any may change. A new one starts by category throughout. One in use by a view or a \
          template can't be deleted. Replies with the filter",
         view_phase_filter,
-    ),
+    )
+    .menu("Manage > Phasing"),
     edit(
         "option",
         "Design Options",
@@ -1496,7 +2128,8 @@ pub static ALL: &[Command] = &[
          others' (and the set); `delete` deletes the set and every element in its options. Replies with the set (`deleted` \
          lists the elements that went)",
         design_options,
-    ),
+    )
+    .menu("Manage > Design Options"),
     Command {
         id: "measure",
         label: ui_msg!("Measure"),
@@ -1505,7 +2138,244 @@ pub static ALL: &[Command] = &[
                  and its `angle` in degrees from east, counter-clockwise; it changes nothing",
         run: measure,
         undoable: false,
+        menu: None,
+        files: Files::None,
     },
+    other(
+        "circuit",
+        "Size a Circuit",
+        "{load, apparent?, demand?, power_factor?, phases?: FN|FF|3F|3FN, system?: 127/220|220/380|230/400, use?: lighting|power, length?, \
+         method?, insulation?: pvc|epr, conductor?: flexible|rigid, ambient?, grouped?, bundle?, spacing?, soil?, section?, breaker?, \
+         drop_limit?, reduced_neutral?} one electrical circuit sized as NBR 5410:2004 asks, for copper: `load` in W (or VA with \
+         `apparent`), `demand` (0 to 1, 1) and `power_factor` (over 0 to 1, 1; a first value, not a claim about the load), `phases` \
+         (FN one phase and neutral, the default; FF; 3F; 3FN balanced), the voltage `system` (127/220), `use` (power: 2.5 mm² at least; \
+         lighting 1.5), `length` to the farthest load (mm; none: no drop is checked), the installation `method` of Tabela 33 (7: a \
+         conduit in masonry; also 1 to 8, 11, 11A, 61, 61A), `insulation` (pvc 70 °C, or epr 90 °C), `conductor` (flexible, the larger \
+         resistance; or rigid), `ambient` °C (30 in air, 20 in soil), `grouped` circuits in the conduit (this one included), `bundle` \
+         (method 11 cables bundled), `spacing` between buried conduits (mm) and `soil` resistivity (K·m/W), and a `section` (mm²) and \
+         `breaker` (A) already chosen, which are never made smaller. Replies with the design current, the section and breaker that give \
+         I_B ≤ I_n ≤ I_Z (which gives I_2 = 1.45 I_n ≤ 1.45 I_Z for the breakers of NBR NM 60898) with the drop within `drop_limit` (4 %), the current the section carries, the drop, \
+         the conductors (phases, neutral, protective), the factors, and what the chosen section and breaker give. It changes nothing; \
+         aluminium, trays, several layers, short circuit and harmonics are not checked. It has no shortcut: Revit has no tool for it",
+        circuit,
+    ),
+    other(
+        "conduit_fill",
+        "Conduit Fill",
+        "{section, phases?: FN|FF|3F|3FN, circuits?, reduced_neutral?, family?, size?} the fill of a conduit as NBR 5410 asks, for the \
+         conductors of a circuit (its phases, neutral and protective conductor, of `section` mm²) times `circuits` in the same conduit \
+         (1): their cross-sections by outside diameter over the conduit's inside, at most 53 % for one cable, 31 % for two, 40 % for \
+         three or more. `family` (pvc-thread, pvc-solder, steel-heavy, steel-rir; pvc-thread) and `size` (its mark, e.g. 3/4\"; none: \
+         the smallest that fits). The dimensions are the makers' own from their catalogues, each family naming maker, document, page \
+         and address; the inside diameter is the outside less twice the wall. The data covers the flexible 750 V PVC cable of 0.5 to \
+         240 mm² only: there is no `insulation` key, and a section above 240 mm² is `pending`, never guessed. `sections_mm2` lists the \
+         conductors of one circuit (`circuits` of them are in the conduit). Cable trays are not sized. It has no shortcut: Revit has no \
+         tool for it. It changes nothing",
+        conduit_fill,
+    ),
+    other(
+        "drain_size",
+        "Size a Sanitary Drain",
+        "{units?, fixtures?: {wc?, lav?, sink?, shower?, laundry?}, role?: branch|main|stack, slope?, floors?, min_dn?} the DN of a \
+         sanitary drain as NBR 8160 asks, by the fixture units (UHC) it carries: `units`, or `fixtures` counted (Tabela 3: a water \
+         closet 6 UHC and DN 100, a lavatory 1 and 40, a sink 3 and 50, a shower 2 and 40, a laundry tub 3 and 40; the drain is never \
+         smaller than the fixtures' own). `role`: a `branch` (ramal de esgoto, Tabela 5, the default), a `main` (subcoletor or coletor \
+         predial, Tabela 7 by `slope`, a fraction, 0.01 by default; DN 100 at least) or a `stack` (tubo de queda, Tabela 6 by the \
+         building's `floors`, up to three or more). `min_dn` is the largest drain flowing into it. Replies with the `dn`, what it \
+         carries (`capacity`) and the `minimum_dn` the fixtures ask. A blank in the standard's table means not allowed: DN 100 and 150 \
+         carry nothing in a building drain at 0.5 %, and a branch or a building drain never borrows the other's table. For a `main` \
+         every fixture given counts, where item 5.1.4.2 counts only the largest fixture of each bathroom in a residential building: pass `units` already \
+         reduced to follow it. It has no shortcut: Revit has no tool for it. It changes nothing",
+        drain_size,
+    ),
+    other(
+        "vent_size",
+        "Size a Sanitary Vent",
+        "{units, wc?, stack_dn?, length?, trap_dn?} the DN of a sanitary vent as NBR 8160 asks, by the units (UHC) of what it vents: a \
+         branch vent (ramal de ventilação, Tabela 8; `wc` says a water closet is in the group), or, with `stack_dn` (the DN of the \
+         stack or drain served) and `length` (mm, from its foot to its open end), a vent stack or header (Tabela 2). `trap_dn` adds the \
+         longest run from a trap of that DN to its vent (Tabela 1). It has no shortcut: Revit has no tool for it. It changes nothing",
+        vent_size,
+    ),
+    other(
+        "hydrant_size",
+        "Size Hydrants",
+        "{column?: 1-5, area?, type?: 1|2|3|4-40|4-65|5, hydrants?, inside?, nominal?, material?: steel|steel-wet|copper|pvc|pex, length?, rise?} \
+         hydrants and hose reels as IT 22/2025 of the CBPMESP asks. With `column` (of Tabela 3, by the occupation) and `area` (m², \
+         built) it replies the system type and the fire reserve (m³). With `type` (Tabela 2; 4 comes as 4-40 or 4-65 by its nozzle) \
+         it replies the design flow, that of the two most unfavourable jets (`hydrants`, 2 by default), and the head at the nozzle; \
+         with `inside` (mm) it also replies the speed (5 m/s at most), the Hazen-Williams head loss over `length` (m) of the \
+         `material` (Tabela 1: `steel` is black steel in a dry system, C 100, the lowest steel row and the default, `steel-wet` is galvanised or wet, C 120), the head needed at the start of the pipe with its `rise` (mm, up) and, with `nominal` (mm), whether \
+         the pipe is big enough (DN 65; DN 50 for types 1 and 2). `length` and `rise` are in millimetres. `need_mca` is the nozzle \
+         head + the head loss of the straight pipe + the rise: it leaves out the hose, the fittings and the pressure at the source \
+         (`need_covers` says so), and `ok` is only the nozzle head within 100 mca, the speed and the pipe's size (`ok_covers`), not \
+         a verdict on the design. A `type` that contradicts `column` and `area` is an error. Notes 1 and 2 of Tabela 3 (a system one type lower in some cases) are not applied. `region` is SP, the only one: this is the \
+         São Paulo rule, and no other state's. It has no shortcut: Revit has no tool for it. It changes nothing",
+        hydrant_size,
+    ),
+    other(
+        "network",
+        "Pipe Network",
+        "{system?, level?, tolerance?} the pipe network, worked out from the model and never stored: where pipes' ends and the \
+         pipe connectors of fixtures, fittings and valves meet. Points within `tolerance` mm (1 by default, 50 at most) are one node; a \
+         pipe's end or a connector on another pipe's length is a node too, splitting that pipe into two edges (the element stays \
+         whole); a fitting's or a valve's connectors are joined through it, a fixture's are not (its waste and its water are \
+         networks of their own). `system` keeps the networks that pipe system's pipes are in; `level` (a name, id or GUID) only \
+         that level's pipes and components. It replies `nodes` (`at`, what meets there: a pipe's `start` or `end`, a pipe `along` \
+         which it lies, a component's `connector` and its `domain`), `edges` (a pipe's piece and its `length`, or `through` a \
+         fitting), `groups` (the elements joined together, their pipes' systems and their connectors' domains), `open` (ends and \
+         connectors that meet nothing, as Revit's Show Disconnects marks) and `warnings`, which never refuse the model: \
+         `systems_meet` (pipes of two systems in one network), `domains_meet` (connectors of two domains, waste and cold water), \
+         `joined_mid_run` (a pipe met along its length, with no fitting) and `smaller_downstream` (in a network with a waste \
+         connector, a pipe leaving a node downhill narrower than one coming down to it). It has no shortcut: Revit has no tool for it. \
+         It changes nothing",
+        network,
+    ),
+    other(
+        "load_points",
+        "Residential Load Points",
+        "{rooms?: [{name, area, perimeter, kind?: bath|kitchen|service|dry|veranda|other, points?}], alternative?, standard?} the lighting \
+         and the general-use outlets (TUG) of a dwelling's rooms as NBR 5410:2004 item 9.5.2 asks. The numbers are data \
+         (`data/load-points.json`, one rule set for each standard, every row naming its source): `standard` names the set, \
+         `NBR 5410:2004` the default and only one so far, and the answer gives `standard`, `standard_source`, `lighting_source` and \
+         each room's `source`. The rooms are `rooms` (`area` in m², \
+         `perimeter` in millimetres, `points` the outlets the room has, the least it needs when absent) or, without it, the rooms of the \
+         model, measured inside the walls' finish, with the power outlets and the luminaires that stand in each (the room a \
+         component's point is in, at the walls' centre lines; standing in the last phase, primary design options): `tug_points` and \
+         `lighting_points` are those drawn, and a room with no luminaire is not `ok`. Where the model draws no outlet, or no \
+         luminaire, at all, that count is the least instead (`counted` says which were drawn). A room's kind is known by its name (Portuguese or English: banheiro, cozinha, copa, \
+         área de serviço, lavanderia, sala, dormitório, varanda…) unless `kind` gives it; a name that says none is `other`. Lighting: 1 \
+         ceiling point of 100 VA up to 6 m² and 60 VA more for each whole 4 m² above. Outlets: a bathroom 1; kitchen, pantry, service \
+         area, laundry one for each 3.5 m of perimeter; room, bedroom one for each 5 m; veranda 1; the others 1 up to 6 m² and one \
+         for each 5 m above. Power: in a bathroom, kitchen, pantry, service area or laundry 600 VA for each of the first 3 points and \
+         100 VA for the others; elsewhere 100 VA a point; on the points a room has. Where those rooms have more than 6 points \
+         together `alternative: true` takes 600 VA for the first 2 of each (`alternative_possible` says when). A kitchen or pantry \
+         also needs 2 outlets over the sink's counter (`counter_outlets`). Not applied: the exceptions to the lighting point and to \
+         a veranda's outlet, the placement of the outlets and the TUE (`not_covered`). It has no shortcut: Revit has no tool for it. \
+         It changes nothing",
+        load_points,
+    ),
+    other(
+        "dr_check",
+        "Check Residual-Current Protection",
+        "{circuits: [{name, points: [{place, kind, rating?, height?, outdoor?}], residual?, it_continuity?}], building?: residential|other} \
+         which circuits NBR 5410:2004 asks additional protection by a high-sensitivity residual-current device (DR, 30 mA at most) \
+         for. A circuit's `points` are what it serves: `place` is bath (a place with a bathtub or a shower), external, kitchen (or \
+         pantry-kitchen), laundry, service (service area), garage, wet (another wet internal area) or dry; `kind` is outlet, lighting or \
+         fixed (another point of use); `rating` an outlet's rated current in A (32 A at most is covered; unknown, it is taken as covered), \
+         `height` a light's in mm (in a dwelling a light 2500 mm up or more in the wet rooms is left out), `outdoor` an internal outlet \
+         that may feed equipment outdoors. It is needed where any point is in a bath place, an outlet is in an external area or may \
+         feed equipment outdoors, and, in a dwelling (the default `building`), any point is in a kitchen, laundry, service area, garage \
+         or wet internal area (outside a dwelling, only their outlets). `it_continuity` marks an IT circuit that must not be cut, for \
+         the safety of persons or to keep lives, which is left out (`exempt`). `residual` is the rated residual current of the device \
+         the circuit has, in mA: `ok` is whether it is 30 or less, and `missing` names the circuits that need one and have none. \
+         Not covered: the further rules for the volumes of a bathroom and for swimming pools (`not_covered`). It has no shortcut: \
+         Revit has no tool for it. It changes nothing",
+        dr_check,
+    ),
+    other(
+        "dps_check",
+        "Check Surge Protection",
+        "{region: AQ1|AQ2|AQ3, overhead?, accepted_risk?, risk_to_people?, purpose?: line|direct|both, earthing?: TT|TN-S|TN-C|IT, \
+         uo?, before_dr?, system?: 120/208|127/220|220/380|230/400|277/480|400/690, neutral?, phases?: 1|3, existing?, signal_lines?: [telephone|data|video|tv|antenna|interconnection]} surge protection (DPS) of \
+         a power line as NBR 5410:2004 asks. It is required where the line is `overhead` (wholly or partly, or the installation has an \
+         overhead line itself) and the `region` is AQ2 (more than 25 days of thunderstorms a year), or in any AQ3 region (5.4.2.1.1); \
+         `accepted_risk` is the project taking a calculated risk the standard allows, never where the omission may put people at risk \
+         (`risk_to_people`), and `exempt` says it was taken. When it is required the reply gives where it stands by its `purpose` \
+         (line, the default: surges the line carries and switching surges, at the entry or the main board; direct: lightning on the \
+         building, at the entry; both; `existing` adds the meter box of an existing individual unit), with `earthing` (and whether the \
+         line has a `neutral`, yes by default) the connection scheme or schemes of Figure 13, with `phases` (3 by default) the least \
+         nominal discharge current (5 kA for each mode; 20 kA three-phase or 10 kA single-phase between the neutral and the PE of \
+         scheme 3) and impulse current (12.5 kA; 50 or 25 kA there), and the connecting conductors (4 mm² copper at least, 16 mm² \
+         against direct lightning, 0.5 m in all). With `earthing`, `uc_min` is the least continuous operating voltage Uc of Tabela 49 for \
+         each pair of points the device connects (1.1 Uo; Uo between the neutral and the PE; √3 Uo phase to PE in IT; U in IT without a \
+         neutral), in volts when `uo`, the phase-to-neutral voltage, is given. `signal_lines` are the external signal lines, each protected at the entry. Not \
+         covered: the overcurrent device of the DPS (6.3.5.2.5) and coordination (`not_covered`). `before_dr` is for a DPS upstream of \
+         a DR, which in TT takes scheme 3 only (6.3.5.2.6 b); with `earthing` the reply also gives the follow current between neutral \
+         and PE and the short-circuit the DPS must withstand (6.3.5.2.4 e). It has no shortcut: Revit has no tool for it. It changes nothing",
+        dps_check,
+    ),
+    other(
+        "demand",
+        "Demand and Service Category",
+        "{utility: CPFL|ENEL|CELESC, building?: residential|other, system?: 127/220|220/380, area?, outlets?, lighting_points?, \
+         lighting_outlets?: {use, kw, pf?}, heaters?, boilers?, appliances?, stoves?: [{w, count?}], air_conditioners?: [{btu | va and w, \
+         count?}], air_use?: residential|commercial, motors?: [{cv, phases: 1|3 | kva and kw, count?}], special?: [{kind: arc_weld|\
+         resistance_weld|xray, kw, count?}], hydromassage?: [{w, count?}]} the demand D (kVA) of an installation and the category of \
+         service it asks of the `utility`, by that utility's own standard, since NBR 5410 gives no demand factors. `utility` is \
+         required: CPFL (GED 13 version 2.24, 18/09/2020: CPFL Paulista, Piratininga, Santa Cruz and RGE) or ENEL (ET 1569 version 01, \
+         29/01/2024) or CELESC (N-321.0001, revision of December 2025); any other is refused until its tables are added. \
+         CELESC, too, leaves the demand to the designer: `{utility: CELESC, network?: 220/380|220/440, installed_kw, phases?: \
+         1|2|3, demand_kva?}` gives the category of Tabela 01 by the installed load (A single-phase 220 V, M single-phase \
+         220/440 V, B two-phase, C three-phase), its breaker, phases and wires, the connection and entry branches and the \
+         earthing conductor; `phases` picks the supply an appliance asks for whatever the load. ENEL does not work out a \
+         demand, for its specification leaves it \
+         to the designer (item 7.7.2): `{utility: ENEL, network: aerial|aerial_120_240|underground|underground_submersible, installed_kw, \
+         phases?: 1|2|3, demand_kva?}` frames the supply by the installed load in kW: Anexo A (aerial, 127/220 V), C (aerial, 120/240 V), \
+         D (underground, surface, 127/220 V) or E (underground, submersible): the category, the power it makes available (E prints none and \
+         gives the junction box), the breaker, the connection and entry branches, the earthing conductor and the measurement; where two \
+         categories hold the load (B2 and C1 of A) `candidates` names both and `phases` picks one. `network: aerial_delta` (Anexo B, 120/240 V \
+         delta with a neutral) goes by `demand_current_a`, the designer's demand current in A, and gives the smallest breaker that holds it. \
+         `demand_kva` is carried as the designer gives it. For CPFL: `D = a + b + c + d + e + f + g + h + i`: a lighting and outlets (in a dwelling, `area` m² \
+         gives the least outlets of Tabela 2, or `outlets` above 250 m² (100 W each, and the kitchen's 3 of 600 W), and `lighting_points` of \
+         100 W; in another building `lighting_outlets` declares its `use` (auditorium, shop, barbershop, club, school, office, garage, hospital, \
+         hotel, church, industry, restaurant), kW and power factor, by Tabela 18), b `heaters` (showers, taps, instant heaters, irons: Tabela 4 \
+         by their number in all), c `boilers` (Tabela 5), d `appliances` (dryers, ovens, dishwashers, microwaves: Tabela 6), e `stoves` \
+         (Tabela 7), f `air_conditioners` (a `btu` of Tabela 8, or `va` and `w`; a factor of 1, or Tabela 9 for `air_use` commercial), g \
+         `motors` (a `cv` of Tabela 14 or 15 with its `phases`, or `kva` and `kw`; Tabela 10 by rank, the biggest first), h `special` \
+         equipment (Tabela 11, power factor 0.75), i `hydromassage` (Tabela 10). `w` is the power of one appliance in watts. It replies the \
+         installed load (kW), each term, D, and the `category` of Tabela 1A (`system` 127/220, the default) or 1B (220/380) with its breaker, \
+         cable, conduit and earthing conductor: by the installed load up to 25 kW, by D above, `null` where the table ends (75 kW; D of 76 \
+         or 82 kVA). Not covered: the other columns of Tabela 1, the cables of Tabelas 1D and 1E, and the starting of motors (Tabela 13) \
+         (`not_covered`). It has no shortcut: Revit has no tool for it. It changes nothing",
+        demand,
+    ),
+    other(
+        "water_size",
+        "Size Cold Water Pipes",
+        "{fixtures?: {wc, lav, sink, shower, laundry: count}, flow?, method?: weights|sum, dn?, length?, fittings?: {elbow90, elbow45, \
+         tee_through, tee_side, gate, globe, check: count}, pressure?, rise?} a cold water pipe of PVC soldável as NBR 5626 asks. The \
+         flow is `flow` (L/s), or the design flow of the `fixtures` by the `method` the project chooses: weights (the empirical \
+         method, Q = 0.3 √ΣP, never more than the fixtures' own flows; the default) or sum (every fixture at once). The fixture \
+         flows and weights are Tigre's (Manual Técnico, page 198), not the standard's; `wc` is the WC with a flush tank only (a flush-valve WC \
+         is not in the table here). Without `dn` it replies the smallest DN chosen by speed alone (3 m/s at most; the pressure is \
+         not used to choose it); with `dn`, whether that pipe keeps the speed. The head loss is Darcy-Weisbach (Colebrook, PVC at \
+         20 °C) over `length` (mm) plus the equivalent length of the `fittings`; with `pressure` (kPa, dynamic, upstream) and `rise` \
+         (mm, up) it replies the pressure left at the end, 10 kPa at least at a point of use, and `ok` covers both; without `pressure` \
+         `ok` is the speed alone (`ok_covers` says which). It has no shortcut: Revit has no tool for it. It changes nothing",
+        water_size,
+    ),
+    other(
+        "reservoir_size",
+        "Size Water Reservation",
+        "{daily_l? | people?, per_person_l?, days?, fire_l?, house?, lower_percent?, compartments?, fill_flow?, pumps?, towers?, \
+         smallest_l?, peak_l?} the reservation of a building as NBR 5626:2020 asks. The day's consumption is `daily_l` (litres), or \
+         `people` times `per_person_l`: the standard gives no litres per person, so it is the project's own assumption and the reply \
+         says so. The potable volume is `days` of it (1 by default, 24 h being the least; 3 at most unless the project shows how the \
+         quality is kept) and `fire_l` is kept apart and added (the project's and the fire brigade's, not the standard's). The reply \
+         has the refill flow (the day's consumption in 6 h, or 3 h with `house`, a single-family house) and checks each of one kind \
+         (current requirement, historical reference, engineering practice, configurable assumption): `fill_flow` (L/s) against that \
+         flow, `compartments` of an elevated reservoir (2 at least, a house excepted), `smallest_l` against `peak_l` (the greatest peak \
+         over a normal maintenance), `pumps` (2 independent at least) and, with `towers` of 2 or more, the spare pump. A check whose \
+         input is not given is `pending` and never stops the others; `ok` is that none failed. `lower_percent` splits the potable \
+         volume between the lower and the upper reservoir, a choice of the project's; the usual split is only a suggestion. It \
+         leaves out the pump's head and the recalque pipe. It changes nothing",
+        reservoir_size,
+    ),
+    other(
+        "storm_size",
+        "Size a Storm Drain",
+        "{kind: downpipe|horizontal, area?, rainfall?, flow?, outlet?: edge|funnel, gutter?, length?, slope?, inside?} a storm drain as \
+         NBR 10844 asks. The flow is `flow` (L/min), or the rain on `area` (m², as the standard counts a roof) at `rainfall` (mm/h; \
+         150 by default, which the standard allows for up to 100 m² only: above that `rainfall` is required): Q = I·A/60. A `downpipe` (condutor vertical) takes the inner diameter of the \
+         standard's Figure 3 abacuses by Q, the water depth in the gutter `gutter` (50 to 100 mm), its `length` (mm, 0.3 m or more) \
+         and the gutter's `outlet` (edge: sharp-edged, the default; funnel); 70 mm inside at least. A `horizontal` drain takes \
+         Manning at two thirds full (n 0.011, PVC only, from the standard's Table 2) at its `slope` (a fraction, 0.005 at least): the inner \
+         diameter it needs, and with `inside` (mm) whether that pipe carries the flow. Off the abacuses (more than 150 mm inside) \
+         nothing is read. A key that does not apply to the `kind`, or `flow` together with `area`, is an error. It has no shortcut: \
+         Revit has no tool for it. It changes nothing",
+        storm_size,
+    ),
     other(
         "library",
         "Library",
@@ -1526,14 +2396,16 @@ pub static ALL: &[Command] = &[
          none), and `plan` and `extent` ([[x, y], [x, y]] mm), the level's plan that shows them and where; it selects nothing \
          itself, a front end does",
         select_by_id,
-    ),
+    )
+    .menu("Manage > Select by ID"),
     other(
         "ids_of",
         "IDs of Selection",
         "{ids: [id or GUID, …]} what names each element: its `id`, its `guid`, its `ifc` GlobalId, its `category` and its \
          `name` (or type, number, mark)",
         ids_of,
-    ),
+    )
+    .menu("Manage > IDs of Selection"),
     other(
         "filter_selection",
         "Filter",
@@ -1787,6 +2659,9 @@ pub(crate) fn cable_carrier_check(s: &mut Session, p: &Value) -> R {
 
 fn catalogue_link(s: &mut Session, p: &Value) -> R {
     only("catalogue_link", p, &["path"])?;
+    if s.read_only.is_some() {
+        return Err("Cannot change a catalogue binding in a read-only session".into());
+    }
     if p.get("path") == Some(&Value::Null) {
         let model = s.model_mut();
         model.catalogue_retired.clear();
@@ -1895,8 +2770,16 @@ fn catalogue_import(s: &mut Session, p: &Value) -> R {
 
 // ---------- parameters ----------
 
+/// The longest an error message is, in characters: a message that repeats what it was given (a list of a hundred thousand ids)
+/// is cut, and says by how much.
+const MAX_MESSAGE: usize = 2000;
+
 fn bad(cmd: &str, msg: impl std::fmt::Display) -> String {
-    format!("{cmd}: {msg}")
+    let text = format!("{cmd}: {msg}");
+    match text.char_indices().nth(MAX_MESSAGE) {
+        Some((cut, _)) => format!("{}… ({} more characters)", &text[..cut], text[cut..].chars().count()),
+        None => text,
+    }
 }
 
 fn absent(v: Option<&Value>) -> bool {
@@ -1932,6 +2815,21 @@ fn points(c: &str, p: &Value, key: &str) -> Result<Vec<P2>, String> {
     a.iter().map(|v| point(v).ok_or_else(|| bad(c, format!("`{key}`: {v} is not a point [x, y] in mm")))).collect()
 }
 
+/// `[x, y, z]` in mm, finite and within the model's limits.
+fn point3(v: &Value) -> Option<[f64; 3]> {
+    let [x, y, z] = v.as_array()?.as_slice() else { return None };
+    let p = [x.as_f64()?, y.as_f64()?, z.as_f64()?];
+    p.iter().all(|c| c.is_finite() && c.abs() <= MAX_COORD).then_some(p)
+}
+
+fn points3(c: &str, p: &Value, key: &str) -> Result<Vec<[f64; 3]>, String> {
+    let a = p.get(key).and_then(Value::as_array).ok_or_else(|| bad(c, format!("`{key}` [[x, y, z], …] is required")))?;
+    if a.len() > MAX_POINTS {
+        return Err(bad(c, format!("`{key}` has more than {MAX_POINTS} points")));
+    }
+    a.iter().map(|v| point3(v).ok_or_else(|| bad(c, format!("`{key}`: {v} is not a point [x, y, z] in mm")))).collect()
+}
+
 fn num(c: &str, p: &Value, key: &str) -> Result<Option<f64>, String> {
     match p.get(key) {
         v if absent(v) => Ok(None),
@@ -1960,6 +2858,17 @@ fn string(c: &str, p: &Value, key: &str) -> Result<Option<String>, String> {
         Some(v) => Err(bad(c, format!("`{key}` must be text of at most {MAX_TEXT} characters, got {v}"))),
         None => Ok(None),
     }
+}
+
+/// How a door or a window opens, by its name; blank, not said.
+fn operation(c: &str, name: &str) -> Result<Option<crate::model::Operation>, String> {
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::model::Operation::parse(name).map(Some).ok_or_else(|| {
+        let names: Vec<&str> = crate::model::Operation::ALL.iter().map(|o| o.name()).collect();
+        bad(c, format!("`operation` is one of {}, not `{name}`", names.join(", ")))
+    })
 }
 
 /// An element of `m` by its id, or its GUID.
@@ -2050,13 +2959,15 @@ fn view_param(c: &str, m: &Model, p: &Value, sheets: bool) -> Result<Id, String>
     let plan = || plan_param(c, m, p, "level").map(|(level, view)| m.elements.id(view.unwrap_or(level)).unwrap_or_default());
     match p.get("view") {
         v if absent(v) => plan(),
-        Some(Value::String(n)) if Guid::parse(n).is_none() => m
-            .elements
-            .iter()
-            .find_map(|(id, e)| {
-                (m.view_name(*id) == Some(n.as_str()) || sheets && matches!(e, Element::Sheet(sh) if sh.number == *n)).then_some(*id)
-            })
-            .ok_or_else(|| bad(c, format!("no view named `{n}`"))),
+        Some(Value::String(n)) if Guid::parse(n).is_none() => {
+            let sheet = || m.sheets().into_iter().find(|id| m.sheet(*id).is_some_and(|sh| sh.number == *n));
+            // The first by id, a view or (with `sheets`) a sheet.
+            let found = match (m.view_named(n), if sheets { sheet() } else { None }) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            found.ok_or_else(|| bad(c, format!("no view named `{n}`")))
+        }
         Some(v) => serde_json::from_value::<Guid>(v.clone())
             .ok()
             .and_then(|g| m.elements.id(g))
@@ -2078,8 +2989,13 @@ fn type_param(c: &str, p: &Value, m: &Model, category: &str) -> Result<String, S
 pub(crate) fn category(s: &str) -> String {
     // `structural column` and `structural_column` are `structuralcolumn`.
     let s: String = s.to_ascii_lowercase().chars().filter(char::is_ascii_alphanumeric).collect();
-    // `mass` ends in the plural's letter.
-    if s == "mass" || s == "masses" { "mass".into() } else { s.trim_end_matches('s').to_string() }
+    // `mass` and `switch` end in the plural's letter, and an accessory's plural isn't made by it.
+    match s.as_str() {
+        "mass" | "masses" => "mass".into(),
+        "switch" | "switches" => "switch".into(),
+        "pipeaccessory" | "pipeaccessories" => "pipeaccessory".into(),
+        _ => s.trim_end_matches('s').to_string(),
+    }
 }
 
 // ---------- derived values ----------
@@ -2117,6 +3033,19 @@ fn along(w: &Wall, p: P2) -> f64 {
 /// How far `p` is from a wall's centre line.
 fn off_centre(m: &Model, w: &Wall, p: P2) -> f64 {
     Axis::of(w).distance(p, walls::centre(m, w))
+}
+
+/// The nearest wall at `at` on any level, with the heights it spans: what a level that does not cut it should be told about.
+fn wall_elsewhere(m: &Model, at: P2) -> Option<(Id, f64, f64)> {
+    m.elements
+        .iter()
+        .filter_map(|(id, e)| match e {
+            Element::Wall(w) => Some((id, w, off_centre(m, w, at))),
+            _ => None,
+        })
+        .filter(|(_, w, d)| *d <= m.thickness(w) / 2.0 + 100.0)
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(id, w, _)| (*id, m.base_z(w), m.top_z(w)))
 }
 
 /// The wall a plan of `level` cuts nearest `at`, within its half thickness plus 100 mm of its centre
@@ -2174,9 +3103,42 @@ pub(crate) fn tidy(ring: &[P2]) -> Vec<P2> {
     ring
 }
 
-/// One past the largest number among `taken` ("1" when there is none).
+/// The next in the series `taken` is numbered in: one past its largest number, "1" when there is none.
+/// A series is plain numbers ("1", "2") or numbers after a prefix ("P1", "P2", "J-01"); a prefix
+/// counts as a series once two marks share it and they outnumber the plain numbers, so a lone "D2"
+/// among numbered doors stays an exception. Zero padding is kept ("P09" → "P10"), and the result
+/// is never one already taken. A mark longer than a name may be (`MAX_TEXT`) is no part of a series.
 pub(crate) fn next_number<'a>(taken: impl Iterator<Item = &'a str>) -> String {
-    taken.filter_map(|t| t.trim().parse::<u64>().ok()).max().unwrap_or(0).saturating_add(1).to_string()
+    let taken: Vec<&str> = taken.map(str::trim).collect();
+    // Each series by its prefix: how many marks it has, its largest number and the width its zero-padded ones keep.
+    let mut series: BTreeMap<&str, (usize, u64, usize)> = BTreeMap::new();
+    for t in taken.iter().filter(|t| t.len() <= MAX_TEXT) {
+        let digits = t.len() - t.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let (prefix, number) = t.split_at(t.len() - digits);
+        let Ok(n) = number.parse::<u64>() else { continue };
+        let s = series.entry(prefix).or_insert((0, 0, 0));
+        s.0 += 1;
+        s.1 = s.1.max(n);
+        if number.len() > 1 && number.starts_with('0') {
+            s.2 = s.2.max(digits);
+        }
+    }
+    let plain = series.get("").map_or(0, |s| s.0);
+    let (prefix, (_, last, width)) = series
+        .iter()
+        .filter(|(p, s)| p.is_empty() || (s.0 >= 2 && s.0 > plain))
+        .max_by_key(|(p, s)| (s.0, s.1, std::cmp::Reverse(**p)))
+        .map_or(("", (0, 0, 0)), |(p, s)| (*p, *s));
+    // A mark longer than a name may be starts no series, so no width passes MAX_TEXT; this keeps it so.
+    let width = if prefix.is_empty() { 0 } else { width.min(MAX_TEXT) };
+    let mut n = last;
+    loop {
+        n = n.saturating_add(1);
+        let next = format!("{prefix}{n:0width$}");
+        if !taken.contains(&next.as_str()) || n == u64::MAX {
+            return next;
+        }
+    }
 }
 
 /// Revit-style grid naming: the letter after the last grid's letter, else the next number.
@@ -2202,10 +3164,22 @@ fn next_grid_name(m: &Model) -> String {
 
 /// An element as agents read it: its fields (what it points at by GUID) plus its `id`, its `guid` and derived values.
 pub fn element_json(m: &Model, id: Id) -> Value {
+    element_json_with(m, id, &crate::rooms::Rooms::new(m))
+}
+
+/// [`element_json`], a room's boundary found among `rooms`: what one look at many elements shares.
+pub fn element_json_with(m: &Model, id: Id, rooms: &crate::rooms::Rooms) -> Value {
     let Some(e) = m.elements.get(id) else { return Value::Null };
     let mut extra = Map::new();
     extra.insert("id".into(), json!(id));
     extra.insert("guid".into(), json!(m.guid(id)));
+    // Room Bounding, which a file leaves out while it is on.
+    if let Element::Wall(Wall { room_bounding, .. })
+    | Element::Column(Column { room_bounding, .. })
+    | Element::StructuralColumn(Column { room_bounding, .. }) = e
+    {
+        extra.insert("room_bounding".into(), json!(room_bounding));
+    }
     // Its type's and its family's GUIDs, beside their names.
     e.clone().lib_refs_mut(&mut |kind, name| {
         let key = match kind {
@@ -2217,6 +3191,15 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             extra.insert(key.into(), json!(g));
         }
     });
+    // The room a component stands in, as Revit's Room parameter: by GUID, with its number and name for schedules and tags.
+    if let Element::Component(c) = e
+        && let Some(id) = rooms.room_at(c.level, c.at)
+        && let Some(Element::Room(r)) = m.elements.get(id)
+    {
+        extra.insert("room".into(), json!(m.guid(id)));
+        extra.insert("room_number".into(), json!(r.number));
+        extra.insert("room_name".into(), json!(r.name));
+    }
     match e {
         Element::CadImport(ci) => {
             if let Some(cad) = m.cads.get(&ci.cad) {
@@ -2234,6 +3217,11 @@ pub fn element_json(m: &Model, id: Id) -> Value {
         }
         Element::RoomSeparator(rs) => {
             extra.insert("length".into(), json!(hundredth(rs.start.dist(rs.end))));
+        }
+        Element::Rebar(rb) => {
+            let length = rebar::length(&rb.path);
+            extra.insert("length".into(), json!(hundredth(length)));
+            extra.insert("weight_kg".into(), json!((rebar::weight_kg(rb.diameter, length) * 1000.0).round() / 1000.0));
         }
         Element::PointCloud(pc) => {
             if let Some(cloud) = m.clouds.get(&pc.cloud) {
@@ -2257,6 +3245,9 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             if let (Some(t), Some(w)) = (m.opening_type(e), m.wall(o.host)) {
                 extra.insert("width".into(), json!(t.width));
                 extra.insert("height".into(), json!(t.height));
+                if let Some(op) = t.operation {
+                    extra.insert("operation".into(), json!(op.name()));
+                }
                 extra.insert("level".into(), json!(w.level));
                 extra.insert("at".into(), json!(m.anchor(id)));
                 // Of a family: every parameter's value, worked out.
@@ -2272,11 +3263,18 @@ pub fn element_json(m: &Model, id: Id) -> Value {
         }
         Element::Dimension(d) => {
             extra.insert("values".into(), json!(m.dimension_values(d).into_iter().map(hundredth).collect::<Vec<_>>()));
+            extra.insert("labels".into(), json!(m.dimension_labels(d)));
         }
         // Every parameter's value, worked out, and how high it reaches over its base.
         Element::Component(cp) => {
             if let Some(v) = m.families.get(&cp.family).and_then(|f| f.values(&cp.type_name, &cp.params).ok()) {
                 extra.insert("values".into(), values_json(v));
+            }
+            // What it draws and where it joins a system, as its family's connectors say for its type, placed where it
+            // stands: none for a family with none.
+            let cs = m.component_connectors(cp);
+            if !cs.is_empty() {
+                extra.insert("connectors".into(), Value::Array(cs.iter().map(connector_json).collect()));
             }
             let base = m.elevation(cp.level) + cp.offset;
             let top = m.component_pieces(cp).iter().map(|p| p.top).fold(base, f64::max);
@@ -2347,7 +3345,16 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             extra.insert("outline".into(), json!(outline.into_iter().map(micron).collect::<Vec<_>>()));
         }
         Element::Sheet(sh) => {
+            // Which title block it's drawn with, the built-in one ("") too, which the file leaves out.
+            extra.insert("title_block".into(), json!(sh.title_block));
             extra.insert("paper".into(), json!(paper(&sh.size)));
+            // What its title block's fields say, filled in; and which of them are its own to give.
+            extra.insert("title_values".into(), json!(sheet::title_values(m, id)));
+            if let Some(tb) = m.title_blocks.get(&sh.title_block) {
+                let own: Vec<&str> =
+                    tb.fields.iter().filter(|f| f.scope == crate::titleblock::Scope::Sheet).map(|f| f.key.as_str()).collect();
+                extra.insert("sheet_fields".into(), json!(own));
+            }
             let on: Vec<Id> =
                 m.elements.iter().filter(|(_, e)| matches!(e, Element::Viewport(v) if m.same(v.sheet, id))).map(|(id, _)| *id).collect();
             extra.insert("viewports".into(), json!(on));
@@ -2364,7 +3371,7 @@ pub fn element_json(m: &Model, id: Id) -> Value {
         }
 
         Element::Tag(t) => {
-            extra.insert("text".into(), json!(m.tag_text(t)));
+            extra.insert("text".into(), json!(m.tag_text_with(t, rooms)));
             extra.insert("level".into(), json!(m.level_of(e)));
             extra.insert("at".into(), json!(m.anchor(t.host).map(|a| a + t.offset)));
         }
@@ -2373,11 +3380,10 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             let left: f64 = m.floor_slabs(f).iter().map(|(face, rise)| area(&m.less_shafts(face, *rise).0)).sum();
             extra.insert("area_m2".into(), json!(m2(left)));
             extra.insert("thickness".into(), json!(m.types.floor.get(&f.type_name).map_or(0.0, |t| t.thickness)));
-            // How high its top is, at its lowest and its highest.
-            let top = m.floor_top(f);
-            let (lo, hi) =
-                f.boundary.iter().map(|q| top.at(*q)).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), z| (lo.min(z), hi.max(z)));
-            extra.insert("top".into(), json!([hundredth(lo), hundredth(hi)]));
+            // What it holds, less its openings and the shafts through it: under a variable layer, less where its top falls.
+            extra.insert("volume_m3".into(), json!((m.floor_volume(f) / 1e6).round() / 1e3));
+            // How high its top is, at its lowest and its highest, its shape's points too.
+            extra.insert("top".into(), top_range(m, f));
             // Where its top's model pattern starts and how far it's turned: shown at their defaults too, to be set by modify.
             extra.insert("pattern_origin".into(), json!(f.pattern_origin));
             extra.insert("pattern_angle".into(), json!(f.pattern_angle));
@@ -2405,13 +3411,21 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             extra.insert("levels".into(), json!(m.mass_slices(ms).iter().map(|(l, _, _)| *l).collect::<Vec<Id>>()));
         }
         Element::Room(r) => {
-            let region = m.room_region(r);
+            let bound = rooms.bound(r, m.room_area);
+            if let Err(Unbound::Shared(other)) = bound {
+                extra.insert("shares_space_with".into(), json!(other));
+            }
+            let region = bound.ok();
             extra.insert("enclosed".into(), json!(region.is_some()));
             extra.insert("area_m2".into(), json!(region.as_ref().map_or(0.0, |g| m2(g.area()))));
             extra.insert("perimeter_m".into(), json!(region.as_ref().map_or(0.0, |g| (g.perimeter() / 10.0).round() / 100.0)));
+            let height = m.room_height(r);
+            extra.insert("unbounded_height".into(), json!(height));
+            extra.insert("volume_m3".into(), json!(region.as_ref().map_or(0.0, |g| (g.area() * height / 1e7).round() / 100.0)));
         }
-        Element::Text(_) => {
+        Element::Text(n) => {
             extra.insert("level".into(), json!(m.level_of(e)));
+            extra.insert("size".into(), json!(m.text_types.get(&n.type_name).map(|t| t.size)));
         }
         Element::DetailGroup(g) => {
             extra.insert("members".into(), json!(m.detail_groups.get(&g.type_name).map_or(0, |t| t.members.len())));
@@ -2434,6 +3448,12 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             extra.insert("length".into(), json!(hundredth(length)));
             extra.insert("level".into(), json!(m.level_of(e)));
         }
+        Element::Spot(sp) if sp.slope => {
+            let read = m.spot_slope(sp);
+            extra.insert("slope".into(), json!(read.map(|(f, _)| hundredth(f))));
+            extra.insert("toward".into(), json!(read.and_then(|(_, d)| d).map(|d| [hundredth(d.0), hundredth(d.1)])));
+            extra.insert("level".into(), json!(m.level_of(e)));
+        }
         Element::Spot(sp) => {
             extra.insert("elevation".into(), json!(m.spot_value(sp).map(hundredth)));
             extra.insert("level".into(), json!(m.level_of(e)));
@@ -2442,12 +3462,14 @@ pub fn element_json(m: &Model, id: Id) -> Value {
             extra.insert("loaded".into(), json!(m.loaded.contains_key(&l.path)));
             extra.insert("elements".into(), json!(m.loaded.get(&l.path).map(|o| o.elements.len())));
         }
-        Element::Level(_)
-        | Element::Grid(_)
-        | Element::Schedule(_)
-        | Element::View3D(_)
-        | Element::PlanView(_)
-        | Element::ElectricalLine(_) => {}
+        // Its Computation Height, which its JSON leaves out at the usual 1200 mm.
+        Element::Level(l) => {
+            extra.insert("computation_height".into(), json!(l.computation_height));
+        }
+        Element::Dimension3D(d) => {
+            extra.insert("length".into(), json!(hundredth(crate::dims3d::length(d))));
+        }
+        Element::Grid(_) | Element::Schedule(_) | Element::View3D(_) | Element::PlanView(_) | Element::ElectricalLine(_) => {}
         Element::ElectricalTerminal(t) => {
             extra.insert("name".into(), json!(t.name));
             extra.insert("purpose".into(), json!(t.purpose));
@@ -2469,6 +3491,31 @@ pub fn element_json(m: &Model, id: Id) -> Value {
 /// Project files this large or larger are refused.
 const MAX_FILE: u64 = 256 << 20;
 
+/// IFC files this large or larger are refused. Reading one peaks at about 12 to 14 times its size in memory (measured on
+/// Revit-like, meshed and BIMCraft-written files of 17 to 81 MB), so one just under 512 MiB stays under about 8 GB.
+const MAX_IFC: u64 = 512 << 20;
+
+/// Files of `extension` (in lower case) this large or larger are refused by `open`: an IFC file at [`MAX_IFC`], a project at
+/// [`MAX_FILE`].
+fn max_file(extension: &str) -> u64 {
+    if extension == "ifc" { MAX_IFC } else { MAX_FILE }
+}
+
+#[cfg(test)]
+mod max_file_tests {
+    use super::*;
+
+    #[test]
+    fn an_ifc_file_may_be_twice_as_large_as_a_project_so_issue_264s_opens() {
+        // Issue #264: an IFC file of 282,607,463 bytes was refused as too large; a project or a family keeps its 256 MiB.
+        assert!(max_file("ifc") > 282_607_463);
+        assert_eq!(max_file("ifc"), 512 << 20);
+        for other in ["bimcraft", "json", "", "ifczip", "IFC"] {
+            assert_eq!(max_file(other), MAX_FILE, "{other}");
+        }
+    }
+}
+
 fn ext(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
 }
@@ -2485,8 +3532,8 @@ fn new(s: &mut Session, p: &Value) -> R {
 }
 
 fn language_param(c: &str, code: &str) -> Result<Language, String> {
-    Language::from_code(code)
-        .ok_or_else(|| bad(c, format!("`{code}` is no language here; there are en (English), pt (Português) and es (Español)")))
+    let codes = "en, pt, es or sv";
+    Language::from_code(code).ok_or_else(|| bad(c, format!("`{code}` is no language here; use {codes}")))
 }
 
 fn language(s: &mut Session, p: &Value) -> R {
@@ -2527,23 +3574,35 @@ fn with_links(s: &mut Session, mut reply: Value) -> Value {
 /// `open`, but for what its links read.
 fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: bool) -> R {
     let c = "open";
-    let size = std::fs::metadata(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
-    if size >= MAX_FILE {
-        return Err(bad(c, format!("{} is too large ({size} bytes)", path.display())));
+    let size = std::fs::metadata(&path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
+    let most = max_file(&ext(&path));
+    if size >= most {
+        return Err(bad(c, format!("{} is too large ({size} bytes; `open` takes one under {most})", path.display())));
     }
     // IFC comes in as a new project: saving it asks where.
     if ext(path) == "ifc" {
         let bytes = std::fs::read(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         let stem = path.file_stem().map_or_else(|| "Project".into(), |s| s.to_string_lossy().into_owned());
-        let i = crate::import::ifc(&bytes, &stem).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+        let file = crate::step::parse(&bytes).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+        let seed = crate::import::seed(&bytes);
+        // The text is freed before the model is built from it, so the two are not both held at the peak.
+        drop(bytes);
+        let i = crate::import::from_step(file, &stem, seed).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for e in i.model.elements.values() {
             *counts.entry(e.category()).or_default() += 1;
         }
-        let reply =
-            json!({"path": path, "name": i.model.name, "format": i.schema, "elements": counts, "skipped": i.skipped, "moved": i.moved});
+        // What came in as generic components, of the IFC classes BIMCraft has no element for.
+        let generic = i
+            .model
+            .elements
+            .values()
+            .filter(|e| matches!(e, Element::Component(c) if i.model.families.get(&c.family).is_some_and(|f| f.remembered().is_some())))
+            .count();
+        let reply = json!({"path": path, "name": i.model.name, "format": i.schema, "elements": counts, "generic": generic,
+            "skipped": i.skipped, "moved": i.moved});
         s.reset(i.model, None);
-        s.read_only = read_only;
+        s.catalogue_read_only = read_only;
         return Ok(reply);
     }
     let text = std::fs::read_to_string(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
@@ -2574,7 +3633,7 @@ fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: 
         .map(|path| crate::ods::sync_bound(&mut m, path, false, false, &BTreeSet::new()));
     let name = m.name.clone();
     s.reset(m, project);
-    s.read_only = read_only;
+    s.catalogue_read_only = read_only;
     let mut reply = json!({"path": path, "name": name});
     let missing: Vec<_> = s.model.library.entries().filter(|(_, entry)| entry.placeholder).map(|(_, entry)| entry.guid).collect();
     if !missing.is_empty() {
@@ -2808,6 +3867,11 @@ fn save(s: &mut Session, p: &Value) -> R {
         std::fs::write(&path, crate::ifc::export(&s.model)).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         return Ok(json!({"path": path, "format": "IFC4"}));
     }
+    if format == "glb" {
+        let out = crate::gltf::export(&crate::link::seen(&s.model)).map_err(|e| bad(c, e))?;
+        std::fs::write(&path, &out.bytes).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+        return Ok(json!({"path": path, "format": "glTF 2.0", "elements": out.nodes, "triangles": out.triangles}));
+    }
     if format == "pdf" {
         let seen = crate::link::seen(&s.model);
         let m = &*seen;
@@ -2836,6 +3900,9 @@ fn save(s: &mut Session, p: &Value) -> R {
     snapshot.check().map_err(|e| bad(c, e))?;
     let text = snapshot.to_json().map_err(|e| bad(c, e))?;
     crate::autosave::atomic_write(&path, &text).map_err(|e| bad(c, e))?;
+    if s.read_only.is_some() {
+        return Ok(json!({"path": path, "format": "bimcraft"}));
+    }
     let first_catalogue = s.catalogue_untitled.take();
     let previous = s.path.replace(path.clone());
     if first_catalogue.is_some() {
@@ -2870,7 +3937,7 @@ fn recover(s: &mut Session, p: &Value) -> R {
     let project = string("recover", p, "project")?.map(PathBuf::from);
     let path = PathBuf::from(string("recover", p, "path")?.ok_or("recover: `path` is required")?);
     // Its links and approved catalogue belong to the project, not the backup.
-    let read_only = s.read_only;
+    let read_only = s.catalogue_read_only;
     let result = open_file(s, &path, project, read_only)?;
     Ok(with_links(s, result))
 }
@@ -2911,6 +3978,116 @@ fn png_reply(c: &str, p: &Value, png: Vec<u8>, mut info: Value) -> R {
     Ok(info)
 }
 
+/// A family drawn on its own: its `type` standing in a model of its own — in a wall `wall_thickness`
+/// mm thick if it's a door's or a window's, on a floor of its own footprint if it isn't — and that
+/// model drawn by [`render_view`]. Nothing of this project's is touched and nothing is left in it:
+/// what a preview costs the project is nothing, no element and no undo step.
+fn family_preview(s: &Session, p: &Value) -> R {
+    let c = "render";
+    let name = string(c, p, "family")?.ok_or_else(|| bad(c, "`family` is required: the family to draw"))?;
+    let family = s.model.families.get(&name).ok_or_else(|| bad(c, format!("there's no family `{name}`; `inspect` lists them")))?.clone();
+    let ty = string(c, p, "type")?.unwrap_or_else(|| family.types.keys().next().cloned().unwrap_or_default());
+    if ty.is_empty() {
+        return Err(bad(c, format!("family `{name}` has no type to draw")));
+    }
+    if !family.types.contains_key(&ty) {
+        let types: Vec<&str> = family.types.keys().map(String::as_str).collect();
+        return Err(bad(c, format!("family `{name}` has no type `{ty}` (there are: {})", types.join(", "))));
+    }
+    let mode = string(c, p, "mode")?.unwrap_or_else(|| "3d".into());
+    if !matches!(mode.as_str(), "3d" | "plan" | "elevation") {
+        return Err(bad(c, format!("`mode` is 3d, plan or elevation, not `{mode}`")));
+    }
+    let wall = num(c, p, "wall_thickness")?.unwrap_or(crate::family::DEFAULT_WALL);
+    if !(0.0..MAX_COORD).contains(&wall) {
+        return Err(bad(c, format!("`wall_thickness` must be mm above zero and up to {MAX_COORD}, got {wall}")));
+    }
+    // What its type comes to, so the host is sized to the opening it makes.
+    let values = family
+        .values_in(&ty, &BTreeMap::new(), crate::family::DEFAULT_WALL)
+        .map_err(|e| bad(c, format!("family `{name}` type `{ty}`: {e}")))?;
+    let number = |what: &str| match values.get(what) {
+        Some(crate::family::Val::Number(x)) => Some(*x),
+        _ => None,
+    };
+    // A model of its own, holding the project's materials so what's drawn looks as it would here.
+    let mut scratch = Session::new();
+    {
+        let m = scratch.model_mut();
+        m.materials = s.model.materials.clone();
+        m.images = s.model.images.clone();
+        m.families.insert(name.clone(), family.clone());
+    }
+    let made = |r: R, what: &str| r.map_err(|e| bad(c, format!("{what}: {e}")));
+    if family.category.hosted() {
+        // A wall as thick as asked, long and tall enough for the opening to stand whole in it.
+        let width = number(crate::family::WIDTH).unwrap_or(1000.0);
+        let height = number(crate::family::HEIGHT).unwrap_or(2100.0);
+        let span = (width * 2.0 + 1000.0).max(4000.0);
+        let tall = (height + 900.0).max(3000.0);
+        made(
+            scratch.execute("type", &json!({"category": "wall", "name": "Family Preview Wall", "thickness": wall})),
+            "a wall of that thickness",
+        )?;
+        made(
+            scratch.execute(
+                "wall",
+                &json!({"points": [[-span / 2.0, 0.0], [span / 2.0, 0.0]], "type": "Family Preview Wall", "height": tall}),
+            ),
+            "a wall for it to stand in",
+        )?;
+        let kind = if family.category == crate::family::Category::Door { "door" } else { "window" };
+        made(scratch.execute(kind, &json!({"at": [0.0, 0.0], "family": name, "type": ty})), "the opening")?;
+    } else {
+        // A floor over its own footprint, so it stands on something and the picture has a ground.
+        let mut box_ = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for shape in family.shapes(&values) {
+            box_[0] = box_[0].min(shape.min[0]);
+            box_[1] = box_[1].min(shape.min[1]);
+            box_[2] = box_[2].max(shape.max[0]);
+            box_[3] = box_[3].max(shape.max[1]);
+        }
+        if !box_[0].is_finite() || box_[2] < box_[0] || box_[3] < box_[1] {
+            box_ = [-1000.0, -1000.0, 1000.0, 1000.0];
+        }
+        let pad = 500.0;
+        let (x0, y0, x1, y1) = (box_[0] - pad, box_[1] - pad, box_[2] + pad, box_[3] + pad);
+        made(scratch.execute("floor", &json!({"boundary": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]})), "a floor under it")?;
+        made(scratch.execute("component", &json!({"family": name, "type": ty, "at": [0.0, 0.0]})), "the component")?;
+    }
+    // What the picture is of, without what the preview doesn't take: `render` draws this model,
+    // from where the mode asks.
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        for key in ["family", "mode", "type", "wall_thickness", "ceiling", "eye_elevation", "revision"] {
+            o.remove(key);
+        }
+        match mode.as_str() {
+            "plan" => {
+                for key in ["view", "azimuth", "elevation"] {
+                    o.remove(key);
+                }
+            }
+            // Front-on: as seen from the north (+y), level with the model.
+            "elevation" => {
+                o.insert("view".into(), json!("{3D}"));
+                o.insert("azimuth".into(), json!(90.0));
+                o.insert("elevation".into(), json!(0.0));
+            }
+            _ => {
+                o.insert("view".into(), json!("{3D}"));
+            }
+        }
+    }
+    let mut reply = render_view(&mut scratch, &q)?;
+    reply["view"] = json!(name);
+    reply["kind"] = json!(format!("family {mode} preview"));
+    reply["family"] = json!(name);
+    reply["type"] = json!(ty);
+    reply["mode"] = json!(mode);
+    Ok(reply)
+}
+
 fn render_view(s: &mut Session, p: &Value) -> R {
     let revision = s.revision();
     if let Some(value) = p.get("revision") {
@@ -2926,6 +4103,11 @@ fn render_view(s: &mut Session, p: &Value) -> R {
 
 fn render_snapshot(s: &Session, p: &Value) -> R {
     let c = "render";
+    // A family on its own, in a model of its own: this project isn't touched by it. `mode` and the
+    // rest say so too, for a reply that means a family's preview but forgot to name one.
+    if ["family", "type", "mode", "wall_thickness"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        return family_preview(s, p);
+    }
     // What its links build is in the picture.
     let seen = crate::link::seen(&s.model);
     let m = &*seen;
@@ -2933,16 +4115,55 @@ fn render_snapshot(s: &Session, p: &Value) -> R {
     let (w, h) = (side("width", 1600)?, side("height", 1000)?);
     let (w3, h3) = (w.min(view3d::MAX_SIDE), h.min(view3d::MAX_SIDE));
     let view = p.get("view");
-    if matches!(view, Some(Value::String(v)) if v.eq_ignore_ascii_case("{3D}") || v.eq_ignore_ascii_case("3D")) {
+    // A 3D view: the default `{3D}`, or any view named or id'd as one (a camera view made with `camera`). Its own camera
+    // stands the picture where it looks from; the default fitted over the model when it has none.
+    let three_d = match view {
+        Some(Value::String(v)) if v.eq_ignore_ascii_case("{3D}") || v.eq_ignore_ascii_case("3D") => Some(m.default_3d()),
+        Some(Value::String(v)) if Guid::parse(v).is_none() => {
+            m.elements.iter().find_map(|(id, e)| matches!(e, Element::View3D(v3) if v3.name == *v).then_some(*id)).map(Some)
+        }
+        Some(v) => serde_json::from_value::<Guid>(v.clone())
+            .ok()
+            .and_then(|g| m.elements.id(g))
+            .filter(|id| matches!(m.elements.get(id), Some(Element::View3D(_))))
+            .map(Some),
+        _ => None,
+    };
+    if let Some(three) = three_d {
         let (azimuth, elevation) = (num(c, p, "azimuth")?.unwrap_or(view3d::AZIMUTH), num(c, p, "elevation")?.unwrap_or(view3d::ELEVATION));
         let scene = view3d::Scene::new(m);
         let look = Look::of_3d(m);
-        let png = scene.render_in(&scene.fit_in(azimuth, elevation, w3, h3, &look), &[], &look).png().map_err(|e| bad(c, e))?;
+        // Through the view's lens, if it's in perspective, and from as high as the eye is put.
+        let held = three.and_then(|v| match m.elements.get(v) {
+            Some(Element::View3D(v3)) => Some(v3.clone()),
+            _ => None,
+        });
+        let lens = held.as_ref().and_then(View3D::lens);
+        let name = held.as_ref().map_or_else(|| "{3D}".to_string(), |v| v.name.clone());
+        let camera = held.as_ref().and_then(|v| v.camera);
+        // A camera view is seen from its eye at its target through its lens; the default is fitted over the model.
+        let fitted = match (camera, lens) {
+            (Some(cam), Some(lens)) => view3d::Camera::at(cam.eye, cam.target, lens, w3, h3),
+            _ => scene.fit_from(view3d::Camera { lens, ..scene.fit_in(azimuth, elevation, w3, h3, &look) }, &look),
+        };
+        let cam = match (num(c, p, "eye_elevation")?, lens) {
+            (Some(z), Some(_)) if z.is_finite() && z.abs() <= MAX_COORD => fitted.with_eye_elevation(z),
+            (Some(z), Some(_)) => return Err(bad(c, format!("`eye_elevation`: {z} mm is not a usable height"))),
+            (Some(_), None) => return Err(bad(c, "a parallel 3D view has no eye to raise: turn it to perspective first (`perspective`)")),
+            (None, _) => fitted,
+        };
+        let mut image = scene.render_in(&cam, &[], &look);
+        // Its dimensions, over the picture.
+        if let Some(v) = three {
+            crate::dims3d::paint(&mut image, &crate::dims3d::marks(m, v, &cam, &look, crate::dims3d::SCREEN));
+        }
+        let png = image.png().map_err(|e| bad(c, e))?;
         return png_reply(
             c,
             p,
             png,
-            json!({"width": w3, "height": h3, "view": "{3D}", "kind": "3D view", "azimuth": azimuth, "elevation": elevation}),
+            json!({"width": w3, "height": h3, "view": name, "kind": "3D view", "azimuth": cam.azimuth, "elevation": cam.elevation,
+                "lens": lens, "eye_elevation": cam.eye_elevation(), "eye": camera.map(|c| c.eye), "target": camera.map(|c| c.target)}),
         );
     }
     // A section or elevation, by name or id.
@@ -3008,8 +4229,11 @@ fn schedule(s: &mut Session, p: &Value) -> R {
     let m = &s.model;
     let name = string(c, p, "name")?.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let cat = match string(c, p, "category")? {
-        Some(k) if !schedule::categories().contains(&category(&k).as_str()) => {
-            return Err(bad(c, format!("`{k}` isn't a category schedules are of; there are: {}", schedule::categories().join(", "))));
+        Some(k) if !schedule::categories().contains(&category(&k).as_str()) && category(&k) != schedule::MULTI => {
+            return Err(bad(
+                c,
+                format!("`{k}` isn't a category schedules are of; there are: {}, {}", schedule::categories().join(", "), schedule::MULTI),
+            ));
         }
         k => k.map(|k| category(&k)),
     };
@@ -3043,6 +4267,11 @@ fn schedule(s: &mut Session, p: &Value) -> R {
         serde_json::from_value(v).map_err(|e| bad("schedule", format!("`{key}`: {e}")))
     }
     let mut changed = false;
+    // A multi-category one's categories, as elements name theirs; `[]`, every built one.
+    if let Some(v) = p.get("categories").filter(|v| !v.is_null()) {
+        let given: Vec<String> = read("categories", v.clone())?;
+        (sc.categories, changed) = (given.iter().map(|k| category(k)).collect(), true);
+    }
     if let Some(v) = named("fields", "name")? {
         (sc.fields, changed) = (read("fields", v)?, true);
     }
@@ -3074,11 +4303,21 @@ fn schedule(s: &mut Session, p: &Value) -> R {
         if changed {
             m.check().map_err(|e| bad(c, e))?;
         }
-        std::fs::write(&path, crate::schedule::to_csv(&t)).map_err(|e| bad(c, format!("{path}: {e}")))?;
+        // A workbook for a path ending .xlsx, else CSV.
+        let bytes = if path.to_lowercase().ends_with(".xlsx") {
+            let sheet = if sc.name.is_empty() { category(&sc.of) } else { sc.name.clone() };
+            crate::schedule::to_xlsx(&t, &sheet)
+        } else {
+            crate::schedule::to_csv(&t).into_bytes()
+        };
+        std::fs::write(&path, bytes).map_err(|e| bad(c, format!("{path}: {e}")))?;
     }
     let columns: Vec<String> = t.columns.iter().map(|col| crate::schedule::heading(Units::Millimetres, col)).collect();
     let available: Vec<String> = crate::schedule::fields(m, &category(&sc.of)).into_iter().map(|(n, _)| n).collect();
     let mut out = json!({"id": id, "name": sc.name, "category": category(&sc.of), "columns": columns, "rows": t.rows, "elements": t.ids, "available": available});
+    if category(&sc.of) == schedule::MULTI {
+        out["categories"] = json!(schedule::listed(&sc));
+    }
     if let Some(totals) = t.totals {
         out["totals"] = json!(totals);
     }
@@ -3114,6 +4353,8 @@ fn drawn_category(c: &str, given: &str) -> Result<String, String> {
                     .chain(&graphics::SCANS)
                     .chain(&graphics::IMPORTED)
                     .copied()
+                    .chain([graphics::COMPONENT])
+                    .chain(graphics::SUBCATEGORIES.iter().map(|s| s.key))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -3184,6 +4425,7 @@ fn edit_graphics(c: &str, m: &Model, p: &Value, g: &mut Graphics, of_template: b
             (touches_filters, Group::Filters, "filters"),
             (touches_phase, Group::Phase, "phase and phase filter"),
             (touches_options, Group::Options, "design options"),
+            (p.get("background_grid").is_some(), Group::BackgroundGrid, "background grids"),
         ] {
             if touches && let Some(t) = follows(group) {
                 return Err(bad(
@@ -3196,13 +4438,26 @@ fn edit_graphics(c: &str, m: &Model, p: &Value, g: &mut Graphics, of_template: b
     if flag(c, p, "reset")? {
         *g = Graphics::default();
     }
-    for name in drawn_categories(c, p, "hide")? {
-        g.categories.entry(name).or_default().hidden = true;
-    }
-    for name in drawn_categories(c, p, "show")? {
-        if let Some(o) = g.categories.get_mut(&name) {
-            o.hidden = false;
+    if let Some(patch) = p.get("background_grid") {
+        if patch.is_null() {
+            g.background_grid = Default::default();
+        } else if patch.is_object() {
+            let mut now = serde_json::to_value(g.background_grid).map_err(|e| bad(c, e))?;
+            merge(&mut now, patch);
+            g.background_grid = serde_json::from_value(now).map_err(|e| bad(c, format!("background grid: {e}")))?;
+        } else {
+            return Err(bad(c, "`background_grid` is an object, or null to restore defaults"));
         }
+    }
+    for name in drawn_categories(c, p, "hide")? {
+        let o = g.categories.entry(name).or_default();
+        (o.hidden, o.shown) = (true, false);
+    }
+    // A subcategory off unless shown is shown by saying so.
+    for name in drawn_categories(c, p, "show")? {
+        let o = g.categories.entry(name.clone()).or_default();
+        // Rooms are off in a 3D view unless shown there; shown, a plan draws them as it would.
+        (o.hidden, o.shown) = (false, graphics::off_unless_shown(&name) || graphics::OFF_IN_3D.contains(&name.as_str()));
         g.categories.retain(|_, o| !o.is_empty());
     }
     for id in drawn_elements(c, m, p, "hide_elements")? {
@@ -3351,7 +4606,9 @@ fn graphics_reply(g: &Graphics) -> Value {
     json!({
         "hidden": hidden, "categories": g.categories, "filters": g.filters, "layers": g.layers,
         "phase": g.phase, "phase_filter": g.phase_filter, "options": g.options,
-        "scale": g.scale, "detail": g.detail, "visual_style": g.style, "engineering": g.engineering,
+        "scale": g.scale, "detail": g.detail, "visual_style": g.style,
+        "background_grid": g.background_grid,
+        "engineering": g.engineering,
     })
 }
 
@@ -3465,6 +4722,245 @@ fn section_box(s: &mut Session, p: &Value) -> R {
     Ok(json!({"view": v, "on": b.on, "min": b.min, "max": b.max}))
 }
 
+fn perspective(s: &mut Session, p: &Value) -> R {
+    let c = "perspective";
+    let m = &s.model;
+    let default = absent(p.get("view"))
+        || matches!(p.get("view"), Some(Value::String(n)) if n.eq_ignore_ascii_case("{3D}") || n.eq_ignore_ascii_case("3D"));
+    // The default 3D view is made when it's first turned, as when its graphics first change.
+    let view = if default {
+        m.default_3d()
+    } else {
+        let v = view_param(c, m, p, false)?;
+        if !matches!(m.elements.get(v), Some(Element::View3D(_))) {
+            return Err(bad(c, format!("{} isn't a 3D view; only a 3D view is seen in perspective", view_title(m, v))));
+        }
+        Some(v)
+    };
+    let was = view.and_then(|v| match m.elements.get(v) {
+        Some(Element::View3D(v3)) => v3.perspective,
+        _ => None,
+    });
+    let on = match p.get("on") {
+        v if absent(v) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(v) => return Err(bad(c, format!("`on` must be true or false, got {v}"))),
+        None => true,
+    };
+    let lens = num(c, p, "lens")?.or(was.map(|w| w.lens)).unwrap_or(view3d::LENS);
+    let v = match view {
+        Some(v) => v,
+        None => s.model_mut().insert(Element::View3D(View3D::default_view())),
+    };
+    let set = Perspective { lens, on };
+    if let Some(Element::View3D(v3)) = s.model_mut().elements.get_mut(v) {
+        v3.perspective = Some(set);
+    }
+    Ok(json!({"view": v, "on": on, "lens": lens}))
+}
+
+fn graphic_display_options(s: &mut Session, p: &Value) -> R {
+    let c = "graphic_display_options";
+    let m = &s.model;
+    let default = absent(p.get("view"))
+        || matches!(p.get("view"), Some(Value::String(n)) if n.eq_ignore_ascii_case("{3D}") || n.eq_ignore_ascii_case("3D"));
+    // The default 3D view is made when its options first change, as when its graphics first change.
+    let view = if default {
+        m.default_3d()
+    } else {
+        let v = view_param(c, m, p, false)?;
+        if !matches!(m.elements.get(v), Some(Element::View3D(_))) {
+            return Err(bad(c, format!("{} isn't a 3D view; only a 3D view has graphic display options", view_title(m, v))));
+        }
+        Some(v)
+    };
+    let was = view
+        .and_then(|v| match m.elements.get(v) {
+            Some(Element::View3D(v3)) => Some(v3.display),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let on = |key: &str| match p.get(key) {
+        v if absent(v) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(bad(c, format!("`{key}` must be true or false, got {v}"))),
+        None => Ok(None),
+    };
+    let most = view3d::MAX_SILHOUETTE;
+    let silhouette = match p.get("silhouette") {
+        v if absent(v) => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|px| px.fract() == 0.0 && (0.0..=f64::from(most)).contains(px))
+                .map(|px| px as u32)
+                .ok_or_else(|| bad(c, format!("`silhouette` is how many px wide the outline is, a whole number 0 to {most}, got {v}")))?,
+        ),
+        None => None,
+    };
+    let now = view3d::DisplayOptions {
+        edges: on("edges")?.unwrap_or(was.edges),
+        silhouette: silhouette.unwrap_or(was.silhouette),
+        ambient_shadows: on("ambient_shadows")?.unwrap_or(was.ambient_shadows),
+    };
+    let view = match view {
+        None if now != was => Some(s.model_mut().insert(Element::View3D(View3D::default_view()))),
+        v => v,
+    };
+    if let (true, Some(v)) = (now != was, view)
+        && let Some(Element::View3D(v3)) = s.model_mut().elements.get_mut(v)
+    {
+        v3.display = now;
+    }
+    Ok(json!({"view": view, "edges": now.edges, "silhouette": now.silhouette, "ambient_shadows": now.ambient_shadows}))
+}
+
+/// `[x, y, z]` in mm within the model's limits, or an error naming `key`.
+fn point3_req(c: &str, p: &Value, key: &str) -> Result<[f64; 3], String> {
+    match p.get(key) {
+        v if absent(v) => Err(bad(c, format!("`{key}` [x, y, z] is required"))),
+        Some(v) => point3(v).ok_or_else(|| bad(c, format!("`{key}` must be a point [x, y, z] in mm, got {v}"))),
+        None => Err(bad(c, format!("`{key}` [x, y, z] is required"))),
+    }
+}
+
+fn camera(s: &mut Session, p: &Value) -> R {
+    let c = "camera";
+    let m = &s.model;
+    let eye_given = !absent(p.get("eye"));
+    let target_given = !absent(p.get("target"));
+    let view = p.get("view");
+    let named_view = !absent(view);
+    // The default 3D view asked for by name: it is made when it's first given a camera, as when its perspective is first
+    // turned; nothing exists yet to look up.
+    let default_3d = matches!(view, Some(Value::String(n)) if n.eq_ignore_ascii_case("{3D}") || n.eq_ignore_ascii_case("3D"));
+    // With a view and none of eye, target or lens, this reads the camera; it needs the view to exist. Otherwise the view is
+    // where the camera goes: given, a new default `{3D}`, or a new camera view made below.
+    let v = match view {
+        Some(_) if named_view && !default_3d => {
+            let id = view_param(c, m, p, false)?;
+            if !matches!(m.elements.get(id), Some(Element::View3D(_))) {
+                return Err(bad(c, format!("{} isn't a 3D view; a camera goes on a 3D view", view_title(m, id))));
+            }
+            Some(id)
+        }
+        Some(_) if named_view && default_3d => m.default_3d(),
+        _ => None,
+    };
+    let reading = named_view && !eye_given && !target_given && absent(p.get("lens"));
+    // A point given must be a point, by its name; one left out stays as the view has it (below).
+    let eye = if eye_given { Some(point3_req(c, p, "eye")?) } else { None };
+    let target = if target_given { Some(point3_req(c, p, "target")?) } else { None };
+    let lens = num(c, p, "lens")?;
+    let was = v.and_then(|id| match m.elements.get(id) {
+        Some(Element::View3D(v3)) => v3.perspective.filter(|p| p.on).map(|p| p.lens),
+        _ => None,
+    });
+    // Read: the camera as the view has it, with what its perspective says. Reading makes nothing: the default `{3D}`
+    // before anything made it reads as a view with no camera yet.
+    if reading {
+        let (cam, pers, name) = match v.and_then(|id| m.elements.get(id)) {
+            Some(Element::View3D(v3)) => (v3.camera, v3.perspective.map(|p| (p.on, p.lens)), v3.name.clone()),
+            _ => (None, None, "{3D}".to_string()),
+        };
+        let (on, lens) = pers.unwrap_or((false, lens.unwrap_or(view3d::LENS)));
+        return Ok(
+            json!({"view": v, "name": name, "eye": cam.map(|c| c.eye), "target": cam.map(|c| c.target), "lens": lens, "perspective": on}),
+        );
+    }
+    // Set: the points kept from the camera the view has when they are not given, so a lens alone (or one point) changes
+    // just that; a view without a camera yet needs both. The eye is never on the target.
+    let kept = v.and_then(|id| match m.elements.get(id) {
+        Some(Element::View3D(v3)) => v3.camera,
+        _ => None,
+    });
+    let (Some(eye), Some(target)) = (eye.or(kept.map(|k| k.eye)), target.or(kept.map(|k| k.target))) else {
+        return Err(bad(c, "`eye` and `target` [x, y, z] are both required to set a camera"));
+    };
+    let across = (0..3).map(|k| eye[k] - target[k]).fold(0.0, |acc, d| acc + d * d).sqrt();
+    if across <= TOL {
+        return Err(bad(c, "the eye is on the target; give the camera two points a little apart"));
+    }
+    // Set: the lens kept from the view it lands on when not given.
+    let lens = lens.or(was).unwrap_or(view3d::LENS);
+    if !(view3d::MIN_LENS..=view3d::MAX_LENS).contains(&lens) {
+        let (lo, hi) = (view3d::MIN_LENS, view3d::MAX_LENS);
+        return Err(bad(c, format!("a {lens} mm lens is no camera's; a camera's lens is {lo} to {hi} mm")));
+    }
+    let set = crate::model::ViewCamera { eye, target };
+    let id = match v {
+        Some(id) => id,
+        // The default `{3D}` when asked for and not made yet keeps its own name; a new camera view is named by number.
+        None if default_3d => s.model_mut().insert(Element::View3D(View3D { camera: Some(set), ..View3D::default_view() })),
+        None => {
+            let name = match string(c, p, "name")? {
+                Some(n) => n,
+                None => s.model.free_view_name(s.model.language.word("Camera"), true),
+            };
+            s.model_mut().insert(Element::View3D(View3D { name, camera: Some(set), ..View3D::default_view() }))
+        }
+    };
+    if let Some(Element::View3D(v3)) = s.model_mut().elements.get_mut(id) {
+        v3.camera = Some(set);
+        v3.perspective = Some(Perspective { lens, on: true });
+    }
+    Ok(json!({"view": id, "id": id, "name": s.model.view_name(id), "eye": eye, "target": target, "lens": lens, "perspective": true}))
+}
+
+fn work_plane(s: &mut Session, p: &Value) -> R {
+    let c = "work_plane";
+    only(c, p, &["view", "level", "offset", "points", "surface"])?;
+    let m = &s.model;
+    let default = absent(p.get("view"))
+        || matches!(p.get("view"), Some(Value::String(n)) if n.eq_ignore_ascii_case("{3D}") || n.eq_ignore_ascii_case("3D"));
+    let view = if default {
+        m.default_3d()
+    } else {
+        let v = view_param(c, m, p, false)?;
+        if !matches!(m.elements.get(v), Some(Element::View3D(_))) {
+            return Err(bad(c, format!("{} isn't a 3D view; only a 3D view has a work plane to set", view_title(m, v))));
+        }
+        Some(v)
+    };
+    let offset = num(c, p, "offset")?;
+    let points = match p.get("points") {
+        v if absent(v) => None,
+        Some(v) => Some(
+            serde_json::from_value::<[[f64; 3]; 3]>(v.clone())
+                .map_err(|_| bad(c, format!("`points` are three points [[x, y, z], [x, y, z], [x, y, z]] in mm, not {v}")))?,
+        ),
+        None => None,
+    };
+    let surface = match p.get("surface") {
+        v if absent(v) => None,
+        Some(v) => Some(serde_json::from_value::<Surface>(v.clone()).map_err(|e| {
+            bad(c, format!("`surface` is {{point: [x, y, z], normal: [x, y, z]}}, a point of it in mm and the way it faces: {e}"))
+        })?),
+        None => None,
+    };
+    let level = if absent(p.get("level")) { None } else { Some(level_param(c, m, p, "level")?) };
+    let given = WorkPlane { level, offset: offset.unwrap_or(0.0), points, surface };
+    let plane = if level.is_some() || points.is_some() || surface.is_some() {
+        Some(given)
+    } else {
+        offset.map(|offset| WorkPlane { offset, ..m.work_plane(view) })
+    };
+    let resolved = plane.as_ref().map_or_else(|| m.work_plane(view).resolve(m), |wp| wp.resolve(m)).map_err(|e| bad(c, e))?;
+    let v = match view {
+        Some(v) => v,
+        None => s.model_mut().insert(Element::View3D(View3D::default_view())),
+    };
+    if let Some(Element::View3D(v3)) = s.model_mut().elements.get_mut(v) {
+        v3.work_plane = plane;
+    }
+    let wp = s.model.work_plane(Some(v));
+    let level = wp.level.and_then(|g| s.model.elements.id(g));
+    let z = resolved.over_plan().map(|p| p.z);
+    Ok(json!({
+        "view": v, "level": level, "offset": wp.offset, "points": wp.points, "surface": wp.surface,
+        "origin": resolved.origin, "normal": resolved.normal, "z": z, "slope": resolved.slope(),
+    }))
+}
+
 fn set_graphics(m: &mut Model, view: impl Key, g: Graphics) {
     if let Some(slot) = m.elements.get_mut(view).and_then(graphics::graphics_mut) {
         *slot = g;
@@ -3491,6 +4987,8 @@ fn view_template(s: &mut Session, p: &Value) -> R {
     let was = m.view_templates.get(&name).cloned();
     let keys = [
         "from",
+        "like",
+        "kind",
         "controls",
         "view_range",
         "hide",
@@ -3507,6 +5005,7 @@ fn view_template(s: &mut Session, p: &Value) -> R {
         "scale",
         "detail",
         "visual_style",
+        "background_grid",
     ];
     let makes = keys.iter().any(|k| !absent(p.get(k))) || p.get("template").is_some();
     if was.is_none() && !makes {
@@ -3516,7 +5015,24 @@ fn view_template(s: &mut Session, p: &Value) -> R {
             format!("there's no view template `{name}`; make one with `from` (a view), or `controls`{}", known_names(&there)),
         ));
     }
-    let mut t = was.clone().unwrap_or_else(|| ViewTemplate { controls: Group::ALL.into_iter().collect(), ..ViewTemplate::default() });
+    let mut t = match (&was, name_param(c, p, "like")?) {
+        (Some(t), _) => t.clone(),
+        (None, Some(like)) => m.view_templates.get(&like).cloned().ok_or_else(|| {
+            let there: Vec<&str> = m.view_templates.keys().map(String::as_str).collect();
+            bad(c, format!("there's no view template `{like}` to start from{}", known_names(&there)))
+        })?,
+        (None, None) => ViewTemplate { controls: Group::ALL.into_iter().collect(), ..ViewTemplate::default() },
+    };
+    match p.get("kind") {
+        None => {}
+        Some(Value::Null) => t.kind = None,
+        Some(v) => {
+            t.kind = Some(
+                serde_json::from_value(v.clone())
+                    .map_err(|_| bad(c, format!("`kind` is plan, section or 3d, or null for any, not {v}")))?,
+            );
+        }
+    }
     // Made from a view: what its graphics and its plan's view range are now.
     if !absent(p.get("from")) {
         let view = view_param(c, m, &json!({"view": p["from"]}), false)?;
@@ -3533,12 +5049,14 @@ fn view_template(s: &mut Session, p: &Value) -> R {
             scale: resolved.scale,
             detail: resolved.detail,
             style: resolved.style,
+            background_grid: resolved.background_grid,
             ..Graphics::default()
         };
         t.view_range = match m.elements.get(view) {
             Some(Element::Level(_) | Element::PlanView(_)) => Some(m.view_range_of(view)),
             _ => None,
         };
+        t.kind = m.elements.get(view).and_then(graphics::ViewKind::of);
     }
     match p.get("controls") {
         v if absent(v) => {}
@@ -3548,7 +5066,7 @@ fn view_template(s: &mut Session, p: &Value) -> R {
                     c,
                     format!(
                         "`controls` is a list of what it controls: {}: {e}",
-                        Group::ALL.map(|g| format!("{g:?}").to_lowercase()).join(", ")
+                        Group::ALL.map(|g| serde_json::to_string(&g).unwrap_or_default()).join(", ")
                     ),
                 )
             })?;
@@ -3575,9 +5093,23 @@ fn view_template(s: &mut Session, p: &Value) -> R {
         s.model_mut().view_templates.insert(name.clone(), t.clone());
         t.check(&s.model).map_err(|e| bad(c, e))?;
     }
+    let name = match name_param(c, p, "rename")? {
+        Some(to) if to != name => {
+            let m = s.model_mut();
+            if m.view_templates.contains_key(&to) {
+                return Err(bad(c, format!("there's already a view template `{to}`")));
+            }
+            m.view_templates.remove(&name);
+            m.view_templates.insert(to.clone(), t.clone());
+            rename_entry(m, &LibKind::ViewTemplate, &name, &to);
+            to
+        }
+        _ => name,
+    };
     let m = &s.model;
     let mut reply = graphics_reply(&t.graphics);
     reply["name"] = json!(name);
+    reply["kind"] = json!(t.kind);
     reply["controls"] = json!(t.controls);
     reply["view_range"] = json!(t.view_range);
     reply["views"] = json!(
@@ -4002,6 +5534,1511 @@ fn measure(_: &mut Session, p: &Value) -> R {
     Ok(json!({"length": to(r.length, 100.0), "dx": to(r.dx, 100.0), "dy": to(r.dy, 100.0), "angle": to(r.angle, 1e4)}))
 }
 
+/// A number of `key` within `lo..=hi`, or `default` when absent.
+fn within(c: &str, p: &Value, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, String> {
+    match p.get(key) {
+        v if absent(v) => Ok(default),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= lo && *x <= hi)
+            .ok_or_else(|| bad(c, format!("`{key}` must be a number from {lo} to {hi}, got {v}"))),
+        None => Ok(default),
+    }
+}
+
+/// A choice among `names`, as text; `default` when absent.
+fn choice<'a>(c: &str, p: &'a Value, key: &str, names: &[&str], default: &'a str) -> Result<&'a str, String> {
+    match p.get(key) {
+        v if absent(v) => Ok(default),
+        Some(Value::String(t)) if names.contains(&t.as_str()) => Ok(t.as_str()),
+        Some(v) => Err(bad(c, format!("`{key}` must be one of {}, got {v}", names.join(", ")))),
+        None => Ok(default),
+    }
+}
+
+fn circuit(_: &mut Session, p: &Value) -> R {
+    use crate::nbr5410::{self as e, Circuit, Insulation, Phases, Use};
+    let c = "circuit";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &[
+        "load",
+        "apparent",
+        "demand",
+        "power_factor",
+        "phases",
+        "system",
+        "use",
+        "length",
+        "method",
+        "insulation",
+        "conductor",
+        "ambient",
+        "grouped",
+        "bundle",
+        "spacing",
+        "soil",
+        "section",
+        "breaker",
+        "drop_limit",
+        "reduced_neutral",
+    ];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let load = within(c, p, "load", 0.0, 0.0, 1.0e9)?;
+    if load <= 0.0 {
+        return Err(bad(c, "`load` (W, or VA with `apparent`) is required"));
+    }
+    let systems: Vec<&str> = e::SYSTEMS.iter().map(|s| s.0).collect();
+    let system = choice(c, p, "system", &systems, systems[0])?;
+    let methods = e::method_keys();
+    let sections_ok = |x: f64| e::SECTIONS.iter().any(|s| (s - x).abs() < 1e-9);
+    let section = within(c, p, "section", 0.0, 0.0, 1000.0)?;
+    if section > 0.0 && !sections_ok(section) {
+        return Err(bad(
+            c,
+            format!(
+                "`section` must be one of the standard's: {}",
+                e::SECTIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+    let breaker = within(c, p, "breaker", 0.0, 0.0, 1000.0)?;
+    if breaker > 0.0 && !e::BREAKERS.iter().any(|b| (b - breaker).abs() < 1e-9) {
+        return Err(bad(
+            c,
+            format!("`breaker` must be one of: {}", e::BREAKERS.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")),
+        ));
+    }
+    let ambient = match p.get("ambient") {
+        v if absent(v) => None,
+        _ => Some(within(c, p, "ambient", 30.0, -50.0, 200.0)?),
+    };
+    let circuit = Circuit {
+        load,
+        apparent: flag(c, p, "apparent")?,
+        demand: within(c, p, "demand", 1.0, f64::MIN_POSITIVE, 1.0)?,
+        power_factor: within(c, p, "power_factor", 1.0, f64::MIN_POSITIVE, 1.0)?,
+        phases: Phases::parse(choice(c, p, "phases", &["FN", "FF", "3F", "3FN"], "FN")?).unwrap_or(Phases::PhaseNeutral),
+        system: systems.iter().position(|s| *s == system).unwrap_or(0),
+        use_: if choice(c, p, "use", &["power", "lighting"], "power")? == "lighting" { Use::Lighting } else { Use::Power },
+        length: within(c, p, "length", 0.0, 0.0, MAX_COORD)? / 1000.0,
+        method: choice(c, p, "method", &methods, "7")?.to_string(),
+        insulation: Insulation::parse(choice(c, p, "insulation", &["pvc", "epr"], "pvc")?).unwrap_or(Insulation::Pvc),
+        flexible: choice(c, p, "conductor", &["flexible", "rigid"], "flexible")? == "flexible",
+        ambient,
+        grouped: within(c, p, "grouped", 1.0, 1.0, 1000.0)?.round() as u32,
+        bundle: flag(c, p, "bundle")?,
+        spacing: within(c, p, "spacing", 0.0, 0.0, 100_000.0)? / 1000.0,
+        soil: within(c, p, "soil", 2.5, 0.0, 100.0)?,
+        section,
+        breaker,
+        drop_limit: within(c, p, "drop_limit", e::DROP_LIMIT, f64::MIN_POSITIVE, 100.0)?,
+        reduced_neutral: flag(c, p, "reduced_neutral")?,
+    };
+    let d = e::design(&circuit);
+    if let Some(fault) = d.fault {
+        return Err(bad(c, fault.message()));
+    }
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    let evaluation = |v: &e::Evaluation| {
+        json!({"section_mm2": v.section, "breaker_a": v.breaker, "carries_a": round(v.carries, 100.0), "carries_ok": v.ampacity_ok,
+               "breaker_ok": v.breaker_ok, "drop_percent": v.drop.map(|d| round(d.0, 100.0)), "drop_ok": v.drop.map(|d| d.1),
+               "minimum_section_ok": v.minimum_ok})
+    };
+    let Some(n) = d.needed else { return Err(bad(c, e::Fault::TooBig.message())) };
+    Ok(json!({
+        "current_a": round(d.current, 100.0),
+        "volts": d.volts,
+        "minimum_section_mm2": d.minimum,
+        "factors": d.factors.map(|f| json!({"temperature": f.temperature, "grouping": f.grouping, "soil": f.soil})),
+        "section_mm2": n.section,
+        "breaker_a": n.breaker,
+        "carries_a": round(n.carries, 100.0),
+        "drop_percent": n.drop.map(|d| round(d.0, 100.0)),
+        "conductors": e::cable_text(circuit.phases, n.section, circuit.reduced_neutral),
+        "grew": section < n.section - 1e-9 || breaker < n.breaker - 1e-9,
+        "chosen": d.chosen.as_ref().map(evaluation),
+    }))
+}
+
+fn conduit_fill(_: &mut Session, p: &Value) -> R {
+    use crate::conduit::{self, FAMILIES};
+    use crate::nbr5410::Phases;
+    let c = "conduit_fill";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["section", "phases", "circuits", "reduced_neutral", "family", "size"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let section = within(c, p, "section", 0.0, 0.0, 1000.0)?;
+    if section <= 0.0 {
+        return Err(bad(c, "`section` (mm²) is required"));
+    }
+    let phases = Phases::parse(choice(c, p, "phases", &["FN", "FF", "3F", "3FN"], "FN")?).unwrap_or(Phases::PhaseNeutral);
+    let circuits = within(c, p, "circuits", 1.0, 1.0, 1000.0)?.round() as usize;
+    let keys: Vec<&str> = FAMILIES.iter().map(|f| f.key).collect();
+    let family = conduit::family(choice(c, p, "family", &keys, "pvc-thread")?).ok_or_else(|| bad(c, "no such family"))?;
+    let one = conduit::conductors(phases, section, flag(c, p, "reduced_neutral")?);
+    let all: Vec<f64> = (0..circuits).flat_map(|_| one.iter().copied()).collect();
+    let source = json!({"maker": family.maker, "document": family.document, "page": family.page, "url": family.url, "inside": "outside less twice the wall"});
+    if let Some(s) = one.iter().find(|s| conduit::cable_diameter(**s).is_none()) {
+        return Ok(
+            json!({"conductors": all.len(), "pending": format!("the catalogue has no outside diameter for a cable of {s} mm²"), "source": source}),
+        );
+    }
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    let smallest = conduit::smallest(family, &all).map(|s| s.0);
+    let size =
+        match string(c, p, "size")? {
+            None => None,
+            Some(mark) => Some(family.sizes.iter().find(|s| s.0 == mark).ok_or_else(|| {
+                bad(c, format!("`size` must be one of {}", family.sizes.iter().map(|s| s.0).collect::<Vec<_>>().join(", ")))
+            })?),
+        };
+    let fill = size.and_then(|s| conduit::fill(s, &all));
+    Ok(json!({
+        "conductors": all.len(),
+        "circuits": circuits,
+        "sections_mm2": one,
+        "smallest": smallest,
+        "size": size.map(|s| s.0),
+        "inside_mm": size.map(|s| round(conduit::inside(s), 100.0)),
+        "fill_percent": fill.map(|f| round(f.ratio * 100.0, 10.0)),
+        "limit_percent": fill.map(|f| round(f.limit * 100.0, 10.0)),
+        "ok": fill.map(|f| f.ok),
+        "source": source,
+    }))
+}
+
+fn drain_size(_: &mut Session, p: &Value) -> R {
+    use crate::drainage::{self, Role};
+    let c = "drain_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["units", "fixtures", "role", "slope", "floors", "min_dn"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let mut units = within(c, p, "units", 0.0, 0.0, 1.0e7)?;
+    let mut minimum = within(c, p, "min_dn", 0.0, 0.0, 1000.0)?;
+    let mut fixtures_dn = 0.0;
+    match p.get("fixtures") {
+        v if absent(v) => {}
+        Some(Value::Object(f)) => {
+            let mut sum = 0.0;
+            for (kind, n) in f {
+                let (u, dn) = drainage::fixture(kind)
+                    .ok_or_else(|| bad(c, format!("`fixtures`: no fixture `{kind}`, use {}", crate::plumbing::kinds().join(", "))))?;
+                let n = n
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 10_000.0 && n.fract() == 0.0)
+                    .ok_or_else(|| bad(c, format!("`fixtures`: `{kind}` must be a whole number from 0 to 10000, got {n}")))?;
+                sum += u * n;
+                if n > 0.0 {
+                    fixtures_dn = f64::max(fixtures_dn, dn);
+                }
+            }
+            units += sum;
+        }
+        Some(v) => return Err(bad(c, format!("`fixtures` must be an object {{kind: count}}, got {v}"))),
+        None => {}
+    }
+    if units <= 0.0 {
+        return Err(bad(c, "`units` (UHC) or `fixtures` is required"));
+    }
+    minimum = minimum.max(fixtures_dn);
+    let role = Role::parse(choice(c, p, "role", &["branch", "main", "stack"], "branch")?).unwrap_or(Role::Branch);
+    let slope = within(c, p, "slope", 0.01, 0.0, 1.0)?;
+    let floors = within(c, p, "floors", 1.0, 1.0, 1000.0)?.round() as u32;
+    let dn = drainage::smallest(units, slope, role, floors, minimum)
+        .ok_or_else(|| {
+        let most = drainage::DNS.iter().map(|dn| (*dn, drainage::capacity(*dn, slope, role, floors))).fold((0.0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        bad(
+            c,
+            format!(
+                "{units} UHC is more than the tables of this version list for this role and slope: the most is DN {} at {} UHC (a blank in the standard's table means not allowed, not that the tables ended); split the load, or give a steeper `slope`",
+                most.0, most.1
+            ),
+        )
+    })?;
+    Ok(json!({"units": units, "dn": dn, "capacity": drainage::capacity(dn, slope, role, floors), "minimum_dn": minimum}))
+}
+
+fn vent_size(_: &mut Session, p: &Value) -> R {
+    use crate::drainage;
+    let c = "vent_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["units", "wc", "stack_dn", "length", "trap_dn"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let units = within(c, p, "units", 0.0, 0.0, 1.0e7)?;
+    if units <= 0.0 {
+        return Err(bad(c, "`units` (UHC of what it vents) is required"));
+    }
+    let dns = drainage::DNS;
+    let mut out = serde_json::Map::new();
+    let dn = if absent(p.get("stack_dn")) {
+        drainage::branch_vent(units, flag(c, p, "wc")?)
+            .ok_or_else(|| bad(c, format!("{units} UHC is more than the table gives a branch vent (Tabela 8)")))?
+    } else {
+        let served = within(c, p, "stack_dn", 0.0, 0.0, 1000.0)?;
+        if !dns.iter().any(|d| (d - served).abs() < 1e-9) {
+            return Err(bad(c, format!("`stack_dn` must be one of {}", dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))));
+        }
+        if absent(p.get("length")) {
+            return Err(bad(c, "`length` (mm, from the foot to the open end) is required with `stack_dn`"));
+        }
+        let length = within(c, p, "length", 0.0, 0.0, MAX_COORD)? / 1000.0;
+        let dn = drainage::vent_stack(served, units, length)
+            .ok_or_else(|| bad(c, "no vent of the table (Tabela 2) is long enough for that, or the units pass its last row"))?;
+        out.insert("longest_m".into(), json!(drainage::vent_stack_limit(served, units, dn)));
+        dn
+    };
+    out.insert("dn".into(), json!(dn));
+    if !absent(p.get("trap_dn")) {
+        let t = within(c, p, "trap_dn", 0.0, 0.0, 1000.0)?;
+        let mm = drainage::trap_distance(t).ok_or_else(|| bad(c, "`trap_dn` must be 40, 50, 75 or 100 (Tabela 1)"))?;
+        out.insert("trap_to_vent_mm".into(), json!(mm));
+    }
+    Ok(Value::Object(out))
+}
+
+/// `demand` for Enel: ET 1569 leaves the demand to the designer (item 7.7.2), so it frames the supply by the installed load, in its
+/// Anexo A (aerial) or D (underground), and carries the designer's demand if one is given.
+fn demand_enel(p: &Value, utility: &str, source: &str) -> R {
+    use crate::demand::{self as d, NETWORKS, Network};
+    let c = "demand";
+    const KEYS: &[&str] = &["utility", "network", "installed_kw", "demand_current_a", "phases", "demand_kva"];
+    if let Some(k) = p.as_object().and_then(|o| o.keys().find(|k| !KEYS.contains(&k.as_str()))) {
+        return Err(bad(c, format!("`{k}` isn't one of ENEL's parameters: {}", KEYS.join(", "))));
+    }
+    let name = choice(c, p, "network", NETWORKS, "")?;
+    if name.is_empty() {
+        return Err(bad(c, format!("`network` is required: {}", NETWORKS.join(", "))));
+    }
+    let phases = match p.get("phases").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=3) => Some(n as u8),
+            _ => return Err(bad(c, format!("`phases` is 1, 2 or 3, got {v}"))),
+        },
+    };
+    let demand_kva = match p.get("demand_kva").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(within(c, p, "demand_kva", 0.0, 0.0, 1.0e6)?),
+    };
+    let note_demand = "ET 1569 (item 7.7.2) leaves the demand to the designer, who may use the methods the utilities recommend: it is carried as given, never worked out here";
+    let not_covered = "the conduits, the poles and the type of meter box of the annexes, Anexo A to E's other columns, and the limits of supply of Tabela 2 by motors, welding machines and X-ray sets";
+    if name == "aerial_delta" {
+        // Anexo B goes by the current the designer's demand draws, not by the installed load.
+        if p.get("installed_kw").is_some_and(|v| !v.is_null()) {
+            return Err(bad(c, "Anexo B (`aerial_delta`) goes by `demand_current_a`, not by `installed_kw`"));
+        }
+        if absent(p.get("demand_current_a")) {
+            return Err(bad(c, "`demand_current_a` (the designer's demand current, A) is required for `aerial_delta`"));
+        }
+        let amps = within(c, p, "demand_current_a", 0.0, 0.0, 1.0e6)?;
+        let rows = d::delta_pick(amps, phases);
+        let (category, note) = match &rows {
+            Some(rows) => {
+                let r = rows[0];
+                let conn = json!({"conductors_per_phase": r.connection.0, "phase": r.connection.1, "neutral": r.connection.2});
+                let cat = json!({
+                    "names": r.names,
+                    "breaker_a": r.breaker,
+                    "connection_mm2": conn,
+                    "entry_mm2": r.entry,
+                    "earthing_mm2": r.earth,
+                    "measurement": r.measurement,
+                });
+                (cat, Value::Null)
+            }
+            None => (Value::Null, json!("above the last breaker of Anexo B: 300 A")),
+        };
+        let candidates: Vec<&str> = rows.iter().flatten().flat_map(|r| r.names.iter().copied()).collect();
+        return Ok(json!({
+            "utility": utility,
+            "source": source,
+            "annex": "B",
+            "network": name,
+            "installed_kw": Value::Null,
+            "demand_current_a": amps,
+            "phases": phases,
+            "category": category,
+            "candidates": candidates,
+            "category_note": note,
+            "demand_kva": demand_kva,
+            "demand_note": note_demand,
+            "not_covered": not_covered,
+        }));
+    }
+    let network = Network::parse(name).ok_or_else(|| bad(c, format!("`network` is one of {}", NETWORKS.join(", "))))?;
+    if p.get("demand_current_a").is_some_and(|v| !v.is_null()) {
+        return Err(bad(c, "`demand_current_a` is for `aerial_delta` (Anexo B); the other networks go by `installed_kw`"));
+    }
+    if absent(p.get("installed_kw")) {
+        return Err(bad(c, "`installed_kw` (the installed load in kW) is required"));
+    }
+    let kw = within(c, p, "installed_kw", 0.0, 0.0, 1.0e6)?;
+    let pick = d::enel_pick(network, kw, phases);
+    let (category, candidates, note) = match &pick {
+        Some(k) => {
+            let r = k.rows[0];
+            let conn = json!({"conductors_per_phase": r.connection.0, "phase": r.connection.1, "neutral": r.connection.2});
+            let cat = json!({
+                "name": r.name,
+                "available_kw": if r.available_kw.is_nan() { Value::Null } else { json!(r.available_kw) },
+                "breaker_a": r.breaker,
+                "connection_mm2": conn,
+                "entry_mm2": {"phase": r.entry.0, "neutral": r.entry.1},
+                "earthing_mm2": r.earth,
+                "measurement": r.measurement,
+                "junction_box": r.junction_box,
+            });
+            (cat, json!(k.rows.iter().map(|r| r.name).collect::<Vec<_>>()), Value::Null)
+        }
+        None if kw > 75.0 && network != Network::Submersible => (
+            Value::Null,
+            json!([]),
+            json!("above 75 kW the unit is served at primary voltage (item 7.3.2), which this specification does not cover"),
+        ),
+        None => {
+            let last = match network {
+                Network::Aerial => 63,
+                Network::Aerial120240 => 11,
+                Network::Underground => 72,
+                Network::Submersible => 100,
+            };
+            (
+                Value::Null,
+                json!([]),
+                json!(format!("above the last category of Anexo {}: up to {last} kW of installed load", network.annex())),
+            )
+        }
+    };
+    Ok(json!({
+        "utility": utility,
+        "source": source,
+        "annex": network.annex(),
+        "network": network.name(),
+        "installed_kw": kw,
+        "phases": phases,
+        "category": category,
+        "candidates": candidates,
+        "category_note": note,
+        "demand_kva": demand_kva,
+        "demand_note": note_demand,
+        "not_covered": not_covered,
+    }))
+}
+
+/// `demand` for Celesc: N-321.0001 classes a unit by its installed load (items 5.3.2.1 to 5.3.2.4, Tabela 01) and leaves a demand to
+/// the designer where a three-phase unit needs one (Tabela 01, note 1), so it frames the supply and carries the designer's demand.
+fn demand_celesc(p: &Value, utility: &str, source: &str) -> R {
+    use crate::demand::{self as d, CELESC_NETWORKS};
+    let c = "demand";
+    const KEYS: &[&str] = &["utility", "network", "installed_kw", "phases", "demand_kva"];
+    if let Some(k) = p.as_object().and_then(|o| o.keys().find(|k| !KEYS.contains(&k.as_str()))) {
+        return Err(bad(c, format!("`{k}` isn't one of CELESC's parameters: {}", KEYS.join(", "))));
+    }
+    let network = choice(c, p, "network", CELESC_NETWORKS, "220/380")?;
+    let phases = match p.get("phases").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(n @ 1..=3) => Some(n as u8),
+            _ => return Err(bad(c, format!("`phases` is 1, 2 or 3, got {v}"))),
+        },
+    };
+    if phases == Some(3) && network == "220/440" {
+        return Err(bad(c, "a 220/440 V network serves single-phase units only (Tabela 01: A and M); take `network: 220/380`"));
+    }
+    if absent(p.get("installed_kw")) {
+        return Err(bad(c, "`installed_kw` (the installed load in kW) is required"));
+    }
+    let kw = within(c, p, "installed_kw", 0.0, 0.0, 1.0e6)?;
+    let demand_kva = match p.get("demand_kva").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(within(c, p, "demand_kva", 0.0, 0.0, 1.0e6)?),
+    };
+    let row = d::celesc_pick(network, kw, phases);
+    let (category, note) = match row {
+        Some(r) => {
+            let cat = json!({
+                "name": r.name,
+                "installed_kw": {"over": r.lo, "up_to": r.hi},
+                "demand_kva": r.demand.map(|(lo, hi)| json!({"over": lo, "up_to": hi})),
+                "breaker_a": r.breaker,
+                "phases": r.phases,
+                "wires": r.wires,
+                "connection_mm2": {"copper": r.connection.0, "aluminium": r.connection.1},
+                "entry_mm2": r.entry,
+                "earthing_mm2": {"copper": r.earth.0, "copper_clad_steel": r.earth.1},
+            });
+            let note = match (r.demand, demand_kva) {
+                (Some((_, hi)), Some(dk)) if dk > hi => {
+                    json!(format!("the designer's demand, {dk} kVA, is above the {hi} kVA printed beside {}", r.name))
+                }
+                _ if r.breaker >= 125.0 => json!("a 125 A three-phase supply asks the designer for a demand (Tabela 01, note 1)"),
+                _ => Value::Null,
+            };
+            (cat, note)
+        }
+        None if network == "220/440" => (Value::Null, json!("above 50 kW a 220/440 V unit is past Tabela 01")),
+        None => (
+            Value::Null,
+            json!("above 75 kW the unit may be served in low voltage only as item 5.2.2.8 allows, with the designer's demand study"),
+        ),
+    };
+    Ok(json!({
+        "utility": utility,
+        "source": source,
+        "table": "01",
+        "network": network,
+        "installed_kw": kw,
+        "phases": phases,
+        "category": category,
+        "category_note": note,
+        "demand_kva": demand_kva,
+        "demand_note": "N-321.0001 gives no demand formula for a unit: Tabela 01 goes by the installed load, and a demand where one is needed is the designer's, carried as given",
+        "not_covered": "Tabela 01's conduits, galvanized steel mast and load branch, Tabela 02 (220 V without a neutral), and the probable demand of a building of several units (N-321.0003)",
+    }))
+}
+
+fn demand(_: &mut Session, p: &Value) -> R {
+    use crate::demand::{self as d, Air, Load, Motor, OtherUse, SPECIAL_KINDS, Special, SpecialKind, System, USES};
+    let c = "demand";
+    if !p.is_object() {
+        return Err(bad(c, "params must be an object"));
+    }
+    only(
+        c,
+        p,
+        &[
+            "utility",
+            "building",
+            "system",
+            "area",
+            "outlets",
+            "lighting_points",
+            "lighting_outlets",
+            "heaters",
+            "boilers",
+            "appliances",
+            "stoves",
+            "air_conditioners",
+            "air_use",
+            "motors",
+            "special",
+            "hydromassage",
+            "network",
+            "installed_kw",
+            "demand_current_a",
+            "phases",
+            "demand_kva",
+        ],
+    )?;
+    let utility = string(c, p, "utility")?.ok_or_else(|| bad(c, format!("`utility` is required: {}", d::UTILITIES.join(", "))))?;
+    let Some(source) = d::source(&utility) else {
+        return Err(bad(
+            c,
+            format!(
+                "there are no tables for `{utility}` yet, only {}: they are the utility's own, and are added from its standard",
+                d::UTILITIES.join(", ")
+            ),
+        ));
+    };
+    let residential = choice(c, p, "building", &["residential", "other"], "residential")? == "residential";
+    if utility == "ENEL" {
+        return demand_enel(p, &utility, source);
+    }
+    if utility == "CELESC" {
+        return demand_celesc(p, &utility, source);
+    }
+    if let Some(k) = ["network", "installed_kw", "demand_current_a", "phases", "demand_kva"].iter().find(|k| p.get(**k).is_some()) {
+        return Err(bad(
+            c,
+            format!(
+                "`{k}` is for utilities ENEL and CELESC: {utility}'s standard takes the loads of its examples, not a category by installed load"
+            ),
+        ));
+    }
+    let system = System::parse(choice(c, p, "system", &["127/220", "220/380"], "127/220")?).unwrap_or(System::S127_220);
+    let area = match p.get("area").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(within(c, p, "area", 0.0, 0.0, 1.0e6)?),
+    };
+    let count = |v: &Value, key: &str, hi: f64| -> Result<u32, String> {
+        match v.get(key).filter(|x| !x.is_null()) {
+            None => Ok(1),
+            Some(x) => x
+                .as_u64()
+                .filter(|n| (*n as f64) <= hi)
+                .map(|n| n as u32)
+                .ok_or_else(|| bad(c, format!("`{key}` must be a whole number up to {hi}, got {x}"))),
+        }
+    };
+    let whole = |key: &str, default: u32| -> Result<u32, String> {
+        match p.get(key).filter(|v| !v.is_null()) {
+            None => Ok(default),
+            Some(x) => x
+                .as_u64()
+                .filter(|n| *n <= 100_000)
+                .map(|n| n as u32)
+                .ok_or_else(|| bad(c, format!("`{key}` must be a whole number up to 100000, got {x}"))),
+        }
+    };
+    let outlets = match p.get("outlets").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(whole("outlets", 0)?),
+    };
+    let lighting_points = whole("lighting_points", 0)?;
+    let list = |key: &str| -> Result<Vec<Value>, String> {
+        match p.get(key).filter(|v| !v.is_null()) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(a)) if a.len() <= 1000 => Ok(a.clone()),
+            Some(v) => Err(bad(c, format!("`{key}` must be a list of at most 1000 items, got {v}"))),
+        }
+    };
+    let loads = |key: &str, field: &str| -> Result<Vec<Load>, String> {
+        list(key)?
+            .iter()
+            .map(|v| {
+                let o = v.as_object().ok_or_else(|| bad(c, format!("`{key}` holds objects, got {v}")))?;
+                if let Some(k) = o.keys().find(|k| ![field, "count"].contains(&k.as_str())) {
+                    return Err(bad(c, format!("`{key}`: unknown parameter `{k}`")));
+                }
+                Ok(Load {
+                    w: within(c, v, field, f64::NAN, 0.0, 1.0e8).map_err(|e| format!("{e} (in `{key}`)"))?,
+                    count: count(v, "count", 100_000.0)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|l| {
+                if l.iter().any(|x| x.w.is_nan()) { Err(bad(c, format!("`{key}`: `{field}` (watts) is required for each"))) } else { Ok(l) }
+            })
+    };
+    let other = match p.get("lighting_outlets").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => {
+            let o = v.as_object().ok_or_else(|| bad(c, "`lighting_outlets` is {use, kw, pf?}"))?;
+            if let Some(k) = o.keys().find(|k| !["use", "kw", "pf"].contains(&k.as_str())) {
+                return Err(bad(c, format!("`lighting_outlets`: unknown parameter `{k}`")));
+            }
+            let kind = choice(c, v, "use", USES, "")?;
+            if kind.is_empty() {
+                return Err(bad(c, format!("`lighting_outlets`: `use` is one of {}", USES.join(", "))));
+            }
+            let kw = within(c, v, "kw", f64::NAN, 0.0, 1.0e6)?;
+            if kw.is_nan() {
+                return Err(bad(c, "`lighting_outlets`: `kw` is required"));
+            }
+            Some(OtherUse { kind: kind.to_string(), kw, pf: within(c, v, "pf", 1.0, 0.1, 1.0)? })
+        }
+    };
+    let mut air = Vec::new();
+    for v in list("air_conditioners")? {
+        let o = v.as_object().ok_or_else(|| bad(c, format!("`air_conditioners` holds objects, got {v}")))?;
+        if let Some(k) = o.keys().find(|k| !["btu", "va", "w", "count"].contains(&k.as_str())) {
+            return Err(bad(c, format!("`air_conditioners`: unknown parameter `{k}`")));
+        }
+        let n = count(&v, "count", 100_000.0)?;
+        if o.get("btu").is_some_and(|x| !x.is_null()) {
+            let btu = within(c, &v, "btu", 0.0, 0.0, 1.0e6)?;
+            let (va, w) = d::window_air(btu).ok_or_else(|| {
+                bad(
+                    c,
+                    format!("`btu` {btu} is not in Tabela 8: 7100, 8500, 10000, 12000, 14000, 18000, 21000 or 30000; or give `va` and `w`"),
+                )
+            })?;
+            air.push(Air { va, w, count: n });
+        } else {
+            let (va, w) = (within(c, &v, "va", f64::NAN, 0.0, 1.0e8)?, within(c, &v, "w", f64::NAN, 0.0, 1.0e8)?);
+            if va.is_nan() || w.is_nan() {
+                return Err(bad(c, "`air_conditioners`: give `btu` (Tabela 8), or `va` and `w`"));
+            }
+            air.push(Air { va, w, count: n });
+        }
+    }
+    let mut motors = Vec::new();
+    for v in list("motors")? {
+        let o = v.as_object().ok_or_else(|| bad(c, format!("`motors` holds objects, got {v}")))?;
+        if let Some(k) = o.keys().find(|k| !["cv", "phases", "kva", "kw", "count"].contains(&k.as_str())) {
+            return Err(bad(c, format!("`motors`: unknown parameter `{k}`")));
+        }
+        let n = count(&v, "count", 100_000.0)?;
+        if o.get("cv").is_some_and(|x| !x.is_null()) {
+            let cv = within(c, &v, "cv", 0.0, 0.0, 1000.0)?;
+            let phases = match v.get("phases").and_then(Value::as_u64) {
+                Some(x @ (1 | 3)) => x as u32,
+                _ => return Err(bad(c, "`motors`: `phases` is 1 or 3 with `cv`")),
+            };
+            let (kva, kw) = d::motor(cv, phases).ok_or_else(|| {
+                bad(c, format!("no {cv} cv {}-phase motor in Tabela {}; give `kva` and `kw`", phases, if phases == 1 { 14 } else { 15 }))
+            })?;
+            motors.push(Motor { kva, kw, count: n });
+        } else {
+            let (kva, kw) = (within(c, &v, "kva", f64::NAN, 0.0, 1.0e6)?, within(c, &v, "kw", f64::NAN, 0.0, 1.0e6)?);
+            if kva.is_nan() || kw.is_nan() {
+                return Err(bad(c, "`motors`: give `cv` and `phases` (Tabela 14 or 15), or `kva` and `kw`"));
+            }
+            motors.push(Motor { kva, kw, count: n });
+        }
+    }
+    let mut special = Vec::new();
+    for v in list("special")? {
+        let o = v.as_object().ok_or_else(|| bad(c, format!("`special` holds objects, got {v}")))?;
+        if let Some(k) = o.keys().find(|k| !["kind", "kw", "count"].contains(&k.as_str())) {
+            return Err(bad(c, format!("`special`: unknown parameter `{k}`")));
+        }
+        let kind = SpecialKind::parse(choice(c, &v, "kind", SPECIAL_KINDS, "")?)
+            .ok_or_else(|| bad(c, format!("`special`: `kind` is one of {}", SPECIAL_KINDS.join(", "))))?;
+        let kw = within(c, &v, "kw", f64::NAN, 0.0, 1.0e6)?;
+        if kw.is_nan() {
+            return Err(bad(c, "`special`: `kw` is required"));
+        }
+        special.push(Special { kind, kw, count: count(&v, "count", 100_000.0)? });
+    }
+    let input = d::Input {
+        residential,
+        area,
+        outlets,
+        lighting_points,
+        other,
+        heaters: loads("heaters", "w")?,
+        boilers: loads("boilers", "w")?,
+        appliances: loads("appliances", "w")?,
+        stoves: loads("stoves", "w")?,
+        air,
+        motors,
+        special,
+        hydro: loads("hydromassage", "w")?,
+        commercial_air: choice(c, p, "air_use", &["residential", "commercial"], "residential")? == "commercial",
+    };
+    let o = d::compute(&input).map_err(|e| bad(c, e))?;
+    let r6 = |x: f64| (x * 1.0e6).round() / 1.0e6 + 0.0;
+    let cat = d::category(system, o.installed_kw, o.demand_kva);
+    let (category, note) = match cat {
+        Some(k) => (
+            json!({"name": k.name, "breaker_a": k.breaker, "cable_mm2": k.cable, "conduit_mm": k.conduit, "earthing_mm2": k.earth, "phases": k.phases}),
+            Value::Null,
+        ),
+        None if o.installed_kw > 75.0 => {
+            (Value::Null, json!("above 75 kW the utility serves at primary voltage, which this standard does not cover"))
+        }
+        None => (Value::Null, json!("the demand is above the last category of the table")),
+    };
+    let t = &o.terms;
+    Ok(json!({
+        "utility": utility,
+        "source": source,
+        "installed_kw": r6(o.installed_kw),
+        "installed_kw_rounded_up": (o.installed_kw - 1.0e-9).ceil(),
+        "lighting_outlets_w": r6(o.lighting_outlets_w),
+        "terms_kva": {"a": r6(t.a), "b": r6(t.b), "c": r6(t.c), "d": r6(t.d), "e": r6(t.e), "f": r6(t.f), "g": r6(t.g), "h": r6(t.h), "i": r6(t.i)},
+        "demand_kva": r6(o.demand_kva),
+        "demand_kva_rounded_up": (o.demand_kva - 1.0e-9).ceil(),
+        "category": category,
+        "category_note": note,
+        "system": if system == System::S127_220 { "127/220" } else { "220/380" },
+        "not_covered": "the other columns of Tabela 1 (poles, pontalete, ramal de ligação), the cables of Tabelas 1D and 1E, the starting of motors (Tabela 13) and the DPS and other requirements of the entry",
+    }))
+}
+
+fn dps_check(_: &mut Session, p: &Value) -> R {
+    use crate::dps::{self, EARTHINGS, Earthing, PURPOSES, Purpose, REGIONS, Region, SIGNALS};
+    let c = "dps_check";
+    if !p.is_object() {
+        return Err(bad(c, "params must be an object"));
+    }
+    only(
+        c,
+        p,
+        &[
+            "region",
+            "overhead",
+            "accepted_risk",
+            "risk_to_people",
+            "purpose",
+            "earthing",
+            "neutral",
+            "phases",
+            "existing",
+            "signal_lines",
+            "uo",
+            "system",
+            "before_dr",
+        ],
+    )?;
+    let Some(region) = Region::parse(choice(c, p, "region", REGIONS, "")?) else {
+        return Err(bad(c, format!("`region` is required: {}", REGIONS.join(", "))));
+    };
+    let line = dps::Line {
+        overhead: flag(c, p, "overhead")?,
+        region,
+        accepted_risk: flag(c, p, "accepted_risk")?,
+        risk_to_people: flag(c, p, "risk_to_people")?,
+    };
+    let purpose = Purpose::parse(choice(c, p, "purpose", PURPOSES, "line")?).unwrap_or(Purpose::Line);
+    let earthing = match choice(c, p, "earthing", EARTHINGS, "")? {
+        "" => None,
+        name => Earthing::parse(name),
+    };
+    let neutral = if absent(p.get("neutral")) { true } else { flag(c, p, "neutral")? };
+    let phases = match p.get("phases").filter(|v| !v.is_null()) {
+        None => 3,
+        Some(v) => match v.as_u64() {
+            Some(n @ (1 | 3)) => n as u32,
+            _ => return Err(bad(c, format!("`phases` is 1 or 3, got {v}"))),
+        },
+    };
+    let existing = flag(c, p, "existing")?;
+    let before_dr = flag(c, p, "before_dr")?;
+    let system = match p.get("system").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str().filter(|x| dps::withstand(x).is_some()) {
+            Some(x) => Some(x.to_string()),
+            None => return Err(bad(c, format!("`system` is one of {}, got {v}", dps::SYSTEMS.join(", ")))),
+        },
+    };
+    let uo = match p.get("uo").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(within(c, p, "uo", 0.0, 1.0, 1.0e5)?),
+    };
+    let mut signals = Vec::new();
+    match p.get("signal_lines").filter(|v| !v.is_null()) {
+        None => {}
+        Some(Value::Array(a)) if a.len() <= 1000 => {
+            for v in a {
+                let kind = v.as_str().filter(|k| dps::signal_required(k).is_some());
+                let Some(kind) = kind else {
+                    return Err(bad(c, format!("`signal_lines` holds {}, got {v}", SIGNALS.join(", "))));
+                };
+                signals.push(json!({
+                    "kind": kind,
+                    "required": true,
+                    "why": dps::signal_required(kind),
+                    "where": "at the building's entry or exit",
+                    "min_impulse_withstand_kv": dps::SIGNAL_ENTRY_WITHSTAND_KV,
+                }));
+            }
+        }
+        Some(v) => return Err(bad(c, format!("`signal_lines` is a list of {}, got {v}", SIGNALS.join(", ")))),
+    }
+    let v = dps::required(&line);
+    let mut power = Map::new();
+    power.insert("required".into(), json!(v.required));
+    power.insert("exempt".into(), json!(v.exempt));
+    power.insert("reasons".into(), json!(v.reasons));
+    if v.required {
+        power.insert("purpose".into(), json!(PURPOSES[purpose as usize]));
+        power.insert("where".into(), json!(dps::place(purpose, existing)));
+        power.insert(
+            "short_circuit".into(),
+            json!("the DPS withstands the short-circuit current presumed where it is installed, with the overcurrent device that goes with it, and a DPS with spark gaps interrupts the follow current of that point (6.3.5.2.4 e)"),
+        );
+        if let Some(w) = system.as_deref().and_then(|x| dps::withstand(x).map(|w| (x, w))) {
+            power.insert(
+                "up".into(),
+                json!({
+                    "system": w.0,
+                    "withstand_kv": {"IV": w.1[0], "III": w.1[1], "II": w.1[2], "I": w.1[3]},
+                    "max_up_kv": w.1[2],
+                    "why": "the protection level Up must stay under what the equipment of use (category II of Tabela 31) withstands",
+                }),
+            );
+        }
+        let mut three = false;
+        if let Some(e) = earthing {
+            let list = if before_dr { dps::schemes_before_dr(e, neutral) } else { dps::schemes(e, neutral) };
+            three = list.contains(&3);
+            let text: Vec<Value> = list.iter().map(|s| json!({"scheme": s, "connects": dps::scheme_text(*s, e)})).collect();
+            let modes: Vec<Value> = dps::uc_min(e, neutral, uo.unwrap_or(1.0))
+                .iter()
+                .map(|u| match uo {
+                    Some(_) => json!({"between": u.between, "formula": u.formula, "volts": (u.volts * 100.0).round() / 100.0}),
+                    None => json!({"between": u.between, "formula": u.formula}),
+                })
+                .collect();
+            power.insert("uc_min".into(), json!({"uo_v": uo, "modes": modes}));
+            match dps::subsequent_current(e) {
+                Some(dps::Subsequent::AtLeastA(a)) => {
+                    power.insert("subsequent_current".into(), json!({"neutral_pe_min_a": a}));
+                }
+                Some(dps::Subsequent::LikePhaseNeutral) => {
+                    power.insert("subsequent_current".into(), json!({"neutral_pe": "the same as the DPS between phase and neutral"}));
+                }
+                None => {}
+            }
+            power.insert(
+                "connection".into(),
+                json!({"earthing": EARTHINGS[e as usize], "neutral": neutral, "schemes": list, "connects": text}),
+            );
+        }
+        let extra = |each: f64, special: f64| {
+            let mut o = Map::new();
+            o.insert("each_mode".into(), json!(each));
+            if three {
+                o.insert("neutral_to_pe_in_scheme_3".into(), json!(special));
+            }
+            Value::Object(o)
+        };
+        if purpose != Purpose::Direct {
+            power.insert("discharge_ka".into(), extra(dps::discharge(purpose, false, phases), dps::discharge(purpose, true, phases)));
+        }
+        if purpose != Purpose::Line {
+            power.insert("impulse_ka".into(), extra(dps::impulse(false, phases), dps::impulse(true, phases)));
+        }
+        power.insert("conductor".into(), json!({"section_mm2": dps::conductor_section(purpose), "max_length_m": dps::CONDUCTOR_LENGTH}));
+    }
+    Ok(json!({
+        "power": power,
+        "signal": signals,
+        "not_covered": "the overcurrent device of the DPS and where it stands (6.3.5.2.5), and the coordination between DPS",
+    }))
+}
+
+fn network(s: &mut Session, p: &Value) -> R {
+    let c = "network";
+    if !p.is_object() {
+        return Err(bad(c, "params must be an object"));
+    }
+    only(c, p, &["system", "level", "tolerance"])?;
+    let m = &s.model;
+    let system = string(c, p, "system")?;
+    let level = if absent(p.get("level")) { None } else { Some(level_param(c, m, p, "level")?) };
+    let tolerance = within(c, p, "tolerance", crate::network::TOLERANCE, 0.01, crate::network::MAX_TOLERANCE)?;
+    let n = crate::network::network(m, system.as_deref(), level, tolerance).map_err(|e| bad(c, e))?;
+    let round = |p: [f64; 3]| p.map(|x| (x * 100.0).round() / 100.0 + 0.0);
+    use crate::network::Joint;
+    let joint = |j: &Joint| match j {
+        Joint::RunEnd { run, end } => json!({"pipe": run, "end": if *end { "end" } else { "start" }}),
+        Joint::RunSide { run } => json!({"pipe": run, "along": true}),
+        Joint::Connector { element, index, domain } => json!({"component": element, "connector": index, "domain": domain}),
+    };
+    let nodes: Vec<Value> =
+        n.nodes.iter().map(|x| json!({"at": round(x.at), "joins": x.joints.iter().map(joint).collect::<Vec<_>>()})).collect();
+    let edges: Vec<Value> = n
+        .edges
+        .iter()
+        .map(|e| match e.length {
+            Some(l) => json!({"pipe": e.element, "from": e.from, "to": e.to, "length": (l * 100.0).round() / 100.0}),
+            None => json!({"through": e.element, "from": e.from, "to": e.to}),
+        })
+        .collect();
+    let groups: Vec<Value> = n.groups.iter().map(|g| json!({"elements": g.elements, "systems": g.systems, "domains": g.domains})).collect();
+    let warnings: Vec<Value> =
+        n.warnings.iter().map(|w| json!({"kind": w.kind, "at": w.at.map(round), "elements": w.elements, "message": w.message})).collect();
+    Ok(json!({"nodes": nodes, "edges": edges, "groups": groups, "open": n.open, "warnings": warnings}))
+}
+
+fn load_points(s: &mut Session, p: &Value) -> R {
+    use crate::loads::{self, KINDS, Kind};
+    let c = "load_points";
+    if !p.is_object() {
+        return Err(bad(c, "params must be an object"));
+    }
+    only(c, p, &["rooms", "alternative", "standard"])?;
+    let alternative = flag(c, p, "alternative")?;
+    let names: Vec<&str> = loads::rule_sets().iter().map(|r| r.standard.as_str()).collect();
+    let standard = choice(c, p, "standard", &names, loads::DEFAULT)?;
+    let set = loads::rule_set(standard).ok_or_else(|| bad(c, format!("no rules for `{standard}` in data/load-points.json")))?;
+    let round = |x: f64| (x * 100.0).round() / 100.0 + 0.0;
+    // (name, kind, area m2, perimeter m, points, kind given)
+    let mut input: Vec<(String, Kind, f64, f64, Option<u32>, bool)> = Vec::new();
+    // The lighting points each room has, where the model draws any.
+    let mut lit: Vec<Option<u32>> = Vec::new();
+    let mut skipped = Vec::new();
+    let mut counted = (false, false);
+    match p.get("rooms").filter(|v| !absent(Some(v))) {
+        None => {
+            let m = &s.model;
+            let rooms = crate::rooms::Rooms::new(m);
+            let (outlets, lights) = drawn_points(m, &rooms);
+            counted = (outlets.is_some(), lights.is_some());
+            let count = |by: &Option<BTreeMap<Id, u32>>, id: Id| by.as_ref().map(|by| by.get(&id).copied().unwrap_or(0));
+            for (id, e) in m.elements.iter() {
+                let Element::Room(r) = e else { continue };
+                match rooms.region_at(r, RoomArea::Finish) {
+                    Some(g) => {
+                        let area = g.area() / 1.0e6;
+                        input.push((r.name.clone(), loads::kind_of(&r.name), area, g.perimeter() / 1000.0, count(&outlets, *id), false));
+                        lit.push(count(&lights, *id));
+                    }
+                    None => skipped.push(json!({"id": id, "name": r.name, "why": "not enclosed by walls"})),
+                }
+            }
+        }
+        Some(Value::Array(a)) if a.len() <= 5000 => {
+            for (i, r) in a.iter().enumerate() {
+                let at = |e: String| format!("rooms[{i}]: {e}");
+                let o = r.as_object().ok_or_else(|| bad(c, format!("rooms[{i}] must be an object")))?;
+                if let Some(k) = o.keys().find(|k| !["name", "area", "perimeter", "kind", "points"].contains(&k.as_str())) {
+                    return Err(bad(c, format!("rooms[{i}]: unknown parameter `{k}`")));
+                }
+                let name = string(c, r, "name").map_err(at)?.unwrap_or_default();
+                if name.chars().count() > MAX_TEXT {
+                    return Err(bad(c, format!("rooms[{i}]: `name` is longer than {MAX_TEXT} characters")));
+                }
+                let area = within(c, r, "area", f64::NAN, 0.0, 1.0e6).map_err(at)?;
+                let perimeter = within(c, r, "perimeter", f64::NAN, 0.0, MAX_COORD).map_err(at)?;
+                if area.is_nan() || perimeter.is_nan() {
+                    return Err(bad(c, format!("rooms[{i}]: `area` (m²) and `perimeter` (mm) are required")));
+                }
+                let given = choice(c, r, "kind", KINDS, "").map_err(at)?;
+                let points = match r.get("points") {
+                    v if absent(v) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .filter(|n| *n <= 1000)
+                            .ok_or_else(|| bad(c, format!("rooms[{i}]: `points` must be a whole number from 0 to 1000, got {v}")))?
+                            as u32,
+                    ),
+                    None => None,
+                };
+                let kind = Kind::parse(given).unwrap_or_else(|| loads::kind_of(&name));
+                input.push((name, kind, area, perimeter / 1000.0, points, !given.is_empty()));
+            }
+        }
+        Some(v) => return Err(bad(c, format!("`rooms` must be a list of at most 5000 rooms, got {v}"))),
+    }
+    let rooms: Vec<loads::Room> =
+        input.iter().map(|r| loads::Room { name: &r.0, kind: r.1, area: r.2, perimeter: r.3, provided: r.4 }).collect();
+    let t = set.total(&rooms, alternative);
+    let mut list = Vec::new();
+    let mut all_ok = true;
+    for (i, (r, sh)) in input.iter().zip(&t.rooms).enumerate() {
+        let mut o = Map::new();
+        o.insert("name".into(), json!(r.0));
+        o.insert("kind".into(), json!(r.1.key()));
+        o.insert("area_m2".into(), json!(round(r.2)));
+        o.insert("perimeter_m".into(), json!(round(r.3)));
+        let lights = lit.get(i).copied().flatten();
+        o.insert("lighting_points".into(), json!(lights.unwrap_or(1)));
+        o.insert("lighting_va".into(), json!(sh.lighting_va));
+        o.insert("tug_minimum".into(), json!(sh.minimum));
+        o.insert("tug_points".into(), json!(sh.points));
+        o.insert("tug_va".into(), json!(sh.tug_va));
+        if sh.counter_outlets > 0 {
+            o.insert("counter_outlets".into(), json!(sh.counter_outlets));
+        }
+        let ok = sh.points >= sh.minimum && lights.is_none_or(|n| n >= 1);
+        all_ok &= ok;
+        o.insert("ok".into(), json!(ok));
+        o.insert("source".into(), json!(set.room(r.1).source));
+        if r.1 == Kind::Other && !r.5 {
+            o.insert("note".into(), json!("the name says no kind of room: treated as `other`; give `kind`"));
+        }
+        list.push(Value::Object(o));
+    }
+    Ok(json!({
+        "standard": set.standard,
+        "standard_source": set.source,
+        "lighting_source": set.lighting.source,
+        "rooms": list,
+        "skipped": skipped,
+        "lighting_va": t.lighting_va,
+        "tug_va": t.tug_va,
+        "total_va": t.lighting_va + t.tug_va,
+        "wet_points": t.wet_points,
+        "alternative_possible": t.alternative_possible,
+        "alternative_applied": t.alternative_applied,
+        "ok": all_ok,
+        "counted": {"outlets": counted.0, "lighting": counted.1},
+        "not_covered": "the exceptions to the lighting point and to a veranda's outlet, the placement of the outlets (near the lavatory, over a counter, up to 0.80 m outside the door of a room of 2.25 m² or less) and the TUE",
+    }))
+}
+
+/// How many of something stand in each room, by the room's id.
+type PerRoom = BTreeMap<Id, u32>;
+
+/// The power outlets and the luminaires standing in each room of `m` (in the last phase, of the primary design options), by
+/// the room's id: `None` for a category of which the model has none standing anywhere, so a model that draws no outlets is
+/// taken to have the least, as `rooms` without `points` is. Every outlet counts, a specific-use one too.
+fn drawn_points(m: &Model, rooms: &crate::rooms::Rooms) -> (Option<PerRoom>, Option<PerRoom>) {
+    use crate::phasing::{self, Status};
+    let last = m.phases.len().saturating_sub(1);
+    let shown = crate::graphics::Graphics::default();
+    let (mut outlets, mut lights): (Option<PerRoom>, Option<PerRoom>) = (None, None);
+    for e in m.elements.values() {
+        let Element::Component(c) = e else { continue };
+        let by = match m.families.get(&c.family).map(|f| f.category) {
+            Some(crate::family::Category::Outlet) => &mut outlets,
+            Some(crate::family::Category::Lighting) => &mut lights,
+            _ => continue,
+        };
+        if !matches!(phasing::status(m, e, last), Some(Status::New | Status::Existing)) || !phasing::option_shown(m, &shown, e) {
+            continue;
+        }
+        let by = by.get_or_insert_with(BTreeMap::new);
+        if let Some(room) = rooms.room_at(c.level, c.at) {
+            *by.entry(room).or_insert(0) += 1;
+        }
+    }
+    (outlets, lights)
+}
+
+fn dr_check(_: &mut Session, p: &Value) -> R {
+    use crate::dr::{self, KINDS, PLACES, Place};
+    let c = "dr_check";
+    if !p.is_object() {
+        return Err(bad(c, "params must be an object"));
+    }
+    only(c, p, &["circuits", "building"])?;
+    let residential = choice(c, p, "building", &["residential", "other"], "residential")? == "residential";
+    let list = match p.get("circuits") {
+        Some(Value::Array(a)) if !a.is_empty() && a.len() <= 5000 => a,
+        _ => return Err(bad(c, "`circuits` is a list of 1 to 5000 circuits, each {name, points: [...]}")),
+    };
+    let mut out = Vec::new();
+    let mut missing = Vec::new();
+    for (i, item) in list.iter().enumerate() {
+        let at = |e: String| format!("circuits[{i}]: {e}");
+        let o = item.as_object().ok_or_else(|| bad(c, format!("circuits[{i}] must be an object")))?;
+        if let Some(k) = o.keys().find(|k| !["name", "points", "residual", "it_continuity"].contains(&k.as_str())) {
+            return Err(bad(c, format!("circuits[{i}]: unknown parameter `{k}`")));
+        }
+        let name = string(c, item, "name").map_err(at)?.unwrap_or_else(|| format!("#{}", i + 1));
+        if name.chars().count() > MAX_TEXT {
+            return Err(bad(c, format!("circuits[{i}]: `name` is longer than {MAX_TEXT} characters")));
+        }
+        let pts = match item.get("points") {
+            Some(Value::Array(a)) if !a.is_empty() && a.len() <= 1000 => a,
+            _ => return Err(bad(c, format!("circuits[{i}]: `points` is a list of 1 to 1000 points"))),
+        };
+        let mut points = Vec::new();
+        for (j, pt) in pts.iter().enumerate() {
+            let at = |e: String| format!("circuits[{i}].points[{j}]: {e}");
+            let po = pt.as_object().ok_or_else(|| bad(c, at("it must be an object".into())))?;
+            if let Some(k) = po.keys().find(|k| !["place", "kind", "rating", "height", "outdoor"].contains(&k.as_str())) {
+                return Err(bad(c, at(format!("unknown parameter `{k}`"))));
+            }
+            let place = Place::parse(choice(c, pt, "place", PLACES, "").map_err(at)?);
+            let kind = dr::Kind::parse(choice(c, pt, "kind", KINDS, "").map_err(at)?);
+            let (Some(place), Some(kind)) = (place, kind) else {
+                return Err(bad(c, at(format!("`place` ({}) and `kind` ({}) are required", PLACES.join(", "), KINDS.join(", ")))));
+            };
+            let optional = |key: &str, hi: f64| -> Result<Option<f64>, String> {
+                match pt.get(key).filter(|v| !v.is_null()) {
+                    None => Ok(None),
+                    Some(_) => within(c, pt, key, 0.0, 0.0, hi).map(Some).map_err(at),
+                }
+            };
+            points.push(dr::Point {
+                place,
+                kind,
+                rating: optional("rating", 1.0e6)?,
+                height: optional("height", MAX_COORD)?,
+                outdoor: flag(c, pt, "outdoor").map_err(at)?,
+            });
+        }
+        let residual = match item.get("residual").filter(|v| !v.is_null()) {
+            None => None,
+            Some(_) => Some(within(c, item, "residual", 0.0, 0.0, 1.0e6).map_err(at)?),
+        };
+        let circuit = dr::Circuit { points, residual, it_continuity: flag(c, item, "it_continuity").map_err(at)? };
+        let v = dr::check(&circuit, residential);
+        if v.ok == Some(false) {
+            missing.push(name.clone());
+        }
+        out.push(json!({
+            "name": name,
+            "required": v.required,
+            "exempt": v.exempt,
+            "reasons": v.reasons,
+            "residual_ma": residual,
+            "ok": v.ok,
+        }));
+    }
+    Ok(json!({
+        "circuits": out,
+        "missing": missing,
+        "max_residual_ma": dr::MAX_RESIDUAL,
+        "building": if residential { "residential" } else { "other" },
+        "not_covered": "the further rules for the volumes of a bathroom and for swimming pools, and the other protections against shock, which the device does not replace",
+    }))
+}
+
+fn hydrant_size(_: &mut Session, p: &Value) -> R {
+    use crate::hydrant::{self, MATERIALS, MAX_NOZZLE_HEAD, MAX_SPEED, TYPE_KEYS};
+    let c = "hydrant_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["region", "column", "area", "type", "hydrants", "inside", "nominal", "material", "length", "rise"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    if string(c, p, "region")?.is_some_and(|r| r != "SP") {
+        return Err(bad(
+            c,
+            "`region` must be SP: only IT 22/2025 of the Corpo de Bombeiros of São Paulo is covered, no other state's rule",
+        ));
+    }
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    let (has_column, has_area) = (!absent(p.get("column")), !absent(p.get("area")));
+    let mut system: Option<(u8, f64)> = None;
+    if has_column || has_area {
+        if !has_column {
+            return Err(bad(c, "`column` (1 to 5, of IT 22's Tabela 3) is required with `area`"));
+        }
+        if !has_area {
+            return Err(bad(c, "`area` (m², built) is required with `column`"));
+        }
+        let column = within(c, p, "column", 1.0, 1.0, 5.0)?;
+        if column.fract() != 0.0 {
+            return Err(bad(c, "`column` must be a whole number from 1 to 5"));
+        }
+        let area = within(c, p, "area", 0.0, f64::MIN_POSITIVE, 1.0e8)?;
+        system = hydrant::system_for(column as u8, area);
+    }
+    let mut out = serde_json::Map::new();
+    if let Some((t, rti)) = system {
+        out.insert("system".into(), json!(t.to_string()));
+        out.insert("reserve_m3".into(), json!(rti));
+    }
+    let key = if absent(p.get("type")) {
+        match system {
+            Some((4, _)) if !absent(p.get("inside")) => {
+                return Err(bad(c, "the system is type 4: give `type` as 4-40 or 4-65, by the nozzle"));
+            }
+            Some((t, _)) if t != 4 => Some(t.to_string()),
+            Some(_) => None,
+            None => return Err(bad(c, "`type` (1, 2, 3, 4-40, 4-65 or 5) or `column` and `area` is required")),
+        }
+    } else {
+        let key = choice(c, p, "type", TYPE_KEYS, "")?;
+        if let (Some((t, _)), Some(row)) = (system, hydrant::kind(key))
+            && row.1 != t
+        {
+            return Err(bad(
+                c,
+                format!("`type` {key} contradicts `column` {} and `area`, which give type {t}: give one, or make them agree", p["column"]),
+            ));
+        }
+        Some(key.to_string())
+    };
+    let Some(key) = key else { return Ok(Value::Object(out)) };
+    let hydrants = within(c, p, "hydrants", 2.0, 1.0, 1000.0)?;
+    if hydrants.fract() != 0.0 {
+        return Err(bad(c, "`hydrants` must be a whole number from 1 to 1000"));
+    }
+    let Some(t) = hydrant::kind(&key) else { return Err(bad(c, format!("no system type `{key}`"))) };
+    let flow = hydrant::design_flow(&key, hydrants as u32);
+    out.insert("type".into(), json!(key));
+    out.insert("flow_lpm".into(), json!(flow));
+    out.insert("nozzle_head_mca".into(), json!(t.6));
+    out.insert("hose_dn_mm".into(), json!(t.3));
+    out.insert("hose_length_m".into(), json!(t.4));
+    let mut ok = t.6 <= MAX_NOZZLE_HEAD;
+    if absent(p.get("inside")) {
+        if !absent(p.get("nominal")) {
+            return Err(bad(c, "`nominal` needs the pipe's `inside` diameter (mm)"));
+        }
+        return Ok(Value::Object(out));
+    }
+    let inside = within(c, p, "inside", 0.0, f64::MIN_POSITIVE, 5000.0)?;
+    let material = choice(c, p, "material", &MATERIALS.iter().map(|m| m.0).collect::<Vec<_>>(), "steel")?;
+    let cf = hydrant::hazen_c(material).unwrap_or(120.0);
+    let length = within(c, p, "length", 0.0, 0.0, MAX_COORD)? / 1000.0;
+    let rise = within(c, p, "rise", 0.0, -MAX_COORD, MAX_COORD)? / 1000.0;
+    let (v, j) = (hydrant::speed(flow, inside), hydrant::hazen_j(flow, cf, inside));
+    let loss = j * length;
+    let speed_ok = v <= MAX_SPEED + 1e-9;
+    ok = ok && speed_ok;
+    out.insert("speed_ms".into(), json!(round(v, 100.0)));
+    out.insert("speed_ok".into(), json!(speed_ok));
+    out.insert("head_loss_m_per_m".into(), json!(round(j, 1.0e5)));
+    out.insert("loss_mca".into(), json!(round(loss, 100.0)));
+    out.insert("need_mca".into(), json!(round(t.6 + loss + rise, 100.0)));
+    out.insert(
+        "need_covers".into(),
+        json!("nozzle head + head loss of the straight pipe + rise: not the hose, the fittings or the pressure at the source"),
+    );
+    if !absent(p.get("nominal")) {
+        let nominal = within(c, p, "nominal", 0.0, f64::MIN_POSITIVE, 5000.0)?;
+        let size_ok = nominal + 1e-9 >= hydrant::min_nominal(&key);
+        ok = ok && size_ok;
+        out.insert("size_ok".into(), json!(size_ok));
+    }
+    out.insert("ok".into(), json!(ok));
+    out.insert(
+        "ok_covers".into(),
+        json!("nozzle head within 100 mca, speed within 5 m/s and the pipe's size only: it is not a verdict on the design"),
+    );
+    Ok(Value::Object(out))
+}
+
+fn water_size(_: &mut Session, p: &Value) -> R {
+    use crate::water::{self, FITTINGS, MAX_SPEED, MIN_USE_KPA, Method};
+    let c = "water_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["fixtures", "flow", "method", "dn", "length", "fittings", "pressure", "rise"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let whole = |key: &str, kind: &str, n: &Value| {
+        n.as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 10_000.0 && n.fract() == 0.0)
+            .ok_or_else(|| bad(c, format!("`{key}`: `{kind}` must be a whole number from 0 to 10000, got {n}")))
+    };
+    let method = Method::parse(choice(c, p, "method", &["weights", "sum"], "weights")?).unwrap_or(Method::Weights);
+    let flow = match (absent(p.get("flow")), p.get("fixtures")) {
+        (false, f) if !absent(f) => return Err(bad(c, "give `flow` or `fixtures`, not both")),
+        (false, _) => within(c, p, "flow", 0.0, f64::MIN_POSITIVE, 1000.0)?,
+        (true, Some(Value::Object(f))) => {
+            let mut list: Vec<(&str, f64)> = Vec::new();
+            for (kind, n) in f {
+                if water::fixture(kind).is_none() {
+                    return Err(bad(c, format!("`fixtures`: no fixture `{kind}`, use {}", crate::plumbing::kinds().join(", "))));
+                }
+                let n = whole("fixtures", kind, n)?;
+                list.push((kind.as_str(), n));
+            }
+            water::design_flow(method, &list)
+        }
+        (true, Some(v)) if !absent(Some(v)) => return Err(bad(c, format!("`fixtures` must be an object {{kind: count}}, got {v}"))),
+        _ => 0.0,
+    };
+    if flow <= 0.0 {
+        return Err(bad(c, "`flow` (L/s) or `fixtures` is required"));
+    }
+    let dn = if absent(p.get("dn")) {
+        water::smallest_dn(flow).ok_or_else(|| bad(c, "no DN of PVC soldável (20 to 110) keeps the speed within 3 m/s at that flow"))?
+    } else {
+        let dn = within(c, p, "dn", 0.0, 0.0, 1000.0)?;
+        water::inside(dn).map(|_| dn).ok_or_else(|| bad(c, "`dn` must be one of 20, 25, 32, 40, 50, 60, 75, 85, 110 (PVC soldável)"))?
+    };
+    let inside = water::inside(dn).ok_or_else(|| bad(c, "`dn` is not a PVC soldável size"))?;
+    let mut length = within(c, p, "length", 0.0, 0.0, MAX_COORD)? / 1000.0;
+    match p.get("fittings") {
+        v if absent(v) => {}
+        Some(Value::Object(f)) => {
+            for (kind, n) in f {
+                let le = water::equivalent_length(dn, kind)
+                    .ok_or_else(|| bad(c, format!("`fittings`: no fitting `{kind}`, use {}", FITTINGS.join(", "))))?;
+                length += le * whole("fittings", kind, n)?;
+            }
+        }
+        Some(v) => return Err(bad(c, format!("`fittings` must be an object {{fitting: count}}, got {v}"))),
+        None => {}
+    }
+    let (speed, j) = water::head_loss(flow, inside, water::EPS_PVC);
+    let loss = j * length * water::KPA_PER_M;
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    let mut ok = speed <= MAX_SPEED + 1e-9;
+    let end = if absent(p.get("pressure")) {
+        None
+    } else {
+        let pressure = within(c, p, "pressure", 0.0, 0.0, 1.0e5)?;
+        let rise = within(c, p, "rise", 0.0, -MAX_COORD, MAX_COORD)? / 1000.0;
+        let end = pressure - loss - rise * water::KPA_PER_M;
+        ok = ok && end >= MIN_USE_KPA;
+        Some(end)
+    };
+    Ok(json!({
+        "flow_lps": round(flow, 1000.0),
+        "dn": dn,
+        "inside_mm": round(inside, 10.0),
+        "speed_ms": round(speed, 100.0),
+        "head_loss_m_per_m": round(j, 1.0e5),
+        "equivalent_length_m": round(length, 100.0),
+        "loss_kpa": round(loss, 100.0),
+        "end_kpa": end.map(|e| round(e, 100.0)),
+        "ok": ok,
+        "ok_covers": if end.is_some() { "the speed and the pressure left at the end" } else { "the speed alone: no pressure was given" },
+    }))
+}
+
+fn reservoir_size(_: &mut Session, p: &Value) -> R {
+    use crate::reservoir::{self, Input, Kind, Status};
+    let c = "reservoir_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &[
+        "daily_l",
+        "people",
+        "per_person_l",
+        "days",
+        "fire_l",
+        "house",
+        "lower_percent",
+        "compartments",
+        "fill_flow",
+        "pumps",
+        "towers",
+        "smallest_l",
+        "peak_l",
+    ];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let whole = |key: &str, lo: f64, hi: f64| -> Result<Option<u32>, String> {
+        match p.get(key) {
+            v if absent(v) => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= lo && *n <= hi && n.fract() == 0.0)
+                .map(|n| Some(n as u32))
+                .ok_or_else(|| bad(c, format!("`{key}` must be a whole number from {lo} to {hi}, got {v}"))),
+            None => Ok(None),
+        }
+    };
+    let optional = |key: &str, hi: f64| -> Result<Option<f64>, String> {
+        if absent(p.get(key)) { Ok(None) } else { within(c, p, key, 0.0, f64::MIN_POSITIVE, hi).map(Some) }
+    };
+    let people = whole("people", 1.0, 1.0e6)?;
+    let per_person = optional("per_person_l", 10_000.0)?;
+    let (daily_l, source) = match (optional("daily_l", 1.0e9)?, people, per_person) {
+        (Some(_), Some(_), _) => return Err(bad(c, "`people` and `daily_l` are two ways to give the consumption: give one")),
+        (Some(_), None, Some(_)) => return Err(bad(c, "`per_person_l` goes with `people`, not with `daily_l`")),
+        (Some(d), None, None) => (d, "given as `daily_l`"),
+        (None, Some(n), Some(l)) => (f64::from(n) * l, "`people` times `per_person_l`"),
+        (None, Some(_), None) => {
+            return Err(bad(c, "`people` needs `per_person_l` (litres per person per day): the standard gives none, so it is yours"));
+        }
+        (None, None, Some(_)) => return Err(bad(c, "`per_person_l` needs `people`")),
+        (None, None, None) => return Err(bad(c, "`daily_l` (litres a day), or `people` and `per_person_l`, is required")),
+    };
+    let days = within(c, p, "days", 1.0, 0.01, 365.0)?;
+    let fire_l = within(c, p, "fire_l", 0.0, 0.0, 1.0e9)?;
+    let lower_percent = if absent(p.get("lower_percent")) { None } else { Some(within(c, p, "lower_percent", 0.0, 0.0, 100.0)?) };
+    let input = Input {
+        daily_l,
+        days,
+        fire_l,
+        house: flag(c, p, "house")?,
+        lower_percent,
+        compartments: whole("compartments", 0.0, 1000.0)?,
+        fill_flow_lps: optional("fill_flow", 1.0e6)?,
+        pumps: whole("pumps", 0.0, 1000.0)?,
+        towers: whole("towers", 1.0, 1000.0)?.unwrap_or(1),
+        smallest_l: optional("smallest_l", 1.0e9)?,
+        peak_l: optional("peak_l", 1.0e9)?,
+    };
+    let r = reservoir::size(&input);
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    let pending: Vec<&str> = r.checks.iter().filter(|k| k.status == Status::Pending).map(|k| k.id).collect();
+    Ok(json!({
+        "daily_consumption_l": round(daily_l, 100.0),
+        "consumption": {
+            "source": source,
+            "kind": Kind::Assumption.name(),
+            "note": "the standard gives no litres per person per day: the value is the project's, from a source it names",
+        },
+        "potable_volume_l": round(r.potable_l, 100.0),
+        "fire_reserve_l": round(fire_l, 100.0),
+        "total_volume_l": round(r.total_l, 100.0),
+        "calc": [
+            {"what": "potable volume", "formula": "days x daily consumption", "value": round(r.potable_l, 100.0), "unit": "L"},
+            {"what": "total volume", "formula": "potable volume + fire reserve", "value": round(r.total_l, 100.0), "unit": "L"},
+            {"what": "least supply flow", "formula": "daily consumption / (refill hours x 3600)", "value": round(r.min_fill_flow_lps, 1000.0), "unit": "L/s"},
+        ],
+        "refill": {"hours": r.refill_hours, "min_flow_lps": round(r.min_fill_flow_lps, 1000.0)},
+        "split": r.split.map(|s| json!({
+            "kind": Kind::Assumption.name(),
+            "lower_percent": s.lower_percent,
+            "lower_l": round(s.lower_l, 100.0),
+            "upper_l": round(s.upper_l, 100.0),
+            "note": "the standard fixes no share between the lower and the upper reservoir: this is the project's",
+        })),
+        "suggested_split": {
+            "kind": Kind::Practice.name(),
+            "lower_percent": r.suggested_lower_percent,
+            "note": "the usual share, a common practice and not a requirement; give `lower_percent` to choose",
+        },
+        "checks": r.checks.iter().map(|k| json!({
+            "id": k.id,
+            "kind": k.kind.name(),
+            "status": k.status.name(),
+            "text": k.text,
+            "source": k.source,
+        })).collect::<Vec<_>>(),
+        "pending": pending,
+        "ok": r.checks.iter().all(|k| k.status != Status::Fail),
+        "ok_covers": "the checks that could be made: none failed; `pending` lists what an input not given left open",
+        "not_covered": "the pump's head and power, the recalque pipe (Forchheimer is not the standard's and is not offered here), the fire reserve's own rules and the consumption per person",
+    }))
+}
+
+fn storm_size(_: &mut Session, p: &Value) -> R {
+    use crate::storm::{self, DEFAULT_RAIN, MIN_SLOPE, N_PVC, Off, Outlet};
+    let c = "storm_size";
+    let o = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    const KEYS: &[&str] = &["kind", "area", "rainfall", "flow", "outlet", "gutter", "length", "slope", "inside"];
+    if let Some(key) = o.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let kind = choice(c, p, "kind", &["downpipe", "horizontal"], "")?;
+    if kind.is_empty() {
+        return Err(bad(c, "`kind` (downpipe or horizontal) is required"));
+    }
+    let mine: &[&str] = if kind == "downpipe" { &["outlet", "gutter", "length"] } else { &["slope", "inside"] };
+    if let Some(key) = ["outlet", "gutter", "length", "slope", "inside"].into_iter().find(|k| o.contains_key(*k) && !mine.contains(k)) {
+        return Err(bad(c, format!("`{key}` does not apply to a {kind}")));
+    }
+    if !absent(p.get("flow"))
+        && let Some(key) = ["area", "rainfall"].into_iter().find(|k| o.contains_key(*k))
+    {
+        return Err(bad(c, format!("`{key}` and `flow` are two ways to give the flow: give one")));
+    }
+    let outlet = Outlet::parse(choice(c, p, "outlet", &["edge", "funnel"], "edge")?).unwrap_or(Outlet::Edge);
+    let flow = if absent(p.get("flow")) {
+        let area = within(c, p, "area", 0.0, 0.0, 1.0e7)?;
+        if area <= 0.0 {
+            return Err(bad(c, "`area` (m², the roof that drains) or `flow` (L/min) is required"));
+        }
+        if area > storm::DEFAULT_RAIN_MAX_AREA && absent(p.get("rainfall")) {
+            return Err(bad(
+                c,
+                format!(
+                    "`rainfall` (mm/h, from the standard's table for the place and return period) is required above {} m²: the default {DEFAULT_RAIN} mm/h is for smaller roofs",
+                    storm::DEFAULT_RAIN_MAX_AREA
+                ),
+            ));
+        }
+        storm::design_flow(within(c, p, "rainfall", DEFAULT_RAIN, f64::MIN_POSITIVE, 1000.0)?, area)
+    } else {
+        within(c, p, "flow", 0.0, f64::MIN_POSITIVE, 1.0e9)?
+    };
+    let round = |x: f64, k: f64| (x * k).round() / k + 0.0;
+    if kind == "downpipe" {
+        if absent(p.get("gutter")) {
+            return Err(bad(c, "`gutter` (the water depth in the gutter, 50 to 100 mm) is required"));
+        }
+        if absent(p.get("length")) {
+            return Err(bad(c, "`length` (the downpipe's, mm) is required"));
+        }
+        let (gutter, length) = (within(c, p, "gutter", 0.0, 0.0, 10_000.0)?, within(c, p, "length", 0.0, 0.0, MAX_COORD)? / 1000.0);
+        let d = storm::downpipe_diameter(outlet, flow, gutter, length).map_err(|off| {
+            bad(
+                c,
+                match off {
+                    Off::Depth => "the water depth in the gutter must be 50 to 100 mm: the abacuses stop there",
+                    Off::Length => "a downpipe shorter than 0.3 m is off the abacuses",
+                    Off::Diameter => "more than 150 mm inside is off the abacuses of NBR 10844's Figure 3",
+                },
+            )
+        })?;
+        return Ok(
+            json!({"flow_lpm": round(flow, 100.0), "inside_mm": round(d.diameter, 10.0), "by_depth_mm": round(d.by_depth, 10.0), "by_length_mm": round(d.by_length, 10.0)}),
+        );
+    }
+    if absent(p.get("slope")) {
+        return Err(bad(c, "`slope` (a fraction, 0.005 at least) is required"));
+    }
+    let slope = within(c, p, "slope", 0.0, 0.0, 1.0)?;
+    if slope + 1e-9 < MIN_SLOPE {
+        return Err(bad(c, "`slope` must be 0.5 % (0.005) at least, NBR 10844"));
+    }
+    let need = storm::horizontal_diameter(flow, slope, N_PVC);
+    let inside = within(c, p, "inside", 0.0, 0.0, 10_000.0)?;
+    let carries = (inside > 0.0).then(|| storm::manning_flow(inside, slope, N_PVC));
+    Ok(json!({
+        "flow_lpm": round(flow, 100.0),
+        "inside_mm": round(need, 10.0),
+        "carries_lpm": carries.map(|q| round(q, 10.0)),
+        "ok": carries.map(|q| q + 1e-9 >= flow),
+    }))
+}
+
 fn undo(s: &mut Session, p: &Value) -> R {
     s.step_back(false, steps("undo", p)?)
 }
@@ -4030,6 +7067,31 @@ fn highrise(s: &mut Session, p: &Value) -> R {
         return Err(bad("highrise", "`storeys` must be between 1 and 80"));
     }
     let model = crate::sample::highrise(storeys as u32)?;
+    let elements = model.elements.len();
+    s.reset(model, None);
+    Ok(json!({"storeys": storeys, "elements": elements}))
+}
+
+fn tower(s: &mut Session, p: &Value) -> R {
+    let c = "tower";
+    let params = p.as_object().ok_or_else(|| bad(c, "params must be an object"))?;
+    if let Some(key) = params.keys().find(|k| !["storeys", "plate", "annotation", "sheets"].contains(&k.as_str())) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let plate = match p.get("plate") {
+        v if absent(v) => crate::sample::tower::Plate::REFERENCE,
+        Some(Value::String(s)) if s == "reference" => crate::sample::tower::Plate::REFERENCE,
+        Some(Value::String(s)) if s == "small" => crate::sample::tower::Plate::SMALL,
+        _ => return Err(bad(c, "`plate` must be `reference` or `small`")),
+    };
+    let max = crate::sample::tower::MAX_STOREYS;
+    let storeys = count_opt(c, p, "storeys", max as usize)?;
+    let storeys = u32::try_from(storeys)
+        .ok()
+        .filter(|n| (1..=max).contains(n))
+        .ok_or_else(|| bad(c, format!("`storeys` must be between 1 and {max}")))?;
+    let drawings = crate::sample::tower::Drawings { annotation: flag(c, p, "annotation")?, sheets: flag(c, p, "sheets")? };
+    let model = crate::sample::tower::drawn(plate, storeys, drawings)?;
     let elements = model.elements.len();
     s.reset(model, None);
     Ok(json!({"storeys": storeys, "elements": elements}))
@@ -4206,17 +7268,21 @@ fn beside(s: &Session, path: &str) -> PathBuf {
     }
 }
 
-/// The bytes of the DXF file `path`, or why it can't be brought in.
-fn read_dxf_file(s: &Session, path: &str) -> Result<Vec<u8>, String> {
+/// The bytes of the DXF file `path` (a DWG's, read by the session's DWG reader, as the DXF it becomes) and notes on what a
+/// DWG's read left out, or why it can't be brought in.
+fn read_dxf_file(s: &Session, path: &str) -> Result<(Vec<u8>, Vec<String>), String> {
     let full = beside(s, path);
     match ext(&full).as_str() {
         "dxf" => {}
         "dwg" => {
-            return Err(format!(
-                "{}: BIMCraft doesn't read DWG yet; save it as DXF (any version, ASCII) from the program that made it, \
-                 or convert it with a DWG to DXF converter, and bring that in",
-                full.display()
-            ));
+            let Some(read) = &s.dwg else {
+                return Err(format!(
+                    "{}: this BIMCraft has no DWG reader built in; save it as DXF (any version, ASCII) from the program that \
+                     made it, or convert it with a DWG to DXF converter, and bring that in",
+                    full.display()
+                ));
+            };
+            return read(&full).map_err(|e| format!("{}: {e}", full.display()));
         }
         other => return Err(format!("{}: a .{other} file isn't a CAD drawing BIMCraft reads; it reads DXF", full.display())),
     }
@@ -4224,7 +7290,7 @@ fn read_dxf_file(s: &Session, path: &str) -> Result<Vec<u8>, String> {
     if len > crate::dxf::MAX_BYTES as u64 {
         return Err(format!("{} is too large ({len} bytes; up to {})", full.display(), crate::dxf::MAX_BYTES));
     }
-    std::fs::read(&full).map_err(|e| format!("{}: {e}", full.display()))
+    std::fs::read(&full).map(|bytes| (bytes, Vec::new())).map_err(|e| format!("{}: {e}", full.display()))
 }
 
 /// The CAD import `id` names, by id or GUID.
@@ -4296,6 +7362,7 @@ fn import_cad(s: &mut Session, p: &Value) -> R {
         (level, Some(plan.unwrap_or(level)))
     };
     let link = flag(c, p, "link")?;
+    let mut notes = Vec::new();
     let (name, cad, new) = match (string(c, p, "path")?, string(c, p, "cad")?) {
         (Some(_), Some(_)) => return Err(bad(c, "give `path`, a DXF file to bring in, or `cad`, a drawing the project holds; not both")),
         (None, None) => return Err(bad(c, "give `path`, a DXF file to bring in, or `cad`, the name of a drawing the project holds")),
@@ -4329,7 +7396,8 @@ fn import_cad(s: &mut Session, p: &Value) -> R {
                     format!("the project holds {} CAD drawings already; delete the imports of one first", crate::cad::MAX_CADS),
                 ));
             }
-            let bytes = read_dxf_file(s, &path).map_err(|e| bad(c, e))?;
+            let (bytes, read_notes) = read_dxf_file(s, &path).map_err(|e| bad(c, e))?;
+            notes = read_notes;
             let held: usize = m.cads.values().map(Cad::len).sum();
             if held + bytes.len() > crate::cad::MAX_HELD {
                 return Err(bad(
@@ -4406,6 +7474,9 @@ fn import_cad(s: &mut Session, p: &Value) -> R {
         "id": id, "cad": name, "source": source, "unit": unit, "scale": scale, "entities": entities, "layers": layers,
         "extents": extents, "far": far, "left_out": left_out,
     });
+    if !notes.is_empty() {
+        reply["notes"] = json!(notes);
+    }
     if far > 0 {
         reply["warning"] = json!(format!(
             "{far} of its entities lie far from the rest of the drawing: they're drawn where they are, and left out of its extents. \
@@ -4476,7 +7547,7 @@ fn reload_cad(s: &mut Session, p: &Value) -> R {
         .path()
         .map(str::to_string)
         .ok_or_else(|| bad(c, format!("CAD drawing `{name}` isn't linked; bring it in again with `import_cad` and `link`")))?;
-    let bytes = read_dxf_file(s, &path).map_err(|e| bad(c, e))?;
+    let (bytes, _) = read_dxf_file(s, &path).map_err(|e| bad(c, e))?;
     if cad.same_bytes(&bytes) {
         return Ok(json!({"cad": name, "changed": false}));
     }
@@ -4492,7 +7563,7 @@ fn relink_cads(s: &mut Session) -> Vec<Value> {
     let linked: Vec<(String, String)> = s.model.cads.iter().filter_map(|(n, cad)| Some((n.clone(), cad.path()?.to_string()))).collect();
     let mut failed = Vec::new();
     for (name, path) in linked {
-        let read = read_dxf_file(s, &path).and_then(|bytes| {
+        let read = read_dxf_file(s, &path).and_then(|(bytes, _)| {
             let held = s.model.cads.get(&name);
             if held.is_some_and(|h| h.same_bytes(&bytes)) {
                 return Ok(None);
@@ -4565,6 +7636,386 @@ fn room_separator(s: &mut Session, p: &Value) -> R {
     Ok(json!({"ids": ids}))
 }
 
+fn rebar_bars(s: &mut Session, p: &Value) -> R {
+    let c = "rebar";
+    let mut path = points3(c, p, "points")?;
+    if path.len() < 2 {
+        return Err(bad(c, "`points` needs at least 2 points"));
+    }
+    if flag(c, p, "closed")?
+        && let Some(&first) = path.first()
+    {
+        path.push(first);
+    }
+    if rebar::length(&path) <= TOL {
+        return Err(bad(c, "the bar is too short: its points are all in one place"));
+    }
+    let diameter = num(c, p, "diameter")?.ok_or_else(|| bad(c, "`diameter` in mm is required"))?;
+    let (thin, thick) = rebar::DIAMETERS;
+    if !(thin..=thick).contains(&diameter) {
+        return Err(bad(c, format!("`diameter` {diameter} mm isn't between {thin} and {thick} mm")));
+    }
+    let grade = string(c, p, "grade")?.unwrap_or_else(|| rebar::GRADE.into());
+    if grade.trim().is_empty() {
+        return Err(bad(c, "`grade` can't be blank"));
+    }
+    let layer = string(c, p, "layer")?.unwrap_or_default();
+    let count = count_opt(c, p, "count", 1)?;
+    if !(1..=rebar::MAX_BARS).contains(&count) || count.saturating_mul(path.len()) > MAX_POINTS {
+        return Err(bad(c, format!("`count` is 1 to {} bars, and the bars' points together up to {MAX_POINTS}", rebar::MAX_BARS)));
+    }
+    let step = match p.get("step") {
+        Some(v) if !v.is_null() => point3(v).ok_or_else(|| bad(c, format!("`step` must be [dx, dy, dz] in mm, got {v}")))?,
+        _ if count > 1 => return Err(bad(c, "`step` [dx, dy, dz] is required for more than one bar")),
+        _ => [0.0; 3],
+    };
+    let m = &s.model;
+    let host = match id_opt(c, p, "host")? {
+        Some(h) => Some(m.elements.id(h).ok_or_else(|| bad(c, format!("no element {h}")))?),
+        None => None,
+    };
+    // Its host's level, unless told another.
+    let hosted_at = host.and_then(|h| m.elements.get(h)).and_then(|e| m.level_of(e));
+    let level = match hosted_at {
+        Some(l) if absent(p.get("level")) => l,
+        _ => level_param(c, m, p, "level")?,
+    };
+    let host = host.map(|h| m.guid(h));
+    let m = s.model_mut();
+    let ids: Vec<Id> = (0..count)
+        .map(|k| {
+            let k = k as f64;
+            let path = path.iter().map(|q| [q[0] + k * step[0], q[1] + k * step[1], q[2] + k * step[2]]).collect();
+            m.insert(Element::Rebar(Rebar { level, host, path, diameter, grade: grade.clone(), layer: layer.clone() }))
+        })
+        .collect();
+    Ok(json!({"ids": ids}))
+}
+
+fn reinforce_host(s: &mut Session, p: &Value) -> R {
+    let c = "reinforce";
+    let m = &s.model;
+    // A preset's parameters, which what is given with it replaces.
+    let preset = string(c, p, "preset")?;
+    let merged;
+    let (p, kind) = match &preset {
+        None => (p, None),
+        Some(name) => {
+            let pre = m.reinforcement.get(name).ok_or_else(|| bad(c, format!("there's no reinforcement preset `{name}`")))?;
+            let mut all = pre.params.clone();
+            all.extend(p.as_object().into_iter().flatten().filter(|(k, _)| k.as_str() != "preset").map(|(k, v)| (k.clone(), v.clone())));
+            merged = Value::Object(all);
+            (&merged, Some((name, pre.kind.as_str())))
+        }
+    };
+    // One `host`, or a list of `hosts`, each armed alike; each once.
+    let hosts: Vec<Id> = match (p.get("host"), p.get("hosts")) {
+        (Some(h), Some(l)) if !absent(Some(h)) && !absent(Some(l)) => return Err(bad(c, "give `host` or `hosts`, not both")),
+        (v, Some(Value::Array(a))) if absent(v) && (1..=rebar::MAX_HOSTS).contains(&a.len()) => {
+            let mut seen = BTreeSet::new();
+            a.iter().map(|v| element_id(c, m, v)).collect::<Result<Vec<Id>, String>>()?.into_iter().filter(|id| seen.insert(*id)).collect()
+        }
+        (v, Some(l)) if absent(v) && !absent(Some(l)) => {
+            return Err(bad(c, format!("`hosts` is a list of 1 to {} elements", rebar::MAX_HOSTS)));
+        }
+        _ => {
+            let host = id_opt(c, p, "host")?.ok_or_else(|| bad(c, "`host` (an element) or `hosts` (a list of them) is required"))?;
+            vec![m.elements.id(host).ok_or_else(|| bad(c, format!("no element {host}")))?]
+        }
+    };
+    let several = hosts.len() > 1;
+    let mut made = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut total = 0;
+    for id in &hosts {
+        let element = m.elements.get(*id).ok_or_else(|| bad(c, format!("no element {id}")))?;
+        let level = m.level_of(element).ok_or_else(|| bad(c, "that element has no level"))?;
+        if let Some((name, kind)) = kind.filter(|(_, k)| crate::reinforce::kind_of(element) != Some(*k)) {
+            return Err(bad(c, format!("preset `{name}` is for a {kind}, and {id} is a {}", element.category())));
+        }
+        let crate::reinforce::Made { bars, notes: its } = crate::reinforce::bars(m, element, p)
+            .map_err(|e| if several { format!("{e} (for the {} {id})", element.category()) } else { e })?;
+        notes.extend(its.into_iter().map(|n| if several { format!("{n} (for the {} {id})", element.category()) } else { n }));
+        total += bars.len();
+        if total > rebar::MAX_BARS_ALL {
+            return Err(bad(
+                c,
+                format!(
+                    "that is more than the {} bars a command makes: arm fewer elements at once, or widen a spacing",
+                    rebar::MAX_BARS_ALL
+                ),
+            ));
+        }
+        made.push((*id, m.guid(*id), level, bars));
+    }
+    let hosted: BTreeSet<Guid> = made.iter().map(|(_, g, _, _)| *g).collect();
+    // The bars each made before, which this replaces; a bar with no layer was drawn by hand.
+    let old: Vec<Id> = m
+        .elements
+        .iter()
+        .filter(|(_, e)| matches!(e, Element::Rebar(r) if r.host.is_some_and(|h| hosted.contains(&h)) && !r.layer.is_empty()))
+        .map(|(i, _)| *i)
+        .collect();
+    let weight: f64 = made.iter().flat_map(|(_, _, _, bars)| bars).map(|b| rebar::weight_kg(b.diameter, rebar::length(&b.path))).sum();
+    let m = s.model_mut();
+    for i in &old {
+        m.elements.remove(*i);
+    }
+    let mut ids: Vec<Id> = Vec::new();
+    for (_, guid, level, bars) in made {
+        for b in bars {
+            ids.push(m.insert(Element::Rebar(Rebar {
+                level,
+                host: Some(guid),
+                path: b.path,
+                diameter: b.diameter,
+                grade: b.grade,
+                layer: b.layer.into(),
+            })));
+        }
+    }
+    notes.truncate(rebar::MAX_NOTES);
+    Ok(
+        json!({"ids": ids, "count": ids.len(), "hosts": hosts.len(), "removed": old.len(), "weight_kg": (weight * 1000.0).round() / 1000.0, "notes": notes}),
+    )
+}
+
+fn reinforcement_preset(s: &mut Session, p: &Value) -> R {
+    let c = "reinforcement_preset";
+    only(c, p, &["name", "kind", "params", "rename", "delete"])?;
+    let Some(name) = name_param(c, p, "name")? else {
+        return Ok(json!({"presets": s.model.reinforcement}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if m.reinforcement.remove(&name).is_none() {
+            return Err(bad(c, format!("there's no reinforcement preset `{name}`")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let was = m.reinforcement.get(&name).cloned();
+    let kind = string(c, p, "kind")?
+        .or_else(|| was.as_ref().map(|w| w.kind.clone()))
+        .ok_or_else(|| bad(c, format!("`kind` ({}) is required for a new preset", crate::reinforce::KINDS.join(", "))))?;
+    let params = match p.get("params") {
+        Some(Value::Object(o)) => o.clone(),
+        None | Some(Value::Null) => was.map(|w| w.params).ok_or_else(|| bad(c, "`params` {…} is required for a new preset"))?,
+        Some(v) => return Err(bad(c, format!("`params` must be an object of reinforce's parameters, got {v}"))),
+    };
+    let name = match name_param(c, p, "rename")? {
+        Some(to) if to != name => {
+            if m.reinforcement.contains_key(&to) {
+                return Err(bad(c, format!("there's already a reinforcement preset `{to}`")));
+            }
+            m.reinforcement.remove(&name);
+            rename_entry(m, &LibKind::ReinforcementPreset, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    let preset = crate::reinforce::Preset { kind, params };
+    preset.check(&name).map_err(|e| bad(c, e))?;
+    if !m.reinforcement.contains_key(&name) && m.reinforcement.len() >= crate::reinforce::MAX_PRESETS {
+        return Err(bad(c, format!("the project holds up to {} presets", crate::reinforce::MAX_PRESETS)));
+    }
+    m.reinforcement.insert(name.clone(), preset.clone());
+    Ok(json!({"name": name, "preset": preset}))
+}
+
+/// A number of `unit` under `key`, finite and of any size: the setting's own check says how large it may be.
+fn amount(c: &str, p: &Value, key: &str, unit: &str) -> Result<Option<f64>, String> {
+    match p.get(key) {
+        v if absent(v) => Ok(None),
+        Some(v) => {
+            v.as_f64().filter(|x| x.is_finite()).map(Some).ok_or_else(|| bad(c, format!("`{key}` must be a number of {unit}, got {v}")))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A whole number under `key`, from 0 to 255.
+fn small(c: &str, p: &Value, key: &str) -> Result<Option<u8>, String> {
+    match p.get(key) {
+        v if absent(v) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u8::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| bad(c, format!("`{key}` must be a whole number from 0 to 255, got {v}"))),
+        None => Ok(None),
+    }
+}
+
+/// The text under `key` to set: none when it isn't given (what it was stays), none inside when it is "" (taken away).
+fn clearable(c: &str, p: &Value, key: &str) -> Result<Option<Option<String>>, String> {
+    Ok(string(c, p, key)?.map(|t| Some(t.trim().to_string()).filter(|t| !t.is_empty())))
+}
+
+fn voltage(s: &mut Session, p: &Value) -> R {
+    use crate::electrical::{MAX_VOLTAGES, Voltage};
+    let c = "voltage";
+    only(c, p, &["name", "nominal", "min", "max", "rename", "delete"])?;
+    let Some(name) = name_param(c, p, "name")? else {
+        return Ok(json!({"voltages": s.model.voltages}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if !m.voltages.contains_key(&name) {
+            return Err(bad(c, format!("there's no voltage `{name}`")));
+        }
+        if let Some((system, _)) = m.distribution_systems.iter().find(|(_, d)| d.voltage_names().any(|v| *v == name)) {
+            return Err(bad(c, format!("voltage `{name}` is one distribution system `{system}` supplies: change or delete that first")));
+        }
+        m.voltages.remove(&name);
+        return Ok(json!({"deleted": name}));
+    }
+    let was = m.voltages.get(&name).cloned();
+    let rename = name_param(c, p, "rename")?;
+    if was.is_none() && rename.is_some() {
+        return Err(bad(c, format!("there's no voltage `{name}` to rename")));
+    }
+    let nominal = match (amount(c, p, "nominal", "volts")?, &was) {
+        (Some(n), _) => n,
+        (None, Some(w)) => w.nominal,
+        (None, None) => return Err(bad(c, "`nominal` (volts) is required for a new voltage")),
+    };
+    let band = Voltage::around(nominal);
+    let v = Voltage {
+        nominal,
+        min: amount(c, p, "min", "volts")?.or(was.as_ref().map(|w| w.min)).unwrap_or(band.min),
+        max: amount(c, p, "max", "volts")?.or(was.as_ref().map(|w| w.max)).unwrap_or(band.max),
+    };
+    let name = match rename {
+        Some(to) if to != name => {
+            if m.voltages.contains_key(&to) {
+                return Err(bad(c, format!("there's already a voltage `{to}`")));
+            }
+            m.voltages.remove(&name);
+            rename_entry(m, &LibKind::Voltage, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    v.check(&name).map_err(|e| bad(c, e))?;
+    if !m.voltages.contains_key(&name) && m.voltages.len() >= MAX_VOLTAGES {
+        return Err(bad(c, format!("the project holds up to {MAX_VOLTAGES} voltages")));
+    }
+    m.voltages.insert(name.clone(), v.clone());
+    Ok(json!({"name": name, "voltage": v}))
+}
+
+fn distribution_system(s: &mut Session, p: &Value) -> R {
+    use crate::electrical::{DistributionSystem, MAX_SYSTEMS};
+    let c = "distribution_system";
+    only(c, p, &["name", "phases", "wires", "l_l", "l_n", "l_g", "ground", "rename", "delete"])?;
+    let Some(name) = name_param(c, p, "name")? else {
+        return Ok(json!({"distribution_systems": s.model.distribution_systems}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if m.distribution_systems.remove(&name).is_none() {
+            return Err(bad(c, format!("there's no distribution system `{name}`")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let was = m.distribution_systems.get(&name).cloned();
+    let rename = name_param(c, p, "rename")?;
+    if was.is_none() && rename.is_some() {
+        return Err(bad(c, format!("there's no distribution system `{name}` to rename")));
+    }
+    let phases = small(c, p, "phases")?
+        .or(was.as_ref().map(|w| w.phases))
+        .ok_or_else(|| bad(c, "`phases` (1, 2 or 3) is required for a new distribution system"))?;
+    let wires = small(c, p, "wires")?
+        .or(was.as_ref().map(|w| w.wires))
+        .ok_or_else(|| bad(c, "`wires` (the line conductors and the neutral) is required for a new distribution system"))?;
+    let (l_l, l_n, l_g, ground) = was.map(|w| (w.l_l, w.l_n, w.l_g, w.ground)).unwrap_or_default();
+    let d = DistributionSystem {
+        phases,
+        wires,
+        l_l: clearable(c, p, "l_l")?.unwrap_or(l_l),
+        l_n: clearable(c, p, "l_n")?.unwrap_or(l_n),
+        l_g: clearable(c, p, "l_g")?.unwrap_or(l_g),
+        ground: clearable(c, p, "ground")?.unwrap_or(ground),
+    };
+    let name = match rename {
+        Some(to) if to != name => {
+            if m.distribution_systems.contains_key(&to) {
+                return Err(bad(c, format!("there's already a distribution system `{to}`")));
+            }
+            m.distribution_systems.remove(&name);
+            rename_entry(m, &LibKind::DistributionSystem, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    d.check(&name, &m.voltages).map_err(|e| bad(c, e))?;
+    if !m.distribution_systems.contains_key(&name) && m.distribution_systems.len() >= MAX_SYSTEMS {
+        return Err(bad(c, format!("the project holds up to {MAX_SYSTEMS} distribution systems")));
+    }
+    m.distribution_systems.insert(name.clone(), d.clone());
+    Ok(json!({"name": name, "distribution_system": d}))
+}
+
+fn wire_type(s: &mut Session, p: &Value) -> R {
+    use crate::electrical::{MATERIALS, MAX_SIZES, MAX_WIRE_TYPES, WireSize, WireType};
+    let c = "wire_type";
+    only(c, p, &["name", "material", "temperature", "insulation", "note", "sizes", "rename", "delete"])?;
+    let Some(name) = name_param(c, p, "name")? else {
+        return Ok(json!({"wire_types": s.model.wire_types}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if m.wire_types.remove(&name).is_none() {
+            return Err(bad(c, format!("there's no wire type `{name}`")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let was = m.wire_types.get(&name).cloned();
+    let rename = name_param(c, p, "rename")?;
+    if was.is_none() && rename.is_some() {
+        return Err(bad(c, format!("there's no wire type `{name}` to rename")));
+    }
+    let material = string(c, p, "material")?
+        .or(was.as_ref().map(|w| w.material.clone()))
+        .ok_or_else(|| bad(c, format!("`material` ({}) is required for a new wire type", MATERIALS.join(", "))))?;
+    let temperature = amount(c, p, "temperature", "°C")?
+        .or(was.as_ref().map(|w| w.temperature))
+        .ok_or_else(|| bad(c, "`temperature` (°C) is required for a new wire type"))?;
+    let insulation = string(c, p, "insulation")?
+        .or(was.as_ref().map(|w| w.insulation.clone()))
+        .ok_or_else(|| bad(c, "`insulation` is required for a new wire type"))?;
+    let note = string(c, p, "note")?.or(was.as_ref().map(|w| w.note.clone())).unwrap_or_default();
+    let sizes: Vec<WireSize> = match p.get("sizes") {
+        Some(v) if !absent(Some(v)) => {
+            if v.as_array().is_some_and(|rows| rows.len() > MAX_SIZES) {
+                return Err(bad(c, format!("`sizes` holds up to {MAX_SIZES} rows")));
+            }
+            serde_json::from_value(v.clone())
+                .map_err(|e| bad(c, format!("`sizes` must be a list of {{section, ampacity, label?}}: {e}")))?
+        }
+        _ => was.map(|w| w.sizes).ok_or_else(|| bad(c, "`sizes` [{section, ampacity}, …] is required for a new wire type"))?,
+    };
+    let w = WireType { material, temperature, insulation, note, sizes };
+    let name = match rename {
+        Some(to) if to != name => {
+            if m.wire_types.contains_key(&to) {
+                return Err(bad(c, format!("there's already a wire type `{to}`")));
+            }
+            m.wire_types.remove(&name);
+            rename_entry(m, &LibKind::WireType, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    w.check(&name).map_err(|e| bad(c, e))?;
+    if !m.wire_types.contains_key(&name) && m.wire_types.len() >= MAX_WIRE_TYPES {
+        return Err(bad(c, format!("the project holds up to {MAX_WIRE_TYPES} wire types")));
+    }
+    m.wire_types.insert(name.clone(), w.clone());
+    Ok(json!({"name": name, "wire_type": w}))
+}
+
 fn wall(s: &mut Session, p: &Value) -> R {
     let c = "wall";
     let mut pts = points(c, p, "points")?;
@@ -4585,6 +8036,7 @@ fn wall(s: &mut Session, p: &Value) -> R {
         _ => Some(level_param(c, m, p, "top_level")?),
     };
     let base_offset = num(c, p, "base_offset")?.unwrap_or(0.0);
+    let top_offset = num(c, p, "top_offset")?.unwrap_or(0.0);
     let height = height.unwrap_or(DEFAULT_HEIGHT);
     let arc = num(c, p, "arc")?.unwrap_or(0.0);
     let location = match string(c, p, "location")? {
@@ -4592,6 +8044,11 @@ fn wall(s: &mut Session, p: &Value) -> R {
         None => Location::Centre,
     };
     let (attach_top, attach_base) = (id_opt(c, p, "attach_top")?, id_opt(c, p, "attach_base")?);
+    let room_bounding = match p.get("room_bounding") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad(c, "`room_bounding` is true or false")),
+    };
     let m = s.model_mut();
     let ids: Vec<Id> = pts
         .windows(2)
@@ -4605,10 +8062,13 @@ fn wall(s: &mut Session, p: &Value) -> R {
                 top_level,
                 height,
                 base_offset,
+                top_offset,
                 arc,
                 location,
                 attach_top,
                 attach_base,
+                room_bounding,
+                join: true,
             }))),
             _ => None,
         })
@@ -4657,10 +8117,13 @@ fn flip(s: &mut Session, p: &Value) -> R {
     for e in m.elements.values_mut() {
         if let Element::Dimension(d) = e {
             for r in &mut d.refs {
+                // A flipped wall runs the other way, and across it in to out is out to in: an end swaps too.
                 if lengths.contains_key(&r.id) {
                     r.face = r.face.flipped();
+                    r.point = r.point.map(End::other);
                 } else if hosts.get(&r.id).is_some_and(|h| lengths.contains_key(h)) {
                     r.face = r.face.mirrored();
+                    r.point = r.point.map(End::other);
                 }
             }
         }
@@ -4723,7 +8186,20 @@ fn build_opening(m: &Model, p: &Value, is_door: bool) -> Result<Opening, String>
         None => {
             let at = at.ok_or_else(|| bad(c, "give `at` [x, y] on a wall, or `wall` with `offset`"))?;
             let level = level_param(c, m, p, "level")?;
-            wall_at(m, level, at).ok_or_else(|| bad(c, format!("no wall at [{}, {}] on {}", at.0, at.1, level_name(m, level))))?
+            wall_at(m, level, at).ok_or_else(|| {
+                let none = format!("no wall at [{}, {}] on {}", at.0, at.1, level_name(m, level));
+                match wall_elsewhere(m, at) {
+                    Some((id, bottom, top)) => bad(
+                        c,
+                        format!(
+                            "{none}; wall {id} stands there but spans {bottom} to {top} mm and {} cuts at {} mm: give the wall that level, or a view range that cuts it",
+                            level_name(m, level),
+                            m.plan_range(level).cut
+                        ),
+                    ),
+                    None => bad(c, none),
+                }
+            })?
         }
     };
     let offset = num(c, p, "offset")?.unwrap_or(along_at);
@@ -4796,6 +8272,7 @@ fn floor(s: &mut Session, p: &Value) -> R {
         arrow,
         structural,
         sketch,
+        shape: Default::default(),
         pattern_origin: P2(0.0, 0.0),
         pattern_angle: 0.0,
     }));
@@ -5120,55 +8597,258 @@ fn room(s: &mut Session, p: &Value) -> R {
             _ => None,
         })),
     };
-    let r = Room { params: Default::default(), level, point, name, number: number.clone() };
-    let region = m.room_region(&r).ok_or_else(|| {
-        bad(
+    let mut r = Room::new(level, point, name, number.clone());
+    r.frozen = flag(c, p, "frozen")?;
+    r.base_offset = num(c, p, "base_offset")?.unwrap_or(0.0);
+    let limit_offset = num(c, p, "limit_offset")?;
+    // Unless told, up to 300 mm under the level above; with none above, not bounded, 2500 mm tall.
+    (r.top_level, r.limit_offset) = match (p.get("top_level"), limit_offset) {
+        (v, None) if absent(v) => match m.level_above(level) {
+            Some(above) => (Some(above), crate::model::ROOM_BELOW_ABOVE),
+            None => (None, crate::model::ROOM_LIMIT_OFFSET),
+        },
+        (v, offset) if absent(v) => (None, offset.unwrap_or(crate::model::ROOM_LIMIT_OFFSET)),
+        (_, offset) => (Some(level_param(c, m, p, "top_level")?), offset.unwrap_or(0.0)),
+    };
+    if let Some(wall) = m.wall_holding(&r, m.room_area) {
+        return Err(bad(
             c,
             format!(
-                "[{}, {}] isn't enclosed by walls on {}; place rooms inside a closed loop of walls",
+                "[{}, {}] lies inside wall {}; place a room in the space between walls, not in a wall",
                 point.0,
                 point.1,
-                level_name(m, level)
+                m.shown(wall)
             ),
-        )
-    })?;
-    let area = m2(region.area());
+        ));
+    }
+    // Unbounded, it is placed all the same, as Revit's, with a warning that says why.
+    let (area, warning) = match m.room_bound(&r, m.room_area) {
+        Ok(region) => (m2(region.area()), None),
+        Err(Unbound::NotEnclosed) => (
+            0.0,
+            Some(format!(
+                "[{}, {}] isn't enclosed by walls or room separation lines on {}: the room is placed unbounded, a {} mm square, \
+                 until they close round it",
+                point.0,
+                point.1,
+                level_name(m, level),
+                crate::model::UNBOUNDED_ROOM
+            )),
+        ),
+        Err(Unbound::Shared(other)) => (
+            0.0,
+            Some(format!(
+                "room {} is already in this space; two rooms can't share one, so this one is placed unbounded: move it, delete \
+                 one of them, or part them with a room separation line",
+                m.shown(other)
+            )),
+        ),
+    };
     let id = s.model_mut().insert(Element::Room(r));
-    Ok(json!({"id": id, "number": number, "area_m2": area}))
+    let mut out = json!({"id": id, "number": number, "area_m2": area});
+    if let Some(w) = warning {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
+}
+
+/// The elements whose reference lines may come within `reach` mm of `p` in a plan of `level`, by id: the walls near it
+/// that span the plan's cut height (a wall's faces and caps stay within twice the thickest wall's thickness of its location
+/// line: a cap runs on no farther than the thickest wall meeting it, [`walls::cap`]), the doors and windows in them, the
+/// grids, and the columns (and structural columns) near it that the plan cuts, from whatever level they stand on.
+fn near_point(m: &Model, level: Guid, p: P2, reach: f64) -> BTreeSet<Id> {
+    let look = m.lookup();
+    let thickest = m.types.wall.values().map(|t| t.thickness).filter(|t| t.is_finite()).fold(0.0, f64::max);
+    // Of the walls the plan cuts: those that span its cut height.
+    let cut = m.plan_range(level).cut;
+    let walls = look.walls_near_at(&[([p.0, p.1, p.0, p.1], cut, cut)], reach + 2.0 * thickest + 1.0);
+    let mut out = BTreeSet::new();
+    for &w in &walls {
+        let g = m.guid(w);
+        out.extend(
+            look.referrers(&g).filter(|id| matches!(m.elements.get(*id), Some(Element::Door(o) | Element::Window(o)) if o.host == g)),
+        );
+    }
+    out.extend(walls);
+    out.extend(look.grids());
+    // A column's lines stay within its width or depth, the greater, of its centre.
+    out.extend(look.rare("column").chain(look.rare("structuralcolumn")).filter(|&id| match m.elements.get(id) {
+        Some(e @ (Element::Column(c) | Element::StructuralColumn(c))) => {
+            let size = m.column_type(e).map_or(0.0, |t| t.width.max(t.depth));
+            m.column_cut_by(c, level) && c.at.dist(p) <= reach + size
+        }
+        _ => false,
+    }));
+    out
 }
 
 /// Of the lines a plan of `level` shows that `keep` takes (walls' faces, centre lines and ends,
-/// doors' and windows' centres and jambs, grids), the nearest `p`, within 100 mm.
-fn reference_near(m: &Model, level: impl Key, p: P2, keep: impl Fn(Line) -> bool) -> Option<Reference> {
+/// doors' and windows' centres and jambs, grids, the centre lines and faces of the columns it cuts), the nearest `p`,
+/// within 100 mm.
+pub(crate) fn reference_near(m: &Model, level: impl Key, p: P2, keep: impl Fn(Line) -> bool) -> Option<Reference> {
+    let level = m.guid(level);
+    nearest_reference(m, level, p, keep, near_point(m, level, p, 100.0).into_iter())
+}
+
+/// [`reference_near`] among every element: its twin, which tests hold it to.
+#[cfg(test)]
+pub(crate) fn reference_near_everywhere(m: &Model, level: impl Key, p: P2, keep: impl Fn(Line) -> bool) -> Option<Reference> {
+    let level = m.guid(level);
+    nearest_reference(m, level, p, keep, m.elements.iter().map(|(id, _)| *id))
+}
+
+fn nearest_reference(m: &Model, level: Guid, p: P2, keep: impl Fn(Line) -> bool, ids: impl Iterator<Item = Id>) -> Option<Reference> {
     let cut = |w: Option<&Wall>| w.is_some_and(|w| m.cut_by(w, level));
+    ids.filter(|id| match m.elements.get(*id) {
+        Some(Element::Wall(w)) => cut(Some(w)),
+        Some(Element::Door(o) | Element::Window(o)) => cut(m.wall(o.host)),
+        Some(Element::Column(c) | Element::StructuralColumn(c)) => m.column_cut_by(c, level),
+        Some(Element::Grid(_)) => true,
+        _ => false,
+    })
+    .filter_map(|id| m.reference_at(id, p, &keep))
+    .filter(|(_, d)| *d <= 100.0)
+    .min_by(|a, b| a.1.total_cmp(&b.1))
+    .map(|(r, _)| r)
+}
+
+/// Of the ends of the lines a plan of `level` (`view`, when not the level's own) shows (walls' centre lines and faces,
+/// doors' and windows' jambs, grids, the corners and centre lines of the columns it cuts, its detail lines), the nearest
+/// `p`, within 100 mm.
+pub(crate) fn endpoint_near(m: &Model, level: Guid, view: Option<Guid>, p: P2) -> Option<Reference> {
+    let plan = view.unwrap_or(level);
+    let mut ids = near_point(m, level, p, 100.0);
+    // The view's detail lines: what points at it.
+    ids.extend(m.lookup().referrers(&m.guid(plan)).filter(|id| matches!(m.elements.get(*id), Some(Element::DetailLine(_)))));
+    nearest_end(m, level, view, p, ids.into_iter())
+}
+
+/// [`endpoint_near`] among every element: its twin, which tests hold it to.
+#[cfg(test)]
+pub(crate) fn endpoint_near_everywhere(m: &Model, level: Guid, view: Option<Guid>, p: P2) -> Option<Reference> {
+    nearest_end(m, level, view, p, m.elements.iter().map(|(id, _)| *id))
+}
+
+fn nearest_end(m: &Model, level: Guid, view: Option<Guid>, p: P2, ids: impl Iterator<Item = Id>) -> Option<Reference> {
+    let cut = |w: Option<&Wall>| w.is_some_and(|w| m.cut_by(w, level));
+    let plan = view.unwrap_or(level);
+    ids.filter(|id| match m.elements.get(*id) {
+        Some(Element::Wall(w)) => cut(Some(w)),
+        Some(Element::Door(o) | Element::Window(o)) => cut(m.wall(o.host)),
+        Some(Element::Column(c) | Element::StructuralColumn(c)) => m.column_cut_by(c, level),
+        Some(Element::Grid(_)) => true,
+        Some(Element::DetailLine(l)) => m.same(l.view, plan),
+        _ => false,
+    })
+    .filter_map(|id| m.endpoint_at(id, p))
+    .filter(|(_, d)| *d <= 100.0)
+    .min_by(|a, b| a.1.total_cmp(&b.1))
+    .map(|(r, _)| r)
+}
+
+/// Of the arcs a plan of `level` (`view`, when not the level's own) shows (its curved walls' centre lines and faces, its
+/// detail lines that are arcs), the one passing nearest `p`, within 100 mm.
+fn sweep_near(m: &Model, level: Guid, view: Option<Guid>, p: P2) -> Option<Reference> {
+    let plan = view.unwrap_or(level);
     m.elements
-        .iter()
-        .filter(|(_, e)| match e {
-            Element::Wall(w) => cut(Some(w)),
-            Element::Door(o) | Element::Window(o) => cut(m.wall(o.host)),
-            Element::Grid(_) => true,
-            _ => false,
+        .with_guids()
+        .flat_map(|(_, id, e)| {
+            match e {
+                Element::Wall(w) if w.arc != 0.0 && m.cut_by(w, level) => vec![Face::Centre, Face::Left, Face::Right],
+                Element::DetailLine(l) if m.same(l.view, plan) => vec![Face::Centre],
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(move |face| Reference::line(id, face))
         })
-        .filter_map(|(&id, _)| m.reference_at(id, p, &keep))
+        .filter_map(|r| {
+            let (c, radius, a0, sweep) = m.reference_sweep(&r).ok()?;
+            // How far round from its start `p` lies, the way it sweeps: within it, the distance off it; else from its ends.
+            let t = (sweep.signum() * ((p.1 - c.1).atan2(p.0 - c.0) - a0)).rem_euclid(std::f64::consts::TAU);
+            let gap = if t <= sweep.abs() {
+                (p.dist(c) - radius).abs()
+            } else {
+                let end = |a: f64| c + P2(a.cos(), a.sin()) * radius;
+                p.dist(end(a0)).min(p.dist(end(a0 + sweep)))
+            };
+            Some((r, gap))
+        })
         .filter(|(_, d)| *d <= 100.0)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(r, _)| r)
 }
 
-/// The round column on `level` whose edge passes nearest `p`, within 100 mm.
-fn arc_near(m: &Model, level: impl Key, p: P2) -> Option<Reference> {
-    let level = m.guid(level);
+/// Of what a plan of `level` (`view`, when not the level's own) shows round (the round columns it cuts, its round footings,
+/// its curved walls' centre lines and faces, its detail lines that are circles or arcs), the one whose edge passes nearest
+/// `p`, within 100 mm.
+fn arc_near(m: &Model, level: Guid, view: Option<Guid>, p: P2) -> Option<Reference> {
+    let plan = view.unwrap_or(level);
     m.elements
         .with_guids()
-        .filter(|(_, _, e)| e.column().is_some_and(|col| col.level == level))
-        .filter_map(|(_, id, _)| {
-            let r = Reference { id, face: Face::Centre };
+        .flat_map(|(_, id, e)| {
+            match e {
+                Element::Column(col) | Element::StructuralColumn(col) if m.column_cut_by(col, level) => vec![Face::Centre],
+                Element::Footing(f) if f.level == level => vec![Face::Centre],
+                Element::Wall(w) if w.arc != 0.0 && m.cut_by(w, level) => vec![Face::Centre, Face::Left, Face::Right],
+                Element::DetailLine(l) if m.same(l.view, plan) => vec![Face::Centre],
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(move |face| Reference::line(id, face))
+        })
+        .filter_map(|r| {
             let (c, radius) = m.reference_arc(&r).ok()?;
             Some((r, (p.dist(c) - radius).abs()))
         })
         .filter(|(_, d)| *d <= 100.0)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(r, _)| r)
+}
+
+/// A dimension in a 3D view: see its params doc.
+fn dimension_3d(s: &mut Session, p: &Value) -> R {
+    let c = "dimension_3d";
+    let m = &s.model;
+    let default = absent(p.get("view"))
+        || matches!(p.get("view"), Some(Value::String(n)) if n.eq_ignore_ascii_case("{3D}") || n.eq_ignore_ascii_case("3D"));
+    let view = if default {
+        m.default_3d()
+    } else {
+        let v = view_param(c, m, p, false)?;
+        if !matches!(m.elements.get(v), Some(Element::View3D(_))) {
+            return Err(bad(
+                c,
+                format!("{} isn't a 3D view; a dimension of points and edges in space goes in a 3D view", view_title(m, v)),
+            ));
+        }
+        Some(v)
+    };
+    let refs = match p.get("refs") {
+        Some(Value::Array(a)) if a.len() == 2 => a,
+        _ => return Err(bad(c, "`refs` is two references [{at: [x, y, z], edge?: [[x, y, z], [x, y, z]]}, …]")),
+    };
+    let one = |v: &Value| -> Result<Ref3, String> {
+        let r = serde_json::from_value::<Ref3>(v.clone()).map_err(|e| bad(c, format!("a ref is {{at: [x, y, z], edge?}}: {e}")))?;
+        let fine = |q: [f64; 3]| q.iter().all(|x| x.is_finite() && x.abs() <= MAX_COORD);
+        if !fine(r.at) || r.edge.is_some_and(|[a, b]| !fine(a) || !fine(b)) {
+            return Err(bad(c, format!("a ref's points must be [x, y, z] in mm within ±{MAX_COORD}, got {v}")));
+        }
+        Ok(r)
+    };
+    let refs = [one(&refs[0])?, one(&refs[1])?];
+    let at = point3_req(c, p, "at")?;
+    let type_name = match string(c, p, "type")? {
+        Some(t) => t,
+        None => crate::dims::default_type(&m.dimension_types, DimKind::Aligned).cloned().unwrap_or_default(),
+    };
+    let view = match view {
+        Some(v) => v,
+        None => s.model_mut().insert(Element::View3D(View3D::default_view())),
+    };
+    let d = Dimension3D { view: s.model.guid(view), refs, at, type_name };
+    let length = crate::dims3d::length(&d);
+    let id = s.model_mut().insert(Element::Dimension3D(d));
+    Ok(json!({"id": id, "view": view, "length": hundredth(length)}))
 }
 
 fn dimension(s: &mut Session, p: &Value) -> R {
@@ -5178,7 +8858,12 @@ fn dimension(s: &mut Session, p: &Value) -> R {
     let at = point_req(c, p, "at")?;
     let kind = match string(c, p, "kind")? {
         None => DimKind::Aligned,
-        Some(k) => serde_json::from_value(json!(k)).map_err(|_| bad(c, format!("`kind` is aligned, angular or radial, not `{k}`")))?,
+        Some(k) => serde_json::from_value(json!(k))
+            .map_err(|_| bad(c, format!("`kind` is aligned, linear, angular, radial, diameter or arc_length, not `{k}`")))?,
+    };
+    let mut orient: Option<Orient> = match string(c, p, "orient")? {
+        None => None,
+        Some(o) => Some(serde_json::from_value(json!(o)).map_err(|_| bad(c, format!("`orient` is horizontal or vertical, not `{o}`")))?),
     };
     let given = p.get("refs").and_then(Value::as_array).ok_or_else(|| bad(c, "`refs` [ref, …] is required"))?;
     if given.len() > MAX_POINTS {
@@ -5187,21 +8872,62 @@ fn dimension(s: &mut Session, p: &Value) -> R {
     let mut refs: Vec<Reference> = Vec::new();
     for v in given {
         let near = |q: P2, what: &str| bad(c, format!("no {what} at [{}, {}] on {}", q.0, q.1, level_name(m, level)));
+        let endpoint = v.get("endpoint").filter(|_| v.as_object().is_some_and(|o| o.len() == 1));
+        if let Some(e) = endpoint {
+            let q = point(e).ok_or_else(|| bad(c, format!("`endpoint` is a point [x, y], not {e}")))?;
+            refs.push(
+                endpoint_near(m, level, view, q)
+                    .ok_or_else(|| near(q, "end of a wall, a wall face, a door, a window, a column, a grid or a detail line"))?,
+            );
+            continue;
+        }
         let r = match point(v) {
-            Some(q) if kind == DimKind::Radial => arc_near(m, level, q).ok_or_else(|| near(q, "round column's edge"))?,
+            Some(q) if matches!(kind, DimKind::Radial | DimKind::Diameter) => {
+                arc_near(m, level, view, q).ok_or_else(|| near(q, "round column's, curved wall's, circle's or arc's edge"))?
+            }
+            Some(q) if kind == DimKind::ArcLength => sweep_near(m, level, view, q).ok_or_else(|| near(q, "curved wall or arc"))?,
             Some(q) => {
                 // After the first: one parallel to it, or for an angle, one across it.
                 let first = refs.first().and_then(|r| m.reference_line(r).ok());
                 let keep = |l: Line| first.is_none_or(|(a, b)| geom::parallel(a, b, l.0, l.1) == (kind == DimKind::Aligned));
                 reference_near(m, level, q, keep)
-                    .ok_or_else(|| near(q, "wall face, wall centre line, wall end, door, window or grid line"))?
+                    .ok_or_else(|| near(q, "wall face, wall centre line, wall end, door, window, column or grid line"))?
             }
             None => serde_json::from_value::<Reference>(v.clone())
                 .map_err(|e| bad(c, format!("{v} is not a reference {{id, face?}} or a point [x, y]: {e}")))?,
         };
         refs.push(r);
     }
-    let d = Dimension { level, view, kind, refs, at };
+    if kind == DimKind::Linear && orient.is_none() {
+        // East or west of everything it measures, vertical; else horizontal.
+        let xs: Vec<f64> = refs.iter().filter_map(|r| m.reference_geometry(r).ok()).flat_map(|(a, b)| [a.0, b.0]).collect();
+        let beside = xs.iter().all(|&x| x < at.0) || xs.iter().all(|&x| x > at.0);
+        orient = Some(if beside && !xs.is_empty() { Orient::Vertical } else { Orient::Horizontal });
+    }
+    let type_name = match name_param(c, p, "type")? {
+        Some(t) => t,
+        None => crate::dims::default_type(&m.dimension_types, kind).cloned().unwrap_or_default(),
+    };
+    let text = |key: &str| string(c, p, key).map(Option::unwrap_or_default);
+    let d = Dimension {
+        level,
+        view,
+        kind,
+        orient,
+        refs,
+        at,
+        type_name,
+        prefix: text("prefix")?,
+        suffix: text("suffix")?,
+        above: text("above")?,
+        below: text("below")?,
+        replace: text("replace")?,
+        equality: flag(c, p, "equality")?,
+        texts: Vec::new(),
+        equal: false,
+        locked: Vec::new(),
+        alignment: false,
+    };
     let values: Vec<f64> = m.dimension_values(&d).into_iter().map(hundredth).collect();
     let id = s.model_mut().insert(Element::Dimension(d));
     Ok(json!({"id": id, "values": values}))
@@ -5347,20 +9073,280 @@ fn detectors(s: &mut Session, p: &Value) -> R {
 
 fn text_note(s: &mut Session, p: &Value) -> R {
     let c = "text";
+    if p.get("size").is_some() {
+        return Err(bad(c, "a note's size is its text type's: give `type` (`text_type` lists them, and makes one of a size)"));
+    }
+    only(c, p, &["text", "at", "view", "type", "angle", "leader", "override_format", "runs"])?;
     let m = &s.model;
-    let text = string(c, p, "text")?.ok_or_else(|| bad(c, "`text` is required"))?;
+    let text = note_text(c, p)?.ok_or_else(|| bad(c, "`text` is required"))?;
     let at = point_req(c, p, "at")?;
     let view = view_param(c, m, p, true)?;
+    let type_name = match name_param(c, p, "type")? {
+        Some(n) => n,
+        None => crate::text::default_type(&m.text_types).cloned().ok_or_else(|| bad(c, "the project has no text type; make one first"))?,
+    };
+    let runs = match p.get("runs") {
+        v if absent(v) => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| bad(c, format!("`runs`: {e}")))?,
+        None => Vec::new(),
+    };
     let n = Note {
         view: m.guid(view),
         at,
         text,
-        size: num(c, p, "size")?.unwrap_or(NOTE_SIZE),
+        type_name,
+        size: None,
         angle: num(c, p, "angle")?.unwrap_or(0.0),
         leader: point_opt(c, p, "leader")?,
+        override_format: flag(c, p, "override_format")?,
+        runs,
     };
     let id = s.model_mut().insert(Element::Text(n));
     Ok(json!({"id": id}))
+}
+
+/// A note's `text`: up to [`crate::text::MAX_NOTE`] characters.
+fn note_text(c: &str, p: &Value) -> Result<Option<String>, String> {
+    match p.get("text") {
+        v if absent(v) => Ok(None),
+        Some(Value::String(t)) if t.chars().count() <= crate::text::MAX_NOTE => Ok(Some(t.clone())),
+        Some(v) => Err(bad(c, format!("`text` must be text of at most {} characters, got {v}", crate::text::MAX_NOTE))),
+        None => Ok(None),
+    }
+}
+
+fn text_type(s: &mut Session, p: &Value) -> R {
+    let c = "text_type";
+    let keys = ["font", "size", "bold", "italic", "underline", "width_factor", "color", "border", "border_offset", "border_pen"];
+    only(c, p, &[&["name", "like", "rename", "delete"][..], &keys[..]].concat())?;
+    let Some(name) = name_param(c, p, "name")? else {
+        // What letters each type here: its font, or what stands in for it.
+        let drawn: serde_json::Map<String, Value> =
+            s.model.text_types.iter().map(|(n, t)| (n.clone(), json!(crate::text::resolve(&t.font, false, false).family()))).collect();
+        return Ok(json!({"types": s.model.text_types, "fonts": crate::text::families(), "drawn_with": drawn}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if m.text_types.remove(&name).is_none() {
+            return Err(bad(c, format!("there's no text type `{name}`")));
+        }
+        if let Some((id, _)) = m.elements.iter().find(|(_, e)| matches!(e, Element::Text(n) if n.type_name == name)) {
+            return Err(bad(c, format!("note {id} is of `{name}`; give it another type first")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let mut t = match (m.text_types.get(&name), name_param(c, p, "like")?) {
+        (Some(t), _) => t.clone(),
+        (None, Some(like)) => {
+            m.text_types.get(&like).cloned().ok_or_else(|| bad(c, format!("there's no text type `{like}` to start from")))?
+        }
+        (None, None) => crate::text::TextType::default(),
+    };
+    if let Some(f) = name_param(c, p, "font")? {
+        // A font the type has already stays, though this system hasn't it (a project from another).
+        if !f.trim().eq_ignore_ascii_case(t.font.trim()) {
+            t.font = crate::text::known(&f).ok_or_else(|| {
+                let all = crate::text::families();
+                let word = f.split_whitespace().next().unwrap_or_default().to_lowercase();
+                let like: Vec<&str> = all.iter().map(String::as_str).filter(|n| n.to_lowercase().contains(&word)).take(12).collect();
+                let some: Vec<&str> = if like.is_empty() { all.iter().map(String::as_str).take(12).collect() } else { like };
+                let n = all.len();
+                bad(
+                    c,
+                    format!(
+                        "this system has no font `{f}` (it has {n}, such as: {}); `text_type` without `name` lists them",
+                        some.join(", ")
+                    ),
+                )
+            })?;
+        }
+    }
+    for (key, slot) in [("size", &mut t.size), ("width_factor", &mut t.width_factor), ("border_offset", &mut t.border_offset)] {
+        if let Some(x) = num(c, p, key)? {
+            *slot = x;
+        }
+    }
+    for (key, slot) in [("bold", &mut t.bold), ("italic", &mut t.italic), ("underline", &mut t.underline), ("border", &mut t.border)] {
+        if !absent(p.get(key)) {
+            *slot = flag(c, p, key)?;
+        }
+    }
+    if let Some(v) = p.get("color").filter(|v| !v.is_null()) {
+        t.color = colour(v).ok_or_else(|| bad(c, format!("`color` is \"#rrggbb\" or [r, g, b], each 0 to 255, not {v}")))?;
+    }
+    if let Some(v) = p.get("border_pen").filter(|v| !v.is_null()) {
+        t.border_pen = serde_json::from_value(v.clone()).map_err(|e| bad(c, format!("`border_pen`: {e}")))?;
+    }
+    let name = match name_param(c, p, "rename")? {
+        Some(to) if to != name => {
+            if m.text_types.contains_key(&to) {
+                return Err(bad(c, format!("there's already a text type `{to}`")));
+            }
+            m.text_types.remove(&name);
+            rename_entry(m, &LibKind::TextType, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    t.check(&name).map_err(|e| bad(c, e))?;
+    if m.text_types.get(&name) != Some(&t) {
+        m.text_types.insert(name.clone(), t.clone());
+    }
+    Ok(json!({"name": name, "type": t}))
+}
+
+fn dimension_constraint(s: &mut Session, p: &Value) -> R {
+    use crate::model::Lock;
+    let c = "dimension_constraint";
+    only(c, p, &["id", "equal", "locked"])?;
+    let id = element_id(c, &s.model, p.get("id").unwrap_or(&Value::Null))?;
+    let Some(Element::Dimension(d)) = s.model.elements.get(id) else {
+        return Err(bad(c, format!("{} {id} isn't a dimension", s.model.elements.get(id).map_or("nothing", |e| e.category()))));
+    };
+    let mut d = d.clone();
+    let values = s.model.dimension_values(&d);
+    if !absent(p.get("equal")) {
+        d.equal = flag(c, p, "equal")?;
+        // As Revit's EQ shows its segments as EQ.
+        d.equality = d.equal;
+    }
+    if let Some(v) = p.get("locked").filter(|v| !v.is_null()) {
+        let list = v.as_array().ok_or_else(|| bad(c, format!("`locked` is a list of segments, not {v}")))?;
+        let mut locked = Vec::new();
+        for x in list {
+            let i = x
+                .as_u64()
+                .map(|i| i as usize)
+                .filter(|&i| i < values.len())
+                .ok_or_else(|| bad(c, format!("dimension {id} has segments 0 to {}, not {x}", values.len().saturating_sub(1))))?;
+            // A segment locked already keeps its length; a new one, the length it has now.
+            let length = d.locked.iter().find(|l| l.segment == i).map_or(values.get(i).copied().unwrap_or_default(), |l| l.length);
+            if !locked.iter().any(|l: &Lock| l.segment == i) {
+                locked.push(Lock { segment: i, length });
+            }
+        }
+        locked.sort_by_key(|l| l.segment);
+        d.locked = locked;
+    }
+    s.model_mut().elements.insert(id, Element::Dimension(d.clone()));
+    Ok(json!({"id": id, "equal": d.equal, "locked": d.locked.iter().map(|l| l.segment).collect::<Vec<_>>()}))
+}
+
+fn dimension_text(s: &mut Session, p: &Value) -> R {
+    use crate::model::SegmentText;
+    let c = "dimension_text";
+    only(c, p, &["id", "segment", "prefix", "suffix", "above", "below", "replace"])?;
+    let id = element_id(c, &s.model, p.get("id").unwrap_or(&Value::Null))?;
+    let Some(Element::Dimension(d)) = s.model.elements.get(id) else {
+        return Err(bad(c, format!("{} {id} isn't a dimension", s.model.elements.get(id).map_or("nothing", |e| e.category()))));
+    };
+    let mut d = d.clone();
+    let count = s.model.dimension_labels(&d).len();
+    let given = |key: &str| string(c, p, key);
+    match num(c, p, "segment")? {
+        None => {
+            for (key, slot) in [
+                ("prefix", &mut d.prefix),
+                ("suffix", &mut d.suffix),
+                ("above", &mut d.above),
+                ("below", &mut d.below),
+                ("replace", &mut d.replace),
+            ] {
+                if let Some(t) = given(key)? {
+                    *slot = t;
+                }
+            }
+        }
+        Some(i) if i.fract() == 0.0 && i >= 0.0 && (i as usize) < count => {
+            let i = i as usize;
+            let mut st = d.texts.iter().find(|t| t.segment == i).cloned().unwrap_or(SegmentText { segment: i, ..SegmentText::default() });
+            for (key, slot) in [
+                ("prefix", &mut st.prefix),
+                ("suffix", &mut st.suffix),
+                ("above", &mut st.above),
+                ("below", &mut st.below),
+                ("replace", &mut st.replace),
+            ] {
+                if let Some(t) = given(key)? {
+                    *slot = t;
+                }
+            }
+            d.texts.retain(|t| t.segment != i);
+            if !st.is_empty() {
+                d.texts.push(st);
+                d.texts.sort_by_key(|t| t.segment);
+            }
+        }
+        Some(i) => return Err(bad(c, format!("dimension {id} has segments 0 to {}, not {i}", count.saturating_sub(1)))),
+    }
+    let labels = s.model.dimension_labels(&d);
+    s.model_mut().elements.insert(id, Element::Dimension(d));
+    Ok(json!({"id": id, "labels": labels}))
+}
+
+fn dimension_type(s: &mut Session, p: &Value) -> R {
+    use crate::dims::DimensionType;
+    let c = "dimension_type";
+    let Some(name) = name_param(c, p, "name")? else {
+        return Ok(json!({"types": s.model.dimension_types, "fonts": crate::text::families()}));
+    };
+    let m = s.model_mut();
+    if flag(c, p, "delete")? {
+        if let Some((id, _)) = m.elements.iter().find(|(_, e)| matches!(e, Element::Dimension(d) if d.type_name == name)) {
+            return Err(bad(c, format!("dimension {id} is of `{name}`; give it another type first")));
+        }
+        if m.dimension_types.remove(&name).is_none() {
+            return Err(bad(c, format!("there's no dimension type `{name}`")));
+        }
+        return Ok(json!({"deleted": name}));
+    }
+    let t = match (m.dimension_types.get(&name), name_param(c, p, "like")?) {
+        (Some(t), _) => t.clone(),
+        (None, Some(like)) => {
+            m.dimension_types.get(&like).cloned().ok_or_else(|| bad(c, format!("there's no dimension type `{like}` to start from")))?
+        }
+        (None, None) => DimensionType::default(),
+    };
+    // What it is, with the values given over it, read as a file reads one: a key it hasn't is an error.
+    let mut v = serde_json::to_value(&t).map_err(|e| bad(c, e.to_string()))?;
+    let mut font = None;
+    if let Some(o) = v.as_object_mut() {
+        for (key, value) in p.as_object().into_iter().flatten() {
+            match key.as_str() {
+                "name" | "like" | "rename" | "delete" => {}
+                "font" => font = name_param(c, p, "font")?,
+                "color" if !value.is_null() => {
+                    let rgb =
+                        colour(value).ok_or_else(|| bad(c, format!("`color` is \"#rrggbb\" or [r, g, b], each 0 to 255, not {value}")))?;
+                    o.insert(key.clone(), json!(rgb));
+                }
+                _ => {
+                    o.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    let mut t: DimensionType = serde_json::from_value(v).map_err(|e| bad(c, e.to_string()))?;
+    if let Some(f) = font.filter(|f| !f.trim().eq_ignore_ascii_case(t.font.trim())) {
+        t.font = crate::text::known(&f)
+            .ok_or_else(|| bad(c, format!("this system has no font `{f}`; `dimension_type` without `name` lists them")))?;
+    }
+    let name = match name_param(c, p, "rename")? {
+        Some(to) if to != name => {
+            if m.dimension_types.contains_key(&to) {
+                return Err(bad(c, format!("there's already a dimension type `{to}`")));
+            }
+            m.dimension_types.remove(&name);
+            rename_entry(m, &LibKind::DimensionType, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    t.check(&name).map_err(|e| bad(c, e))?;
+    if m.dimension_types.get(&name) != Some(&t) {
+        m.dimension_types.insert(name.clone(), t.clone());
+    }
+    Ok(json!({"name": name, "type": t}))
 }
 
 fn spot(s: &mut Session, p: &Value) -> R {
@@ -5376,11 +9362,35 @@ fn spot(s: &mut Session, p: &Value) -> R {
         })?)),
         (None, None) => None,
     };
-    let sp = Spot { view: m.guid(view), at, host };
+    let sp = Spot { view: m.guid(view), at, host, slope: false };
     let elevation = m.spot_value(&sp).map(hundredth);
     let host = host.and_then(|h| m.elements.id(h));
     let id = s.model_mut().insert(Element::Spot(sp));
     Ok(json!({"id": id, "elevation": elevation, "host": host}))
+}
+
+/// A spot slope: in a plan, how steeply the top of the floor or roof at `at` (or `host`) falls there, and which way.
+fn spot_slope(s: &mut Session, p: &Value) -> R {
+    let c = "spot_slope";
+    let m = &s.model;
+    let at = point_req(c, p, "at")?;
+    let view = view_param(c, m, p, false)?;
+    let level = m.plan_level(view).ok_or_else(|| bad(c, "a spot slope reads a floor's or a roof's top: place it in a plan"))?;
+    let tops = |id: &Id| matches!(m.elements.get(*id), Some(Element::Floor(_) | Element::Roof(_)));
+    let host = match id_opt(c, p, "host")? {
+        Some(h) => m.elements.id(h),
+        None => m.spot_host(level, at),
+    };
+    let host = host.filter(tops).ok_or_else(|| {
+        let place = format!("[{}, {}] on {}", at.0, at.1, level_name(m, level));
+        bad(c, format!("no slope to read at {place}; place it on a floor or a roof"))
+    })?;
+    let sp = Spot { view: m.guid(view), at, host: Some(m.guid(host)), slope: true };
+    let read = m.spot_slope(&sp);
+    let id = s.model_mut().insert(Element::Spot(sp));
+    Ok(
+        json!({"id": id, "host": host, "slope": read.map(|(f, _)| hundredth(f)), "toward": read.and_then(|(_, d)| d).map(|d| [hundredth(d.0), hundredth(d.1)])}),
+    )
 }
 
 /// The top of something standing on `level`: up to the next level, or `height` mm tall, or up to
@@ -5438,11 +9448,13 @@ pub fn stood_of(m: &Model, p: &Value, category: &str) -> Result<Element, String>
             top_level: None,
             height: thickness,
             base_offset: top - thickness,
+            room_bounding: true,
         };
         return Ok(Element::Footing(col));
     }
     let (top_level, height) = top_param(c, m, p, level)?;
     let col = Column {
+        room_bounding: true,
         params: Default::default(),
         type_name,
         level,
@@ -5601,6 +9613,18 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         return Ok(json!({"ids": [id], "wire": wire_id}));
     }
     chain(s, p, "cablecarrier")
+}
+
+fn duct(s: &mut Session, p: &Value) -> R {
+    chain(s, p, "duct")
+}
+
+fn conduit(s: &mut Session, p: &Value) -> R {
+    chain(s, p, "conduit")
+}
+
+fn cable_tray(s: &mut Session, p: &Value) -> R {
+    chain(s, p, "cabletray")
 }
 
 // A wire in a carrier stores its physical axis instead of a mounting contact line.
@@ -6039,6 +10063,9 @@ pub fn command_of(category: &str) -> &'static str {
         "stripfooting" => "strip_footing",
         "beam" => "beam",
         "pipe" => "pipe",
+        "duct" => "duct",
+        "conduit" => "conduit",
+        "cabletray" => "cable_tray",
         "cablecarrier" => "cable_carrier",
         "wire" => "wire",
         "downconductor" => "down_conductor",
@@ -6155,6 +10182,7 @@ pub fn runs_of(m: &Model, p: &Value, category: &str) -> Result<Vec<Element>, Str
                     offset,
                     end_offset,
                     justify,
+                    join: true,
                     system: system.clone(),
                     source,
                     devices: devices.clone(),
@@ -6314,7 +10342,8 @@ fn roof(s: &mut Session, p: &Value) -> R {
     let type_name = type_param(c, p, m, "roof")?;
     let extrusion: Option<Extrusion> = shaped(c, p, "extrusion", "{line: [[x,y],[x,y]], profile: [[along, up],…], from?, to}")?;
     let drawn = sketched(c, p, "courtyards", &[])?;
-    let sketch = drawn.as_ref().map(|(_, lines)| lines.clone()).unwrap_or_default();
+    let lines = drawn.as_ref().map(|(_, lines)| lines.clone()).unwrap_or_default();
+    let sketch = unslope(&lines);
     let given = !absent(p.get("boundary")) || drawn.is_some();
     let overhang = num(c, p, "overhang")?.unwrap_or(if given || extrusion.is_some() { 0.0 } else { 500.0 });
     let (boundary, found) = match (drawn, given, &extrusion) {
@@ -6323,7 +10352,7 @@ fn roof(s: &mut Session, p: &Value) -> R {
         (None, false, Some(_)) => (Vec::new(), Vec::new()),
         (None, false, None) => roof_footprint(m, level, overhang).map_err(|e| bad(c, e))?,
     };
-    let r = Roof {
+    let mut r = Roof {
         params: Default::default(),
         type_name,
         level,
@@ -6333,14 +10362,44 @@ fn roof(s: &mut Session, p: &Value) -> R {
         overhang,
         gable: flag(c, p, "gable")?,
         gables: shaped(c, p, "gables", "a list of edge numbers")?.unwrap_or_default(),
+        slopes: shaped(c, p, "slopes", "a list of degrees, one for each edge")?.unwrap_or_default(),
         offset: num(c, p, "offset")?.unwrap_or(0.0),
         openings: rings(c, p, "openings")?.unwrap_or_default(),
         join: id_opt(c, p, "join")?,
         extrusion,
         sketch,
+        shape: Default::default(),
     };
+    // Its sketch lines' slopes are its edges', unless it is given `slopes`.
+    if absent(p.get("slopes")) {
+        r.slopes = slopes_of_edges(&r, &lines, &[]);
+    }
     let id = s.model_mut().insert(Element::Roof(r));
     Ok(json!({"id": id}))
+}
+
+/// `lines` as a roof keeps them: none holds a `slope`, which the roof keeps as its `slopes`.
+fn unslope(lines: &[SketchLine]) -> Vec<SketchLine> {
+    lines.iter().map(|l| SketchLine { slope: None, ..l.clone() }).collect()
+}
+
+/// The `slopes` of roof `r`'s footprint edges, as the sketch `lines` that say a `slope` give them: an edge along such a line has
+/// its slope, 0 meaning the roof's; any other edge the one it had along an edge of `was` (an edited roof's edges, each with its
+/// slope), else 0. Empty when none has a slope, and for a footprint too big to pitch, whose slopes nothing reads.
+fn slopes_of_edges(r: &Roof, lines: &[SketchLine], was: &[((P2, P2), f64)]) -> Vec<f64> {
+    let said: Vec<(Vec<P2>, f64)> = lines.iter().filter_map(|l| Some((l.points(), l.slope?))).collect();
+    if r.edges().count() > crate::model::MAX_ROOF_POINTS || (said.is_empty() && was.iter().all(|(_, s)| *s == 0.0)) {
+        return Vec::new();
+    }
+    let within = |(a, b): (P2, P2), (c, d): (P2, P2)| geom::dist_to_segment(c, a, b) <= TOL && geom::dist_to_segment(d, a, b) <= TOL;
+    let slopes: Vec<f64> = r
+        .edges()
+        .map(|e| {
+            let own = said.iter().find(|(drawn, _)| sketch::along(drawn, e.0, e.1)).map(|(_, s)| *s);
+            own.or_else(|| was.iter().find(|(old, _)| within(*old, e)).map(|(_, s)| *s)).unwrap_or(0.0)
+        })
+        .collect();
+    if slopes.iter().all(|s| *s == 0.0) { Vec::new() } else { slopes }
 }
 
 /// A dormer on a roof's slope: its front wall across the slope through `at`, its cheek walls back
@@ -6401,11 +10460,13 @@ fn dormer(s: &mut Session, p: &Value) -> R {
         overhang: f,
         gable: false,
         gables: vec![0, 2],
+        slopes: Vec::new(),
         offset: eave - model.elevation(level),
         openings: Vec::new(),
         join: Some(host),
         extrusion: None,
         sketch: Vec::new(),
+        shape: Default::default(),
     }));
     let roof_guid = model.guid(roof);
     let wall = |start: P2, end: P2| {
@@ -6418,10 +10479,13 @@ fn dormer(s: &mut Session, p: &Value) -> R {
             top_level: None,
             height: ridge - front,
             base_offset,
+            top_offset: 0.0,
             arc: 0.0,
             location: Location::Centre,
             attach_top: Some(roof_guid),
             attach_base: Some(host),
+            room_bounding: true,
+            join: true,
         })
     };
     let (l, r) = (micron(at + n * (w / 2.0)), micron(at - n * (w / 2.0)));
@@ -6465,7 +10529,7 @@ fn sketch_param(c: &str, p: &Value, key: &str, old: &[SketchLine]) -> Result<Opt
             Given::Arc([a, b, t]) => Ok(SketchLine::arc(a, b, t)),
             Given::Full(k) => {
                 let curve = k.fields().curve().map_err(|e| bad(c, format!("`{key}` line {i}: {e}")))?;
-                let mut l = SketchLine { style: k.style.clone(), invisible: k.invisible, ..SketchLine::from(curve) };
+                let mut l = SketchLine { style: k.style.clone(), invisible: k.invisible, slope: k.slope, ..SketchLine::from(curve) };
                 if k.id != 0 {
                     let id = k.id;
                     let was = old.iter().find(|o| o.id == id).ok_or_else(|| {
@@ -6542,7 +10606,24 @@ fn boundary_now(e: &Element) -> Option<Vec<SketchLine>> {
         _ => return None,
     };
     let kept = e.sketch().filter(|ls| sketch::draws(ls, &outline, &holes)).cloned();
-    Some(kept.unwrap_or_else(|| sketch::lines_of(&outline, &holes)))
+    let mut lines = kept.unwrap_or_else(|| sketch::lines_of(&outline, &holes));
+    // A roof's lines say the slope their edges share, when they have one of their own.
+    if let Element::Roof(r) = e
+        && !r.slopes.is_empty()
+        && r.edges().count() <= crate::model::MAX_ROOF_POINTS
+    {
+        for l in &mut lines {
+            let drawn = l.points();
+            let mine: Vec<f64> = r
+                .edges()
+                .enumerate()
+                .filter(|(_, (a, b))| sketch::along(&drawn, *a, *b))
+                .map(|(i, _)| r.slopes.get(i).copied().unwrap_or(0.0))
+                .collect();
+            l.slope = mine.first().copied().filter(|first| mine.iter().all(|s| s == first));
+        }
+    }
+    Some(lines)
 }
 
 /// Revit's Edit Boundary: an element's outline and its holes redrawn as one sketch.
@@ -6569,13 +10650,24 @@ fn edit_boundary(s: &mut Session, p: &Value) -> R {
         return Ok(json!({"id": id, "sketch": now}));
     };
     let area = m2(r.area());
+    let mut said = serde_json::Map::new();
     let e = match e {
-        Element::Floor(f) => Element::Floor(Floor { boundary: r.outer, openings: r.holes, sketch: lines, ..f }),
+        Element::Floor(f) => {
+            let shape;
+            (shape, said) = shape_within(m, &f, &r.outer, &r.holes);
+            Element::Floor(Floor { boundary: r.outer, openings: r.holes, sketch: lines, shape, ..f })
+        }
         Element::Ceiling(x) => Element::Ceiling(Ceiling { boundary: r.outer, openings: r.holes, sketch: lines, ..x }),
         Element::Shaft(_) if !r.holes.is_empty() => return Err(bad(c, "a shaft is one outline with no holes in it")),
         Element::Shaft(sh) => Element::Shaft(Shaft { boundary: r.outer, sketch: lines, ..sh }),
         Element::Roof(old) => {
-            let mut new = Roof { boundary: r.outer, courtyards: r.holes, gables: Vec::new(), sketch: lines, ..old.clone() };
+            let mut new = Roof { boundary: r.outer, courtyards: r.holes, gables: Vec::new(), sketch: unslope(&lines), ..old.clone() };
+            // A slope stays with its edge too, where the edge stays or is cut in two; the lines may say it instead.
+            let was: Vec<((P2, P2), f64)> = old.edges().enumerate().map(|(i, e)| (e, old.slopes.get(i).copied().unwrap_or(0.0))).collect();
+            new.slopes = slopes_of_edges(&new, &lines, &was);
+            // A flat one's shape keeps what stays on its top, as a floor's does.
+            let holes: Vec<Vec<P2>> = new.courtyards.iter().chain(&new.openings).cloned().collect();
+            (new.shape, said) = shape_within(m, &m.roof_as_floor(&old), &new.boundary, &holes);
             // A gable stays where its edge does, either way round.
             let same =
                 |(a, b): (P2, P2), (c, d): (P2, P2)| (a.dist(c) <= TOL && b.dist(d) <= TOL) || (a.dist(d) <= TOL && b.dist(c) <= TOL);
@@ -6587,7 +10679,309 @@ fn edit_boundary(s: &mut Session, p: &Value) -> R {
     };
     let id = m.elements.id(id).ok_or_else(|| bad(c, "no such element"))?;
     s.model_mut().elements.insert(id, e);
-    Ok(json!({"id": id, "area_m2": area}))
+    let mut reply = json!({"id": id, "area_m2": area});
+    if let Some(o) = reply.as_object_mut() {
+        o.extend(said);
+    }
+    Ok(reply)
+}
+
+/// What of a floor's (or a flat roof's, seen as one) shape a new outline and openings keep, so its top round them stays
+/// as it was: the points inside the outline (or on it) and in no opening; each split line cut where it leaves the outline
+/// or enters an opening, the pieces inside kept; and at each end of a piece, and each new corner of the outline or an
+/// opening, a point at the height the top had there, unless one is there or it was 0. And what changed, as `dropped`
+/// (`{points: [[x, y], …], lines: [[[x, y], [x, y]], …]}`, what went), `cut` (the lines cut) and `added` (the points made).
+fn shape_within(m: &Model, old: &Floor, outline: &[P2], holes: &[Vec<P2>]) -> (crate::model::Shape, serde_json::Map<String, Value>) {
+    let sh = &old.shape;
+    let mut said = serde_json::Map::new();
+    if sh.is_empty() {
+        return (sh.clone(), said);
+    }
+    let was = |q: P2| (m.shape_height(old, q) * 1000.0).round() / 1000.0;
+    let near = |r: &[P2], q: P2| geom::ring_edges(r).any(|(a, b)| geom::dist_to_segment(q, a, b) <= TOL);
+    let inside = |q: P2| (geom::contains(outline, q) || near(outline, q)) && !holes.iter().any(|h| geom::contains(h, q) && !near(h, q));
+    let (mut points, gone_points): (Vec<_>, Vec<_>) = sh.points.iter().cloned().partition(|x| inside(x.at));
+    let corners: Vec<P2> = outline.iter().chain(holes.iter().flatten()).copied().collect();
+    let old_corners: Vec<P2> = old.boundary.iter().chain(old.openings.iter().flatten()).copied().collect();
+    let edges: Vec<(P2, P2)> = std::iter::once(outline).chain(holes.iter().map(Vec::as_slice)).flat_map(geom::ring_edges).collect();
+    let mut added: Vec<P2> = Vec::new();
+    // A point at `q` at the height the top had there, unless one is there, it's a corner the top already meets, or it was 0.
+    let mut keep_height = |points: &mut Vec<crate::model::ShapePoint>, q: P2, corner_ok: bool| {
+        let known = points.iter().any(|x| x.at.dist(q) <= TOL) || (corner_ok && corners.iter().any(|c| c.dist(q) <= TOL));
+        let z = was(q);
+        if !known && z.abs() > 0.01 {
+            points.push(crate::model::ShapePoint { at: q, z, ..Default::default() });
+            added.push(q);
+        }
+    };
+    // Each new corner where the top wasn't at 0.
+    for &c in &corners {
+        if !old_corners.iter().any(|o| o.dist(c) <= TOL) {
+            keep_height(&mut points, c, false);
+        }
+    }
+    let (mut lines, mut gone_lines, mut cut) = (Vec::new(), Vec::new(), Vec::new());
+    for l in &sh.lines {
+        // Where it crosses an edge, or passes a corner: the pieces between, those inside kept.
+        let mut ts = vec![0.0, 1.0];
+        ts.extend(edges.iter().filter_map(|&(a, b)| geom::crossing(l.a, l.b, a, b)));
+        ts.extend(corners.iter().filter(|c| geom::dist_to_segment(**c, l.a, l.b) <= TOL).map(|c| geom::param_on_segment(*c, l.a, l.b)));
+        ts.sort_by(f64::total_cmp);
+        ts.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let at = |t: f64| l.a + (l.b - l.a) * t;
+        let mut pieces: Vec<(f64, f64)> = Vec::new();
+        for w in ts.windows(2) {
+            if let [t0, t1] = *w
+                && inside(at((t0 + t1) / 2.0))
+            {
+                match pieces.last_mut() {
+                    Some(last) if (last.1 - t0).abs() < 1e-9 => last.1 = t1,
+                    _ => pieces.push((t0, t1)),
+                }
+            }
+        }
+        let pieces: Vec<(P2, P2)> = pieces.into_iter().map(|(t0, t1)| (at(t0), at(t1))).filter(|(a, b)| a.dist(*b) > TOL).collect();
+        match pieces.as_slice() {
+            [] => gone_lines.push(l.clone()),
+            [(a, b)] if a.dist(l.a) <= TOL && b.dist(l.b) <= TOL => lines.push(l.clone()),
+            _ => {
+                cut.push([l.a, l.b]);
+                lines.extend(pieces.iter().map(|&(a, b)| crate::model::SplitLine { a, b, ..Default::default() }));
+            }
+        }
+    }
+    // Each end of a line kept a point or a corner, at the height the top had there.
+    for end in lines.iter().flat_map(|l| [l.a, l.b]).collect::<Vec<_>>() {
+        keep_height(&mut points, end, true);
+    }
+    if !gone_points.is_empty() || !gone_lines.is_empty() {
+        said.insert(
+            "dropped".into(),
+            json!({
+                "points": gone_points.iter().map(|x| x.at).collect::<Vec<_>>(),
+                "lines": gone_lines.iter().map(|l| [l.a, l.b]).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    if !cut.is_empty() {
+        said.insert("cut".into(), json!(cut));
+    }
+    if !added.is_empty() {
+        said.insert("added".into(), json!(added));
+    }
+    (crate::model::Shape { points, lines }, said)
+}
+
+/// A shape's point as a command takes it; `id` keeps the point it names, and a `guid` sent back with it is let be.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointIn {
+    #[serde(default)]
+    id: Option<Id>,
+    #[serde(default, rename = "guid")]
+    _guid: Option<Guid>,
+    at: P2,
+    #[serde(default)]
+    z: Option<f64>,
+}
+
+/// A split line as a command takes it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LineIn {
+    #[serde(default)]
+    id: Option<Id>,
+    #[serde(default, rename = "guid")]
+    _guid: Option<Guid>,
+    a: P2,
+    b: P2,
+}
+
+/// The floor or flat roof `id` names, by its id, with params that are only `keys`: as shape editing sees it
+/// (`Model::shapeable`), a roof's top as a floor's.
+fn shaped_floor(c: &str, s: &Session, p: &Value, keys: &[&str]) -> Result<(Id, Floor), String> {
+    if let Some(key) = p.as_object().and_then(|o| o.keys().find(|k| !keys.contains(&k.as_str()))) {
+        return Err(bad(c, format!("unknown parameter `{key}`")));
+    }
+    let m = &s.model;
+    let key = id_opt(c, p, "id")?.ok_or_else(|| bad(c, "`id`, the floor or flat roof to shape, is required"))?;
+    let id = m.elements.id(key).ok_or_else(|| bad(c, format!("no element {key}")))?;
+    m.shapeable(id).map(|f| (id, f)).map_err(|e| bad(c, format!("{id}: {e}")))
+}
+
+/// Element `id`'s shape given anew: a floor's or a roof's.
+fn put_shape(s: &mut Session, id: Id, shape: crate::model::Shape) {
+    if let Some(sh) = s.model_mut().elements.get_mut(id).and_then(Element::shape_mut) {
+        *sh = shape;
+    }
+}
+
+/// A height as a command takes it, mm: `z`, finite and in range.
+fn height(c: &str, z: f64) -> Result<f64, String> {
+    (z.is_finite() && z.abs() <= MAX_COORD).then_some(z).ok_or_else(|| bad(c, format!("`z` must be a number in mm, got {z}")))
+}
+
+/// Each end of `lines` that is none of `points` and no corner of `f`'s outline or openings, made a point at the height
+/// `f`'s top has there with `points` and no lines.
+fn loose_ends(m: &Model, f: &Floor, points: &mut Vec<crate::model::ShapePoint>, lines: &[crate::model::SplitLine]) {
+    let corners: Vec<P2> = f.boundary.iter().chain(f.openings.iter().flatten()).copied().collect();
+    let base = Floor { shape: crate::model::Shape { points: points.clone(), lines: Vec::new() }, ..f.clone() };
+    for end in lines.iter().flat_map(|l| [l.a, l.b]) {
+        let known = |q: &P2| q.dist(end) <= TOL;
+        if !points.iter().any(|x| known(&x.at)) && !corners.iter().any(known) {
+            points.push(crate::model::ShapePoint { at: end, z: m.shape_height(&base, end), ..Default::default() });
+        }
+    }
+}
+
+/// What `edit_shape` says of a floor's shape: its points and split lines, its corners at their heights, how many planes
+/// its top is, and its lowest and highest.
+fn shape_reply(m: &Model, id: Id, f: &Floor) -> Value {
+    let points: Vec<Value> = f.shape.points.iter().map(|x| json!({"id": x.id, "at": x.at, "z": x.z})).collect();
+    let lines: Vec<Value> = f.shape.lines.iter().map(|l| json!({"id": l.id, "a": l.a, "b": l.b})).collect();
+    let corners: Vec<Value> =
+        f.boundary.iter().chain(f.openings.iter().flatten()).map(|q| json!({"at": q, "z": hundredth(m.shape_height(f, *q))})).collect();
+    json!({"id": id, "points": points, "lines": lines, "corners": corners, "faces": shape_faces(m, f), "top": top_range(m, f)})
+}
+
+/// How many planes a floor's top is.
+fn shape_faces(m: &Model, f: &Floor) -> usize {
+    if f.shape.is_empty() { 1 } else { m.shape_planes(f).map_or(1, |planes| planes.len()) }
+}
+
+/// A floor's top at its lowest and its highest, mm above the project's zero, to the hundredth.
+fn top_range(m: &Model, f: &Floor) -> Value {
+    let (lo, hi) = m
+        .floor_faces(f)
+        .iter()
+        .flat_map(|(ring, plane)| ring.iter().map(move |q| plane.at(*q)))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), z| (lo.min(z), hi.max(z)));
+    json!([hundredth(lo), hundredth(hi)])
+}
+
+/// The established tools' shape editing, all at once: a floor's points and split lines given anew, as `edit_boundary`
+/// gives an outline. Asked with neither, says what the shape is.
+fn edit_shape(s: &mut Session, p: &Value) -> R {
+    let c = "edit_shape";
+    let (id, f) = shaped_floor(c, s, p, &["id", "points", "lines", "absolute"])?;
+    let m = &s.model;
+    if absent(p.get("points")) && absent(p.get("lines")) {
+        return Ok(shape_reply(m, id, &f));
+    }
+    let absolute = flag(c, p, "absolute")?;
+    let given: Vec<PointIn> = shaped(c, p, "points", "a list of {at: [x, y], z, id?}")?.unwrap_or_default();
+    let lines_in: Vec<LineIn> = shaped(c, p, "lines", "a list of {a: [x, y], b: [x, y], id?}")?.unwrap_or_default();
+    let top = m.floor_top(&f);
+    let old = &f.shape;
+    let mut points = Vec::with_capacity(given.len());
+    for x in given {
+        let z = height(c, x.z.ok_or_else(|| bad(c, format!("the point at {:?} needs its height `z`", x.at)))?)?;
+        let was = x.id.and_then(|i| old.points.iter().find(|o| o.id == i));
+        let (pid, guid) = was.map_or((0, Guid::default()), |o| (o.id, o.guid));
+        points.push(crate::model::ShapePoint { id: pid, guid, at: x.at, z: if absolute { z - top.at(x.at) } else { z } });
+    }
+    let lines: Vec<crate::model::SplitLine> = lines_in
+        .into_iter()
+        .map(|l| {
+            let was = l.id.and_then(|i| old.lines.iter().find(|o| o.id == i));
+            let (lid, guid) = was.map_or((0, Guid::default()), |o| (o.id, o.guid));
+            crate::model::SplitLine { id: lid, guid, a: l.a, b: l.b }
+        })
+        .collect();
+    loose_ends(m, &f, &mut points, &lines);
+    let f = Floor { shape: crate::model::Shape { points, lines }, ..f };
+    let reply = json!({"id": id, "faces": shape_faces(m, &f), "top": top_range(m, &f)});
+    put_shape(s, id, f.shape);
+    Ok(reply)
+}
+
+/// Add Point: a point on a floor's top at `at`, `z` mm above where the top would be without its shape (with `absolute`,
+/// at that elevation); with no `z`, at the height the top has there now. Within a millimetre of a point it has, that one.
+fn add_point(s: &mut Session, p: &Value) -> R {
+    let c = "add_point";
+    let (id, mut f) = shaped_floor(c, s, p, &["id", "at", "z", "absolute", "offset"])?;
+    let m = &s.model;
+    let at = point_req(c, p, "at")?;
+    let z = match (num(c, p, "z")?, num(c, p, "offset")?) {
+        (Some(_), Some(_)) => return Err(bad(c, "give `z` or `offset`, not both")),
+        (None, Some(by)) => m.shape_height(&f, at) + by,
+        (Some(z), None) if flag(c, p, "absolute")? => z - m.floor_top(&f).at(at),
+        (Some(z), None) => z,
+        (None, None) => m.shape_height(&f, at),
+    };
+    match f.shape.points.iter_mut().find(|x| x.at.dist(at) <= TOL) {
+        Some(x) => x.z = z,
+        None => f.shape.points.push(crate::model::ShapePoint { at, z, ..Default::default() }),
+    }
+    let reply = json!({"id": id, "faces": shape_faces(m, &f), "top": top_range(m, &f)});
+    put_shape(s, id, f.shape);
+    Ok(reply)
+}
+
+/// Add Split Line: a line from `a` to `b` a floor's top folds along; an end that is no point of its and no corner becomes
+/// a point, at the height the top has there now.
+fn add_split_line(s: &mut Session, p: &Value) -> R {
+    let c = "add_split_line";
+    let (id, mut f) = shaped_floor(c, s, p, &["id", "a", "b"])?;
+    let m = &s.model;
+    let line = crate::model::SplitLine { a: point_req(c, p, "a")?, b: point_req(c, p, "b")?, ..Default::default() };
+    let mut points = f.shape.points.clone();
+    loose_ends(m, &f, &mut points, std::slice::from_ref(&line));
+    f.shape.points = points;
+    f.shape.lines.push(line);
+    let reply = json!({"id": id, "faces": shape_faces(m, &f), "top": top_range(m, &f)});
+    put_shape(s, id, f.shape);
+    Ok(reply)
+}
+
+/// Falls: a floor's or flat roof's shape worked out from its drains and the least fall (`falls::falls`), given anew.
+fn falls(s: &mut Session, p: &Value) -> R {
+    let c = "falls";
+    let (id, f) = shaped_floor(c, s, p, &["id", "drains", "fall", "ridges"])?;
+    let drains = points(c, p, "drains")?;
+    let fall = num(c, p, "fall")?.ok_or_else(|| bad(c, "`fall`, the least fall in %, is required"))?;
+    let ridges: Vec<[P2; 2]> = shaped(c, p, "ridges", "a list of lines [[x, y], [x, y]]")?.unwrap_or_default();
+    if let Some(q) = ridges.iter().flatten().find(|q| !(q.0.is_finite() && q.1.is_finite() && q.0.abs().max(q.1.abs()) <= MAX_COORD)) {
+        return Err(bad(c, format!("a ridge's end {q:?} is not a point in mm")));
+    }
+    let ridges: Vec<(P2, P2)> = ridges.into_iter().map(|[a, b]| (a, b)).collect();
+    let out = crate::falls::falls(&f.boundary, &f.openings, &drains, fall, &ridges).map_err(|e| bad(c, e))?;
+    let points: Vec<crate::model::ShapePoint> =
+        out.drains.iter().chain(&out.points).map(|&(at, z)| crate::model::ShapePoint { at, z, ..Default::default() }).collect();
+    let lines = out.lines.iter().map(|&(a, b)| crate::model::SplitLine { a, b, ..Default::default() }).collect();
+    let f = Floor { shape: crate::model::Shape { points, lines }, ..f };
+    let m = &s.model;
+    // Every plane at least as steep as asked, its lowest corner a drain or an opening's corner a valley runs on from.
+    let planes = m.shape_planes(&f).map_err(|e| bad(c, format!("the falls don't fold into planes: {e}")))?;
+    let low = |q: P2| out.drains.iter().chain(&out.points).any(|(r, z)| r.dist(q) <= TOL && *z < 0.0);
+    for (loops, plane) in &planes {
+        let ring = loops.first().map(Vec::as_slice).unwrap_or_default();
+        let steep = plane.g.length() * 100.0 >= fall - 1e-6;
+        let lowest = ring.iter().copied().min_by(|a, b| plane.at(*a).total_cmp(&plane.at(*b)));
+        if !steep || !lowest.is_some_and(low) {
+            let q = geom::centroid(ring);
+            return Err(bad(
+                c,
+                format!(
+                    "round ({:.0}, {:.0}) the top can't fall {fall} % to a drain: add a drain there, or a ridge to part it off",
+                    q.0, q.1
+                ),
+            ));
+        }
+    }
+    let drains: Vec<Value> = out.drains.iter().map(|(at, z)| json!({"at": at, "z": z})).collect();
+    let reply = json!({"id": id, "drains": drains, "faces": shape_faces(m, &f), "top": top_range(m, &f)});
+    put_shape(s, id, f.shape);
+    Ok(reply)
+}
+
+/// Reset Shape: a floor's points and split lines all taken off; it's flat at its offset again.
+fn reset_shape(s: &mut Session, p: &Value) -> R {
+    let c = "reset_shape";
+    let (id, mut f) = shaped_floor(c, s, p, &["id"])?;
+    f.shape = Default::default();
+    put_shape(s, id, f.shape);
+    Ok(json!({"id": id}))
 }
 
 /// `key` as JSON shaped like `T` (a list of at most `MAX_POINTS`), or none.
@@ -7026,27 +11420,192 @@ fn new_sheet(s: &mut Session, p: &Value) -> R {
     };
     let name = string(c, p, "name")?.unwrap_or_else(|| m.language.word(msg!("Unnamed")).into());
     let size = string(c, p, "size")?.map_or_else(|| "A3".into(), |z| z.trim().to_ascii_uppercase());
-    let id = s.model_mut().insert(Element::Sheet(Sheet { number: number.clone(), name, size }));
+    let title_block = match p.get("title_block") {
+        v if absent(v) => String::new(),
+        Some(v) => sheet_title_block(c, v)?,
+        None => String::new(),
+    };
+    let fields = match p.get("fields") {
+        v if absent(v) => BTreeMap::new(),
+        Some(v) => field_values(c, "fields", v, &BTreeMap::new())?,
+        None => BTreeMap::new(),
+    };
+    let id = s.model_mut().insert(Element::Sheet(Sheet { number: number.clone(), name, size, title_block, fields }));
     Ok(json!({"id": id, "number": number}))
+}
+
+/// A sheet's `title_block` as `sheet` and `modify` take it: `""` or true the built-in one, `none` in any case or false none
+/// at all ([`crate::titleblock::NONE`]), else the name of a title block of the project's (`Model::check` sees it's there).
+fn sheet_title_block(c: &str, v: &Value) -> Result<String, String> {
+    use crate::titleblock::{NONE, means_none};
+    match v {
+        Value::Bool(true) => Ok(String::new()),
+        Value::Bool(false) => Ok(NONE.into()),
+        Value::String(n) if means_none(n) => Ok(NONE.into()),
+        Value::String(n) => Ok(n.trim().to_string()),
+        _ => Err(bad(
+            c,
+            format!("`title_block` is a title block's name, \"\" (or true) for the built-in one or \"{NONE}\" (or false), not {v}"),
+        )),
+    }
+}
+
+/// `v`, fields' values by key (`{KEY: text or null}`), over `old`: each key uppercase, a null taking the key's value away.
+fn field_values(c: &str, key: &str, v: &Value, old: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+    let o = v.as_object().ok_or_else(|| bad(c, format!("`{key}` is {{KEY: text or null}}, not {v}")))?;
+    let mut out = old.clone();
+    for (k, x) in o {
+        if !crate::titleblock::valid_key(k) {
+            return Err(bad(c, format!("`{k}` isn't a field's key: letters, digits and `_`, starting with a letter")));
+        }
+        let k = k.to_ascii_uppercase();
+        match x {
+            Value::Null => {
+                out.remove(&k);
+            }
+            Value::String(t) => {
+                out.insert(k, t.clone());
+            }
+            Value::Number(n) => {
+                out.insert(k, n.to_string());
+            }
+            _ => return Err(bad(c, format!("`{key}`'s `{k}` is text, or null to clear it, not {x}"))),
+        }
+    }
+    Ok(out)
+}
+
+fn title_values(s: &mut Session, p: &Value) -> R {
+    let c = "title_values";
+    only(c, p, &["values"])?;
+    match p.get("values") {
+        v if absent(v) => {}
+        Some(v) => {
+            let values = field_values(c, "values", v, &s.model.title_values)?;
+            if values != s.model.title_values {
+                s.model_mut().title_values = values;
+            }
+        }
+        None => {}
+    }
+    Ok(json!({"values": s.model.title_values}))
+}
+
+fn title_block(s: &mut Session, p: &Value) -> R {
+    use crate::titleblock::{self, TitleBlock};
+    let c = "title_block";
+    only(c, p, &["name", "like", "rename", "delete", "path", "units", "width", "height", "font", "lines", "fills", "texts", "fields"])?;
+    let Some(name) = name_param(c, p, "name")? else {
+        let auto: Map<String, Value> = titleblock::AUTO.iter().map(|(k, what)| ((*k).to_string(), json!(what))).collect();
+        return Ok(json!({"title_blocks": s.model.title_blocks, "values": s.model.title_values, "auto": auto}));
+    };
+    if flag(c, p, "delete")? {
+        let m = &s.model;
+        if !m.title_blocks.contains_key(&name) {
+            return Err(bad(c, format!("there's no title block `{name}`")));
+        }
+        if let Some(sh) = m.elements.values().find_map(|e| match e {
+            Element::Sheet(sh) if sh.title_block == name => Some(sh),
+            _ => None,
+        }) {
+            return Err(bad(c, format!("sheet {} is drawn with `{name}`; give it another title block first", sh.number)));
+        }
+        s.model_mut().title_blocks.remove(&name);
+        return Ok(json!({"deleted": name}));
+    }
+    let m = &s.model;
+    let mut t = match (m.title_blocks.get(&name), name_param(c, p, "like")?) {
+        (Some(t), _) => t.clone(),
+        (None, Some(like)) => {
+            m.title_blocks.get(&like).cloned().ok_or_else(|| bad(c, format!("there's no title block `{like}` to start from")))?
+        }
+        (None, None) => TitleBlock::default(),
+    };
+    let mut notes = Vec::new();
+    let mut left_out = BTreeMap::new();
+    if let Some(path) = string(c, p, "path")? {
+        let units = match string(c, p, "units")? {
+            None => None,
+            Some(u) if u.trim().eq_ignore_ascii_case("auto") => None,
+            Some(u) => Some(cloud::unit(&u).ok_or_else(|| bad(c, format!("`units` is auto, mm, cm, m, in or ft, not {u}")))?),
+        };
+        let (bytes, read_notes) = read_dxf_file(s, &path).map_err(|e| bad(c, e))?;
+        notes = read_notes;
+        let titleblock::Read { title_block: read, left_out: out, note } =
+            titleblock::read_dxf(&bytes, units).map_err(|e| bad(c, format!("{path}: {e}")))?;
+        notes.extend(note);
+        if read.lines.is_empty() && read.fills.is_empty() && read.texts.is_empty() {
+            return Err(bad(c, format!("{path} draws nothing in its model space; draw the title block there, at full size")));
+        }
+        // The fields it had keep their labels, whose and defaults where the drawing still names them.
+        let fields = read.fields.iter().map(|f| t.field(&f.key).cloned().unwrap_or_else(|| f.clone())).collect();
+        t = TitleBlock { fields, ..read };
+        left_out = out;
+    } else if p.get("units").is_some() {
+        return Err(bad(c, "`units` is the unit of the DXF `path` names"));
+    }
+    // What's given goes over it, read as a file reads one: a key it hasn't is an error.
+    let mut v = serde_json::to_value(&t).map_err(|e| bad(c, e))?;
+    if let Some(o) = v.as_object_mut() {
+        for key in ["width", "height", "font", "lines", "fills", "texts", "fields"] {
+            match p.get(key) {
+                None => {}
+                Some(Value::Null) => {
+                    o.remove(key);
+                }
+                Some(x) => {
+                    o.insert(key.into(), x.clone());
+                }
+            }
+        }
+    }
+    let mut t: TitleBlock = serde_json::from_value(v).map_err(|e| bad(c, e))?;
+    for f in &mut t.fields {
+        f.key = f.key.trim().to_ascii_uppercase();
+    }
+    let m = s.model_mut();
+    let name = match name_param(c, p, "rename")? {
+        Some(to) if to != name => {
+            if m.title_blocks.contains_key(&to) {
+                return Err(bad(c, format!("there's already a title block `{to}`")));
+            }
+            m.title_blocks.remove(&name);
+            rename_entry(m, &LibKind::TitleBlock, &name, &to);
+            to
+        }
+        _ => name,
+    };
+    t.check(&name).map_err(|e| bad(c, e))?;
+    let undefined = t.undefined();
+    if m.title_blocks.get(&name) != Some(&t) {
+        m.title_blocks.insert(name.clone(), t.clone());
+    }
+    let mut out = json!({"name": name, "title_block": t});
+    if !undefined.is_empty() {
+        out["undefined"] = json!(undefined);
+    }
+    if !left_out.is_empty() {
+        out["left_out"] = json!(left_out);
+    }
+    if !notes.is_empty() {
+        out["notes"] = json!(notes);
+    }
+    Ok(out)
 }
 
 fn place(s: &mut Session, p: &Value) -> R {
     let c = "place";
     let m = &s.model;
     let sheet = match p.get("sheet") {
-        Some(Value::String(n)) => m
-            .elements
-            .iter()
-            .find_map(|(id, e)| matches!(e, Element::Sheet(sh) if sh.number == *n || sh.name == *n).then_some(*id))
-            .ok_or_else(|| bad(c, format!("no sheet numbered `{n}`")))?,
+        Some(Value::String(n)) => m.sheet_numbered(n).ok_or_else(|| bad(c, format!("no sheet numbered `{n}`")))?,
         Some(v) => v.as_u64().filter(|id| m.sheet(*id).is_some()).ok_or_else(|| bad(c, format!("`sheet`: {v} is not a sheet")))?,
         None => return Err(bad(c, "`sheet`, a sheet's number or id, is required")),
     };
     let scale = num(c, p, "scale")?;
     let at = point_opt(c, p, "at")?;
     let view = match p.get("view") {
-        Some(Value::String(n)) => match m.elements.keys().find(|id| m.view_name(**id) == Some(n.as_str())) {
-            Some(id) => *id,
+        Some(Value::String(n)) => match m.view_named(n) {
+            Some(id) => id,
             // A schedule, or the 3D view, comes to be as it's first placed: a schedule by its name in
             // English or in the project's language, named in the latter.
             None => {
@@ -7109,6 +11668,13 @@ fn material(s: &mut Session, p: &Value) -> R {
     }
     if let Some(v) = p.get("color").filter(|v| !v.is_null()) {
         mat.color = colour(v).ok_or_else(|| bad(c, format!("`color` is \"#rrggbb\" or [r, g, b], each 0 to 255, not {v}")))?;
+    }
+    if let Some(v) = p.get("transparency").filter(|v| !v.is_null()) {
+        mat.transparency = v
+            .as_u64()
+            .filter(|t| *t <= 100)
+            .and_then(|t| u8::try_from(t).ok())
+            .ok_or_else(|| bad(c, format!("`transparency` is a whole percent, 0 to 100, not {v}")))?;
     }
     // A pattern drawn in code by its name, or one of the project's fill patterns.
     for (key, slot, fill) in [("cut", &mut mat.cut, &mut mat.cut_pattern), ("surface", &mut mat.surface, &mut mat.surface_pattern)] {
@@ -7387,6 +11953,21 @@ fn parameter(s: &mut Session, p: &Value) -> R {
     Ok(json!({"name": name, "parameter": param}))
 }
 
+/// What `form`, `symbol`, `delete_form` and `delete_symbol` did, for `dry_run`'s `changes`.
+#[derive(Default)]
+struct Patches {
+    forms_replaced: usize,
+    forms_patched: Vec<Id>,
+    forms_deleted: Vec<Id>,
+    symbols_replaced: usize,
+    symbols_patched: Vec<Id>,
+    symbols_deleted: Vec<Id>,
+}
+
+/// A project's families: read one (`family {name}` alone costs no undo step), change one, make one
+/// or take one away. The whole change is worked out and checked before the model is touched, so
+/// reading and `dry_run` leave the project as they found it, and a family [`Model::check`] would
+/// refuse is never put in it: every error it has comes back at once, its warnings with them.
 fn family(s: &mut Session, p: &Value) -> R {
     let c = "family";
     // From a file: its fields under the name given, else its own, else the file's.
@@ -7405,42 +11986,101 @@ fn family(s: &mut Session, p: &Value) -> R {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let name = p.get("name").filter(|v| !v.is_null()).cloned().or_else(|| fields.remove("name")).unwrap_or(json!(stem));
         // Only the family it holds: what a file says to rename or delete isn't for it to say.
-        let mut family: Map<String, Value> = ["category", "parameters", "types", "forms", "symbols"]
-            .into_iter()
-            .filter_map(|k| fields.remove(k).map(|v| (k.to_string(), v)))
-            .collect();
+        let mut family: Map<String, Value> =
+            ["category", "kind", "ifc", "parameters", "types", "forms", "symbols", "operation", "connectors"]
+                .into_iter()
+                .filter_map(|k| fields.remove(k).map(|v| (k.to_string(), v)))
+                .collect();
         family.insert("name".into(), name);
+        // `dry_run` is the caller's, not the file's: a dry run of a file loads nothing.
+        if let Some(dry) = p.get("dry_run") {
+            family.insert("dry_run".into(), dry.clone());
+        }
         p = Value::Object(family);
     }
-    let name =
-        string(c, &p, "name")?.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).ok_or_else(|| bad(c, "`name` is required"))?;
+    // The family to read, change or delete; without a name, the project's families are listed.
+    let name = string(c, &p, "name")?.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     // Saved to a file a family of the project's is: the file `path` loads it back from.
     if let Some(file) = string(c, &p, "save")? {
+        let name = name.ok_or_else(|| bad(c, "`name` is required: the family to save"))?;
         let f = s.model.families.get(&name).ok_or_else(|| bad(c, format!("there's no family `{name}` to save")))?;
+        if flag(c, &p, "dry_run")? {
+            return Ok(json!({"name": name, "dry_run": true, "ok": true, "path": file, "saved": false}));
+        }
         let mut v = serde_json::to_value(f).map_err(|e| bad(c, e))?;
         v["name"] = json!(name);
         let text = serde_json::to_string_pretty(&v).map_err(|e| bad(c, e))?;
         std::fs::write(&file, text).map_err(|e| bad(c, format!("{file}: {e}")))?;
         return Ok(json!({"saved": name, "path": file}));
     }
-    let m = s.model_mut();
     let users = |m: &Model, name: &str| -> Vec<Id> {
         m.elements.iter().filter(|(_, e)| e.family().is_some_and(|(f, _)| f == name)).map(|(id, _)| *id).collect()
     };
+    let Some(name) = name else {
+        if flag(c, &p, "delete")? || p.get("rename").is_some_and(|v| !v.is_null()) {
+            return Err(bad(c, "`name` is required: the family's"));
+        }
+        let families: Vec<Value> = s
+            .model
+            .families
+            .iter()
+            .map(|(n, f)| {
+                json!({"name": n, "category": f.category, "types": f.types.len(), "forms": f.forms.len(), "symbols": f.symbols.len()})
+            })
+            .collect();
+        return Ok(json!({"families": families}));
+    };
+    let dry = flag(c, &p, "dry_run")?;
     if flag(c, &p, "delete")? {
-        if !m.families.contains_key(&name) {
+        if !s.model.families.contains_key(&name) {
             return Err(bad(c, format!("there's no family `{name}`")));
         }
-        let used = users(m, &name);
+        let used = users(&s.model, &name);
         if !used.is_empty() {
             let ids: Vec<String> = used.iter().map(Id::to_string).collect();
             return Err(bad(c, format!("elements {} are of `{name}`; delete them first", ids.join(", "))));
         }
-        m.families.remove(&name);
-        return Ok(json!({"deleted": name}));
+        if dry {
+            let mut changes = family_changes(None, &Default::default(), &Patches::default(), None);
+            changes["deleted"] = json!(true);
+            return Ok(json!({"name": name, "dry_run": true, "ok": true, "warnings": [], "changes": changes}));
+        }
+        s.model_mut().families.remove(&name);
+        return Ok(json!({"deleted": name, "warnings": []}));
     }
-    let mut f = m.families.get(&name).cloned().unwrap_or_default();
+    // Read it, which changes nothing and costs no undo step: what it is, each of its types' values
+    // worked out, and what's worth knowing. `dry_run` reads it the same way and says it changed nothing.
+    let keys = [
+        "category",
+        "kind",
+        "ifc",
+        "parameters",
+        "forms",
+        "symbols",
+        "operation",
+        "connectors",
+        "types",
+        "rename",
+        "form",
+        "symbol",
+        "delete_form",
+        "delete_symbol",
+    ];
+    if !keys.iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        let f = s.model.families.get(&name).ok_or_else(|| bad(c, format!("there's no family `{name}`")))?;
+        let (_, warnings) = f.problems(&|m| s.model.materials.contains_key(m));
+        let mut reply = family_reply(&name, f, &warnings);
+        if dry {
+            reply["dry_run"] = json!(true);
+            reply["ok"] = json!(true);
+            reply["changes"] = family_changes(Some(f), f, &Patches::default(), None);
+        }
+        return Ok(reply);
+    }
+    let was = s.model.families.get(&name).cloned();
+    let mut f = was.clone().unwrap_or_default();
     let field = |key: &str, e: serde_json::Error| bad(c, format!("`{key}`: {e}"));
+    let mut patches = Patches::default();
     if let Some(v) = p.get("category").filter(|v| !v.is_null()) {
         f.category = serde_json::from_value(v.clone()).map_err(|e| field("category", e))?;
     }
@@ -7462,42 +12102,245 @@ fn family(s: &mut Session, p: &Value) -> R {
     if let Some(v) = p.get("forms").filter(|v| !v.is_null()) {
         let mut forms: Vec<crate::family::Form> = serde_json::from_value(v.clone()).map_err(|e| field("forms", e))?;
         crate::library::keep_parts(&mut f.forms, &mut forms);
+        patches.forms_replaced = forms.len();
         f.forms = forms;
     }
     if let Some(v) = p.get("symbols").filter(|v| !v.is_null()) {
         let mut symbols: Vec<crate::family::Symbol> = serde_json::from_value(v.clone()).map_err(|e| field("symbols", e))?;
         crate::library::keep_parts(&mut f.symbols, &mut symbols);
+        patches.symbols_replaced = symbols.len();
         f.symbols = symbols;
+    }
+    // One form or one symbol of the family, patched by its `id` or its `guid`: its fields merged over
+    // what that one holds, a `null` taking one away, its place and its id and GUID kept. Whole lists,
+    // `forms` and `symbols`, replace as they always have; these only touch the one they name.
+    if let Some(v) = p.get("form").filter(|v| !v.is_null()) {
+        patches.forms_patched.push(patch_part(c, &name, &mut f.forms, v, "form")?);
+    }
+    if let Some(v) = p.get("symbol").filter(|v| !v.is_null()) {
+        patches.symbols_patched.push(patch_part(c, &name, &mut f.symbols, v, "symbol")?);
+    }
+    if let Some(list) = p.get("delete_form").and_then(Value::as_array) {
+        for v in list {
+            patches.forms_deleted.push(take_part(c, &name, &mut f.forms, v, "form")?);
+        }
+    }
+    if let Some(list) = p.get("delete_symbol").and_then(Value::as_array) {
+        for v in list {
+            patches.symbols_deleted.push(take_part(c, &name, &mut f.symbols, v, "symbol")?);
+        }
+    }
+    if let Some(v) = p.get("connectors").filter(|v| !v.is_null()) {
+        let mut connectors: Vec<crate::family::Connector> = serde_json::from_value(v.clone()).map_err(|e| field("connectors", e))?;
+        crate::library::keep_parts(&mut f.connectors, &mut connectors);
+        f.connectors = connectors;
+    }
+    if let Some(op) = string(c, &p, "operation")? {
+        f.operation = operation(c, &op)?;
+    }
+    // Which fixture or fitting it is; an empty one takes it away. `Family::check` says the kinds its category has.
+    if let Some(kind) = string(c, &p, "kind")? {
+        let kind = kind.trim();
+        f.kind = (!kind.is_empty()).then(|| kind.to_string());
+    }
+    // The IFC class its components go out as, written as IFC writes it; `null` forgets it.
+    match p.get("ifc") {
+        None => {}
+        Some(Value::Null) => f.ifc = None,
+        Some(v) => {
+            let class: crate::family::IfcClass = serde_json::from_value(v.clone()).map_err(|e| field("ifc", e))?;
+            f.ifc = Some(class.written());
+        }
     }
     if let Some(v) = p.get("types").filter(|v| !v.is_null()) {
         let mut types = serde_json::to_value(&f.types).map_err(|e| bad(c, e))?;
         merge(&mut types, v);
         f.types = serde_json::from_value(types).map_err(|e| field("types", e))?;
     }
-    let name = match string(c, &p, "rename")? {
+    // Renaming, checked before the model is touched: onto a name another family has, refused.
+    let rename = match string(c, &p, "rename")? {
         Some(to) => {
             let to = to.trim().to_string();
             if to.is_empty() {
                 return Err(bad(c, "`rename` needs a name"));
             }
-            if to != name && m.families.contains_key(&to) {
+            if to != name && s.model.families.contains_key(&to) {
                 return Err(bad(c, format!("there's a family `{to}` already")));
             }
-            m.families.remove(&name);
-            m.library.family_renamed(&name, &to);
-            for e in m.elements.values_mut() {
-                if let Some(f) = e.family_mut()
-                    && *f == name
-                {
-                    f.clone_from(&to);
-                }
-            }
-            to
+            Some(to)
         }
-        None => name,
+        None => None,
     };
-    m.families.insert(name.clone(), f.clone());
-    Ok(json!({"name": name, "family": f}))
+    let to = rename.clone().unwrap_or_else(|| name.clone());
+    // Every error of what it comes to, each addressed to what has it, and every warning of it.
+    let (errors, warnings) = f.problems(&|m| s.model.materials.contains_key(m));
+    if !errors.is_empty() {
+        // What it's worth knowing comes with what stops it: an author fixes both at once, and a
+        // warning never hides behind the error that came first.
+        let mut said: Vec<String> = errors.iter().map(|e| format!("family `{to}`: {e}")).collect();
+        said.extend(warnings.iter().map(|w| format!("family `{to}`: warning: {w}")));
+        return Err(said.join("\n"));
+    }
+    if dry {
+        let mut reply = family_reply(&to, &f, &warnings);
+        reply["dry_run"] = json!(true);
+        reply["ok"] = json!(true);
+        reply["changes"] = family_changes(was.as_ref(), &f, &patches, rename.as_deref());
+        return Ok(reply);
+    }
+    let m = s.model_mut();
+    if let Some(to) = rename {
+        m.families.remove(&name);
+        m.library.family_renamed(&name, &to);
+        for e in m.elements.values_mut() {
+            if let Some(f) = e.family_mut()
+                && *f == name
+            {
+                f.clone_from(&to);
+            }
+        }
+    }
+    m.families.insert(to.clone(), f.clone());
+    Ok(json!({"name": to, "family": f, "warnings": warnings}))
+}
+
+/// A family as `family` reads it: what it is, each of its types' parameters worked out (formulas and
+/// all), and what's worth knowing about it.
+fn family_reply(name: &str, f: &crate::family::Family, warnings: &[String]) -> Value {
+    let values = f
+        .types
+        .keys()
+        .filter_map(|t| f.values_in(t, &BTreeMap::new(), crate::family::DEFAULT_WALL).ok().map(|v| (t.clone(), v)))
+        .map(|(t, v)| (t, Value::Object(v.iter().map(|(k, v)| (k.clone(), val(v))).collect())))
+        .collect::<Map<String, Value>>();
+    json!({"name": name, "family": f, "values": Value::Object(values), "warnings": warnings})
+}
+
+/// A parameter's value worked out, as JSON: a number, or a material's name.
+fn val(v: &crate::family::Val) -> Value {
+    match v {
+        crate::family::Val::Number(x) => json!(x),
+        crate::family::Val::Text(t) => json!(t),
+    }
+}
+
+/// A family's parameters by name, for what `dry_run` says changed.
+fn by_name(f: &crate::family::Family) -> BTreeMap<&str, &crate::family::Parameter> {
+    f.parameters.iter().map(|q| (q.name.as_str(), q)).collect()
+}
+
+/// What a change comes to, worked out but not made: the parameters and types added, taken away and
+/// changed; the forms and symbols the lists were replaced with, and those patched or deleted by
+/// their id; and the new name, if the change renames the family.
+fn family_changes(was: Option<&crate::family::Family>, now: &crate::family::Family, patches: &Patches, rename: Option<&str>) -> Value {
+    let (was_p, now_p) = (was.map(by_name).unwrap_or_default(), by_name(now));
+    let words = |names: Vec<&str>| names.into_iter().map(str::to_string).collect::<Vec<_>>();
+    let parameters = json!({
+        "added": words(now_p.keys().copied().filter(|k| !was_p.contains_key(k)).collect()),
+        "removed": words(was_p.keys().copied().filter(|k| !now_p.contains_key(k)).collect()),
+        "changed": words(now_p.iter().filter(|(k, v)| was_p.get(*k).is_some_and(|w| w != *v)).map(|(k, _)| *k).collect()),
+    });
+    let types = json!({
+        "added": now.types.keys().filter(|k| was.is_none_or(|w| !w.types.contains_key(*k))).cloned().collect::<Vec<_>>(),
+        "removed": was.into_iter().flat_map(|w| w.types.keys().filter(|k| !now.types.contains_key(*k))).cloned().collect::<Vec<_>>(),
+        "changed": now.types.iter().filter(|(k, v)| was.is_some_and(|w| w.types.get(*k).is_some_and(|o| o != *v))).map(|(k, _)| k.clone())
+            .collect::<Vec<_>>(),
+    });
+    json!({
+        "parameters": parameters,
+        "types": types,
+        "forms": {"replaced": patches.forms_replaced, "patched": patches.forms_patched, "deleted": patches.forms_deleted},
+        "symbols": {"replaced": patches.symbols_replaced, "patched": patches.symbols_patched, "deleted": patches.symbols_deleted},
+        "rename": rename,
+        "deleted": false,
+    })
+}
+
+/// One form or one symbol of the family, patched by its `id` or `guid`: the fields it's given are
+/// merged over what that one holds, a `null` takes one away, and its place, its id and its GUID stay
+/// as they are. `what` says which it is, for the messages: `form`, or `symbol`.
+fn patch_part<T>(c: &str, family: &str, parts: &mut [T], patch: &Value, what: &str) -> Result<Id, String>
+where
+    T: crate::library::HasPart + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let Value::Object(map) = patch else {
+        return Err(bad(c, format!("`{what}` must be {{id | guid, …the {what}'s fields}}, not {patch}")));
+    };
+    let key = map
+        .get("id")
+        .or_else(|| map.get("guid"))
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| bad(c, format!("`{what}` needs the {what}'s `id` or `guid`")))?;
+    let at = part_at(c, parts, key, what, family)?;
+    let mut whole = serde_json::to_value(&parts[at]).map_err(|e| bad(c, e))?;
+    let mut patch = patch.clone();
+    if let Some(map) = patch.as_object_mut() {
+        map.remove("id");
+        map.remove("guid");
+    }
+    merge(&mut whole, &patch);
+    parts[at] = serde_json::from_value(whole).map_err(|e| bad(c, format!("{what} {} of family \"{family}\": {e}", shown(key))))?;
+    let (id, _) = parts[at].ident();
+    Ok(*id)
+}
+
+/// One form or one symbol of the family taken away, by its `id` or `guid`; the others keep their
+/// places, their ids and their GUIDs.
+fn take_part<T>(c: &str, family: &str, parts: &mut Vec<T>, key: &Value, what: &str) -> Result<Id, String>
+where
+    T: crate::library::HasPart,
+{
+    let at = part_at(c, parts, key, what, family)?;
+    let mut gone = parts.remove(at);
+    let (id, _) = gone.ident();
+    Ok(*id)
+}
+
+/// The place in `parts` of the one `key` names, by its id or its GUID.
+fn part_at<T: crate::library::HasPart>(c: &str, parts: &mut [T], key: &Value, what: &str, family: &str) -> Result<usize, String> {
+    let wanted = serde_json::from_value::<Guid>(key.clone()).ok().filter(|g| !g.is_nil());
+    let Some(wanted) = wanted else {
+        return Err(bad(c, format!("`{what}` needs the {what}'s `id` or `guid`, not {key}")));
+    };
+    parts
+        .iter_mut()
+        .position(|part| {
+            let (id, guid) = part.ident();
+            *guid == wanted || wanted.pending() == Some(*id)
+        })
+        .ok_or_else(|| bad(c, format!("{what} {} is not of family \"{family}\"", shown(key))))
+}
+
+/// What a form or a symbol was named by, in a message: the id, or the GUID, as it was given.
+fn shown(key: &Value) -> String {
+    match key {
+        Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
+fn symbol_set(s: &mut Session, p: &Value) -> R {
+    use crate::symbol_set::{Names, SETS};
+    let c = "symbol_set";
+    let set = string(c, p, "set")?.ok_or_else(|| bad(c, format!("`set` is required: {}", SETS.join(", "))))?;
+    if !SETS.contains(&set.as_str()) {
+        return Err(bad(c, format!("no symbol set `{set}`: there is {}", SETS.join(", "))));
+    }
+    let names = match string(c, p, "names")? {
+        Some(code) => Names::from_code(&code).ok_or_else(|| bad(c, format!("`names` is en, nl or fr, not `{code}`")))?,
+        None => Names::of(s.model.language),
+    };
+    let m = s.model_mut();
+    let (mut loaded, mut kept) = (Vec::new(), Vec::new());
+    for (name, family) in crate::symbol_set::families(&set, names) {
+        if m.families.contains_key(&name) {
+            kept.push(name);
+        } else {
+            m.families.insert(name.clone(), family);
+            loaded.push(name);
+        }
+    }
+    Ok(json!({"set": set, "loaded": loaded, "kept": kept}))
 }
 
 fn component(s: &mut Session, p: &Value) -> R {
@@ -7702,13 +12545,63 @@ fn favorite(s: &mut Session, p: &Value) -> R {
 }
 
 /// The families, each its category, its types and its parameters' names.
+/// A connector, worked out, as JSON: an electrical one's load in VA in all and in each phase; a pipe one's domain, flow and
+/// size; and, placed, where it is and the way it faces in the model.
+fn connector_json((c, at, direction): &crate::family::PlacedConnector) -> Value {
+    let mut o = json!({"id": c.id, "guid": c.guid, "kind": c.kind});
+    if !c.name.is_empty() {
+        o["name"] = json!(c.name);
+    }
+    if c.kind.electrical() {
+        for (k, v) in [
+            ("system", json!(c.system)),
+            ("poles", json!(c.poles)),
+            ("voltage", json!(c.voltage)),
+            ("load_va", json!(c.load_va)),
+            ("load_va_by_phase", json!(c.load_va_by_phase)),
+            ("power_factor", json!(c.power_factor)),
+            ("classification", json!(c.classification)),
+        ] {
+            o[k] = v;
+        }
+    }
+    if let Some(d) = c.domain {
+        o["domain"] = json!(d);
+    }
+    if c.kind == crate::family::ConnectorKind::Pipe || c.flow != crate::family::Flow::Both {
+        o["flow"] = json!(c.flow);
+    }
+    if let Some(x) = c.size {
+        o["size"] = json!(x);
+    }
+    if let Some(p) = at {
+        o["at"] = json!(p);
+    }
+    if let Some(d) = direction {
+        o["direction"] = json!(d);
+    }
+    o
+}
+
 fn families(m: &Model) -> Value {
     let all: Map<String, Value> = m
         .families
         .iter()
         .map(|(n, f)| {
             let parameters: Vec<&str> = f.parameters.iter().map(|p| p.name.as_str()).collect();
-            (n.clone(), json!({"category": f.category, "types": f.types.keys().collect::<Vec<_>>(), "parameters": parameters}))
+            (
+                n.clone(),
+                json!({
+                    "category": f.category, "types": f.types.keys().collect::<Vec<_>>(), "parameters": parameters,
+                    "connectors": f.connectors.iter().map(|c| {
+                        let mut o = json!({"kind": c.kind});
+                        if let Some(x) = c.system { o["system"] = json!(x); }
+                        if let Some(x) = c.domain { o["domain"] = json!(x); }
+                        if !c.name.is_empty() { o["name"] = json!(c.name); }
+                        o
+                    }).collect::<Vec<_>>(),
+                }),
+            )
         })
         .collect();
     Value::Object(all)
@@ -7769,10 +12662,15 @@ fn edit_type(s: &mut Session, p: &Value) -> R {
         "door" | "window" => {
             let map = if cat == "door" { &mut m.types.door } else { &mut m.types.window };
             let old = map.get(&name).cloned();
+            let op = match string(c, p, "operation")? {
+                Some(name) => operation(c, &name)?,
+                None => old.as_ref().and_then(|t| t.operation),
+            };
             let t = OpeningType {
                 width: width.or(old.as_ref().map(|t| t.width)).ok_or_else(|| need("width"))?,
                 height: height.or(old.as_ref().map(|t| t.height)).ok_or_else(|| need("height"))?,
                 sill: sill.or(old.as_ref().map(|t| t.sill)).unwrap_or(if cat == "window" { 900.0 } else { 0.0 }),
+                operation: op,
             };
             map.insert(name.clone(), t);
             json!(t)
@@ -7900,7 +12798,12 @@ fn modify(s: &mut Session, p: &Value) -> R {
     let fields = p.as_object().ok_or_else(|| bad(c, "params must be {id | ids, …fields}"))?;
     let m = &s.model;
     let ids = ids_param(c, m, p)?;
-    let (mut edited, mut rescaled) = (Vec::new(), Vec::new());
+    let mut edited = Vec::new();
+    let mut rescaled = Vec::new();
+    // Footings the command changes itself, and the ones that follow their wall's base as it goes up or down.
+    let moving_footings: Vec<Id> =
+        ids.iter().copied().filter(|id| m.elements.get(*id).is_some_and(|e| e.category() == "stripfooting")).collect();
+    let mut following: Vec<(Id, Element)> = Vec::new();
     for &id in &ids {
         let e = m.elements.get(id).ok_or_else(|| bad(c, format!("no element {id}")))?;
         let mut v = serde_json::to_value(e).map_err(|e| bad(c, e))?;
@@ -7933,6 +12836,12 @@ fn modify(s: &mut Session, p: &Value) -> R {
                         json!(m.guid(element_id(c, m, val)?))
                     }
                 }
+                // A sheet's title block as `sheet` takes it: none as `none` or false, the built-in one as "" or true.
+                "title_block" if matches!(e, Element::Sheet(_)) => json!(sheet_title_block(c, val)?),
+                // A sheet's fields by their keys in capitals, as its title block names them, whatever case they're given in.
+                "fields" if matches!(e, Element::Sheet(_)) && val.is_object() => {
+                    Value::Object(val.as_object().into_iter().flatten().map(|(k, v)| (k.to_ascii_uppercase(), v.clone())).collect())
+                }
                 _ => val.clone(),
             };
             match obj.get_mut(k) {
@@ -7946,7 +12855,33 @@ fn modify(s: &mut Session, p: &Value) -> R {
             }
         }
         let mut e2 = serde_json::from_value::<Element>(v).map_err(|e| bad(c, format!("element {id}: {e}")))?;
+        // A note's new text keeps its runs on what didn't change, unless it is given runs of its own.
+        if let (Element::Text(old), Element::Text(n)) = (e, &mut e2)
+            && old.text != n.text
+            && !fields.contains_key("runs")
+        {
+            n.runs = crate::text::remap(&old.text, &n.text, &old.runs);
+        }
         graphics::check_followed(m, e, &e2).map_err(|err| bad(c, format!("element {id}: {err}")))?;
+        // A strip footing glued to the wall keeps its top on the wall's base: raised or lowered along its level
+        // (its `base_offset` or the level's), the footing rises or falls with it. A footing changed by hand is
+        // soon no footing of that wall: the condition is read again from the geometry.
+        if let (Element::Wall(old), Element::Wall(w)) = (e, &e2) {
+            let (before, after) = (m.base_z(old), m.base_z(w));
+            if (after - before).abs() > 1e-9 {
+                for (fid, fid_wall) in crate::glue::footings_of(m, &[id]) {
+                    if fid_wall != id || moving_footings.contains(&fid) {
+                        continue;
+                    }
+                    let Some(r) = m.run_of(fid) else { continue };
+                    if let Some(on) = crate::glue::on_base(m, r, "stripfooting", after)
+                        && let Some(e) = Element::of_run("stripfooting", on)
+                    {
+                        following.push((fid, e));
+                    }
+                }
+            }
+        }
         // A wall put on another of its lines stays where it is: its line moves across it instead.
         if let (Element::Wall(old), Element::Wall(w)) = (e, &mut e2)
             && old.location != w.location
@@ -8015,6 +12950,13 @@ fn modify(s: &mut Session, p: &Value) -> R {
         }
     }
     edited.extend(rescaled);
+    // A footing under a wall raised or lowered goes with it, unless the command set the footing itself.
+    for (fid, e) in following {
+        if !ids.contains(&fid) {
+            edited.retain(|(id, _)| *id != fid);
+            edited.push((fid, e));
+        }
+    }
     let m = s.model_mut();
     for (id, e) in edited {
         m.elements.insert(id, e);
@@ -8109,9 +13051,21 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
         }
         Element::Level(_) => return Err(bad(c, format!("level {id} has no place in plan; change its elevation, or add a level"))),
         Element::Sheet(_) => return Err(bad(c, format!("sheet {id} has no place in plan; move the views on it"))),
-        Element::Schedule(_) | Element::View3D(_) | Element::PlanView(_) => {
+        Element::Schedule(_) | Element::PlanView(_) => {
             return Err(bad(c, format!("{category} {id} has no place in plan; move its viewport on its sheet")));
         }
+        // A camera view has a place in plan: its mark. The camera goes as a whole (the plan point of its eye and its
+        // target, each keeping its height), so moving, copying, turning or mirroring it keeps it looking the same way.
+        Element::View3D(v) => match v.camera {
+            Some(cam) => {
+                let lift = |p: [f64; 3]| {
+                    let q = f(P2(p[0], p[1]));
+                    [q.0, q.1, p[2]]
+                };
+                v.camera = Some(crate::model::ViewCamera { eye: lift(cam.eye), target: lift(cam.target) });
+            }
+            None => return Err(bad(c, format!("view3d {id} has no place in plan; move its viewport on its sheet"))),
+        },
         Element::CadImport(ci) => {
             if mo.mirror {
                 return Err(bad(
@@ -8203,6 +13157,9 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
         // Its edges keep their numbers, its gables with them; a mirror image sweeps the other way.
         Element::Roof(r) => {
             r.boundary.iter_mut().chain(r.courtyards.iter_mut().flatten()).chain(r.openings.iter_mut().flatten()).for_each(|q| *q = f(*q));
+            // A flat one's shape goes with it, each point at its height.
+            r.shape.points.iter_mut().for_each(|x| x.at = f(x.at));
+            r.shape.lines.iter_mut().for_each(|l| (l.a, l.b) = (f(l.a), f(l.b)));
             if let Some(x) = &mut r.extrusion {
                 x.line = x.line.map(&f);
                 if mo.mirror {
@@ -8214,6 +13171,12 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
         Element::Wall(w) => (w.start, w.end) = if mo.mirror { (f(w.end), f(w.start)) } else { (f(w.start), f(w.end)) },
         Element::Grid(g) => (g.start, g.end) = (f(g.start), f(g.end)),
         Element::RoomSeparator(rs) => (rs.start, rs.end) = (f(rs.start), f(rs.end)),
+        Element::Rebar(rb) => {
+            for q in &mut rb.path {
+                let moved = f(P2(q[0], q[1]));
+                (q[0], q[1]) = (moved.0, moved.1);
+            }
+        }
         Element::Floor(fl) => {
             fl.boundary.iter_mut().chain(fl.openings.iter_mut().flatten()).for_each(|q| *q = f(*q));
             // A mirror turns the outline clockwise; floors keep theirs counter-clockwise.
@@ -8222,6 +13185,9 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
             }
             fl.arrow = fl.arrow.map(|a| a.map(f));
             (fl.pattern_origin, fl.pattern_angle) = turned(f, fl.pattern_origin, fl.pattern_angle);
+            // Its shape's points and lines go with it, each at its height.
+            fl.shape.points.iter_mut().for_each(|x| x.at = f(x.at));
+            fl.shape.lines.iter_mut().for_each(|l| (l.a, l.b) = (f(l.a), f(l.b)));
         }
         Element::Ceiling(cl) => {
             cl.boundary.iter_mut().chain(cl.openings.iter_mut().flatten()).for_each(|q| *q = f(*q));
@@ -8244,13 +13210,33 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
                 }
             }
         }
-        Element::Room(r) => r.point = f(r.point),
+        // A frozen room's boundary goes with it.
+        Element::Room(r) => {
+            r.point = f(r.point);
+            if let Some(k) = &mut r.kept {
+                k.map(f);
+            }
+        }
         Element::Door(o) | Element::Window(o) if !within(o.host) => match (mo.slide, m.wall(o.host)) {
             (Some(by), Some(w)) => o.offset += by.dot((w.end - w.start).unit()),
             _ => return Err(bad(c, format!("{category} {id} turns and mirrors only with its wall; select the wall too"))),
         },
         Element::Door(_) | Element::Window(_) => {}
         Element::Dimension(d) => d.at = f(d.at),
+        // In plan, its points and edges; their heights stay.
+        Element::Dimension3D(d) => {
+            let flat = |q: &mut [f64; 3]| {
+                let P2(x, y) = f(P2(q[0], q[1]));
+                (q[0], q[1]) = (x, y);
+            };
+            flat(&mut d.at);
+            for r in &mut d.refs {
+                flat(&mut r.at);
+                if let Some(e) = &mut r.edge {
+                    e.iter_mut().for_each(flat);
+                }
+            }
+        }
         // A tag's place hangs on its door or window's: see `relocate` and `duplicate`.
         Element::Tag(_) => {}
         Element::Section(v) | Element::Elevation(v) => {
@@ -8296,11 +13282,48 @@ fn place_tag(m: &mut Model, id: Id, head: P2) {
     }
 }
 
+/// How many walls and runs that join have an end at `at` at heights `(lo, hi)`: the arms of the node
+/// there. Three or more is a corner where several elements meet, not one element simply carrying on
+/// under another.
+fn arms_at(m: &Model, at: P2, (lo, hi): (f64, f64)) -> usize {
+    m.elements
+        .values()
+        .filter(|e| match e {
+            Element::Wall(w) => {
+                w.join && (w.start.dist(at) <= TOL || w.end.dist(at) <= TOL) && m.base_z(w) <= hi + TOL && lo - TOL <= m.top_z(w)
+            }
+            e => e.run().is_some_and(|r| {
+                r.join
+                    && (r.start.dist(at) <= TOL || r.end.dist(at) <= TOL)
+                    && m.run_geom(e).is_some_and(|g| {
+                        let (rlo, rhi) = g.z_span();
+                        rlo <= hi + TOL && lo - TOL <= rhi
+                    })
+            }),
+        })
+        .count()
+}
+
+/// Whether two lines run the same way, so that one carries on under the other rather than meeting it
+/// at a corner.
+fn same_way(a: (P2, P2), b: (P2, P2)) -> bool {
+    let (u, v) = (a.1 - a.0, b.1 - b.0);
+    u.length() > TOL && v.length() > TOL && u.unit().cross(v.unit()).abs() <= 1e-9
+}
+
+/// The line of the first of `candidates` that `line_of` gives one for and whose span holds `was`, within `TOL`: the
+/// staying wall or run a taken end lay on, along which that end slides to the new crossing.
+fn host_line(was: P2, candidates: impl IntoIterator<Item = Id>, line_of: impl FnMut(Id) -> Option<(P2, P2)>) -> Option<(P2, P2)> {
+    candidates.into_iter().filter_map(line_of).find(|&(a, b)| geom::dist_to_segment(was, a, b) <= TOL)
+}
+
 /// Take elements by `mo`, keeping walls joined: walls joined to a taken wall stretch to stay
 /// joined, and doors and windows in walls that changed keep their place or go with their wall.
-/// With `end` (`Some(true)` the start, `Some(false)` the end), only that end of one wall goes.
+/// With `end` (`Some(true)` the start, `Some(false)` the end), only that end of one wall or one run goes.
 fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>) -> Result<(), String> {
     let m = &s.model;
+    // The walls, and what points at each: found among those, not every element.
+    let lookup = m.lookup();
     let f = mo.map;
     let moving: BTreeSet<Id> = ids.iter().copied().collect();
     let moving_guids: BTreeSet<Guid> = ids.iter().map(|id| m.guid(*id)).collect();
@@ -8309,6 +13332,8 @@ fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>
     let carried = |host: Guid| moving_guids.contains(&host) && end.is_none();
     let mut walls: BTreeMap<Id, Wall> = BTreeMap::new();
     let mut others: Vec<(Id, Element)> = Vec::new();
+    // The runs taken, as they were and as they now stand: what stretches to keep its joins with them.
+    let mut taken: BTreeMap<Id, (crate::model::Run, crate::model::Run)> = BTreeMap::new();
     for &id in ids {
         match transformed(c, m, id, mo, &moving)? {
             Element::Wall(mut w) => {
@@ -8320,49 +13345,191 @@ fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>
                 walls.insert(id, w);
             }
             Element::Door(o) | Element::Window(o) if moving_guids.contains(&o.host) => {}
-            e => others.push((id, e)),
+            // Moving one end of a run: the other end stays where it was, as a wall's does.
+            mut e => {
+                if let (Some(at_start), Some(me), Some(old)) = (end, e.run_mut(), m.run_of(id)) {
+                    if at_start { me.end = old.end } else { me.start = old.start }
+                }
+                if let (Some(before), Some(after)) = (m.run_of(id).cloned(), e.run().cloned()) {
+                    taken.insert(id, (before, after));
+                }
+                others.push((id, e));
+            }
         }
     }
     let old = |id: &Id| m.wall(*id);
-    // A taken wall's end that was on a wall staying put slides back onto it, along the taken wall.
-    // (A wall's end taken on its own goes where it's told.)
-    for (id, w) in walls.iter_mut().filter(|_| end.is_none()) {
-        let Some(before) = old(id).filter(|b| b.arc == 0.0) else { continue };
-        let line = (w.start, w.end);
-        for (end, was) in [(&mut w.start, before.start), (&mut w.end, before.end)] {
-            let host = m.elements.iter().find_map(|(other, e)| match e {
-                Element::Wall(o)
-                    if !moving.contains(other)
-                        && o.arc == 0.0
-                        && stacked(m, o, before)
-                        && geom::dist_to_segment(was, o.start, o.end) <= TOL =>
-                {
+    // Glued footings move with their walls; make that planned move a taken run before finding what stretches to
+    // keep its joins. Otherwise an angled footing sees only the old position and stays behind after the glue runs.
+    let mut glued: Vec<(Id, crate::model::Run, crate::model::Run)> = if end.is_none() {
+        let walls: Vec<Id> = walls.keys().copied().collect();
+        crate::glue::footings_of(m, &walls)
+            .into_iter()
+            .filter_map(|(fid, _)| {
+                let r = m.run_of(fid)?.clone();
+                let after = crate::glue::mapped(&r, f);
+                Some((fid, r, after))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let glued_moving: BTreeSet<Id> = glued.iter().map(|(id, ..)| *id).collect();
+    for (id, before, after) in &glued {
+        if !moving.contains(id) {
+            taken.entry(*id).or_insert_with(|| (before.clone(), after.clone()));
+        }
+    }
+    let index = crate::walls::Index::new(m);
+    let thickest = m.types.wall.values().map(|t| t.thickness).filter(|t| t.is_finite()).fold(0.0, f64::max);
+    // What a taken end may slide along: neither taken nor riding a taken wall.
+    let staying = |other: Id| !moving.contains(&other) && !glued_moving.contains(&other);
+    // A taken line's end that was on a staying line slides along that line to the new crossing, as two
+    // walls' ends do: the staying element keeps its own axis and only runs on or is cut back. An end taken
+    // on its own (with `end`) goes where it is told. Runs of one category meet each other; a strip footing
+    // meets a wall by its top touching the wall's base, as the run's own outline has it.
+    if end.is_none() {
+        for (id, w) in walls.iter_mut() {
+            let Some(before) = old(id).filter(|b| b.arc == 0.0) else { continue };
+            let line = (w.start, w.end);
+            for (end, was) in [(&mut w.start, before.start), (&mut w.end, before.end)] {
+                let (lo, hi) = (m.base_z(before), m.top_z(before));
+                let at = ([was.0, was.1, was.0, was.1], lo, hi);
+                let host = host_line(was, lookup.walls_near_at(&[at], 2.0 * TOL), |other| {
+                    let o = m.wall(other).filter(|o| staying(other) && o.join && before.join && o.arc == 0.0 && stacked(m, o, before))?;
                     Some((o.start, o.end))
+                })
+                .or_else(|| {
+                    host_line(was, index.runs_near(was, lo - TOL, hi + TOL), |other| {
+                        let e = m.elements.get(other).filter(|e| staying(other) && e.category() == "stripfooting")?;
+                        let r = e.run().filter(|r| r.join && before.join && crate::runs::flat(r))?;
+                        let (rlo, rhi) = m.run_geom(e)?.z_span();
+                        (rlo - TOL <= hi && lo - TOL <= rhi).then_some((r.start, r.end))
+                    })
+                });
+                if let Some((a, b)) = host {
+                    *end = geom::line_intersection(line.0, line.1, a, b).map_or(*end, micron);
                 }
-                _ => None,
-            });
-            if let Some((a, b)) = host {
-                *end = geom::line_intersection(line.0, line.1, a, b).map_or(*end, micron);
+            }
+        }
+        for (id, (before, after)) in taken.iter_mut() {
+            if !before.join || !after.join || !crate::runs::flat(before) {
+                continue;
+            }
+            let Some(e) = m.elements.get(*id) else { continue };
+            let category = e.category();
+            let Some((lo, hi)) = m.run_geom(e).map(|g| g.z_span()) else { continue };
+            let line = (after.start, after.end);
+            for (end, was) in [(&mut after.start, before.start), (&mut after.end, before.end)] {
+                let host = host_line(was, index.runs_near(was, lo - TOL, hi + TOL), |other| {
+                    let oe = m.elements.get(other).filter(|oe| other != *id && staying(other) && oe.category() == category)?;
+                    let r = oe.run().filter(|r| r.join && crate::runs::flat(r))?;
+                    let (olo, ohi) = m.run_geom(oe)?.z_span();
+                    (lo < ohi && olo < hi).then_some((r.start, r.end))
+                })
+                .or_else(|| {
+                    if category != "stripfooting" {
+                        return None;
+                    }
+                    let at = ([was.0, was.1, was.0, was.1], lo - TOL, hi + TOL);
+                    host_line(was, lookup.walls_near_at(&[at], thickest + 1.0), |other| {
+                        let w = m.wall(other).filter(|w| !moving.contains(&other) && w.join && w.arc == 0.0)?;
+                        (lo - TOL <= m.top_z(w) && m.base_z(w) - TOL <= hi).then_some((w.start, w.end))
+                    })
+                });
+                if let Some((a, b)) = host {
+                    *end = geom::line_intersection(line.0, line.1, a, b).map_or(*end, micron);
+                }
+            }
+        }
+        // A glued footing rides the corrected line of its wall: take the wall's crossing, not the bare move.
+        for (id, _, after) in glued.iter_mut() {
+            if let Some((_, corrected)) = taken.get(id) {
+                *after = corrected.clone();
+            }
+        }
+        // The taken runs themselves stand where they were cut or run on to the crossing, as the walls do.
+        for (id, (_, after)) in &taken {
+            if !moving.contains(id) {
+                continue;
+            }
+            let Some(e) = m.elements.get(*id) else { continue };
+            if let Some(corrected) = Element::of_run(e.category(), after.clone())
+                && let Some(slot) = others.iter_mut().find(|(other, _)| other == id)
+            {
+                slot.1 = corrected;
             }
         }
     }
     // Walls staying put stretch to keep their joins with the taken ones: an end on a taken wall's
-    // end goes with it; an end on a taken wall's span slides along its own wall onto it.
+    // end goes with it; an end on a taken wall's span slides along its own wall onto it. At a corner
+    // where a strip footing ends too, the wall's end and the footing's go together, as walls' do.
     let moved: Vec<(Wall, Wall)> = walls.iter().filter_map(|(id, w)| Some((old(id)?.clone(), w.clone()))).collect();
-    for (&id, e) in &m.elements {
-        let Element::Wall(w) = e else { continue };
-        if moving.contains(&id) {
+    // The walls whose ends may lie on a taken wall's line as it was, and those near a taken footing: its end
+    // or span may meet a wall's end there, as the footing's own outline meets it.
+    let boxes: Vec<_> = moved.iter().map(|(before, _)| (crate::derived::axis_box(before), m.base_z(before), m.top_z(before))).collect();
+    let mut near = if boxes.is_empty() { BTreeSet::new() } else { lookup.walls_near_at(&boxes, 2.0 * TOL) };
+    for (rid, (before, _)) in &taken {
+        let Some(e) = m.elements.get(*rid) else { continue };
+        let Some(g) = m.run_geom(e) else { continue };
+        if e.category() != "stripfooting" || !before.join {
+            continue;
+        }
+        let box_of = [
+            before.start.0.min(before.end.0),
+            before.start.1.min(before.end.1),
+            before.start.0.max(before.end.0),
+            before.start.1.max(before.end.1),
+        ];
+        let (lo, hi) = g.z_span();
+        near.extend(lookup.walls_near_at(&[(box_of, lo - TOL, hi + TOL)], thickest + g.width / 2.0 + 1.0));
+    }
+    for id in near {
+        let Some(w) = m.wall(id) else { continue };
+        // An unjoined wall stretches for no one, as it joins nothing itself.
+        if moving.contains(&id) || !w.join {
             continue;
         }
         let mut n = w.clone();
         for (end, at) in [(&mut n.start, w.start), (&mut n.end, w.end)] {
-            for (before, after) in moved.iter().filter(|(before, _)| stacked(m, w, before)) {
+            for (before, after) in moved.iter().filter(|(before, _)| before.join && stacked(m, w, before)) {
                 if at.dist(before.start) <= TOL || at.dist(before.end) <= TOL {
                     *end = if at.dist(before.start) <= TOL { after.start } else { after.end };
                     break;
                 }
                 if Axis::of(before).distance(at, 0.0) <= TOL {
                     let straight = w.arc == 0.0 && after.arc == 0.0;
+                    *end =
+                        geom::line_intersection(w.start, w.end, after.start, after.end).filter(|_| straight).map_or_else(|| f(at), micron);
+                    break;
+                }
+            }
+            // A strip footing meets a wall by its top touching the wall's base, as it does in the run's own
+            // outline: the wall's end goes with a footing's the same way it goes with another wall's.
+            for (rid, (before, after)) in taken.iter() {
+                if !before.join || !after.join || !crate::runs::flat(before) {
+                    continue;
+                }
+                let Some(e) = m.elements.get(*rid) else { continue };
+                if e.category() != "stripfooting" {
+                    continue;
+                }
+                let Some(g) = m.run_geom(e) else { continue };
+                let (lo, hi) = g.z_span();
+                if !(lo - TOL <= m.top_z(w) && m.base_z(w) - TOL <= hi) {
+                    continue;
+                }
+                // A footing simply running on under the wall keeps its length: only a real corner, where
+                // another element also ends, takes the footing's end with the wall's.
+                let same = w.arc == 0.0 && same_way((w.start, w.end), (before.start, before.end));
+                if same && arms_at(m, at, (m.base_z(w), m.top_z(w))) <= 2 {
+                    continue;
+                }
+                if at.dist(before.start) <= TOL || at.dist(before.end) <= TOL {
+                    *end = if at.dist(before.start) <= TOL { after.start } else { after.end };
+                    break;
+                }
+                if geom::dist_to_segment(at, before.start, before.end) <= TOL {
+                    let straight = w.arc == 0.0;
                     *end =
                         geom::line_intersection(w.start, w.end, after.start, after.end).filter(|_| straight).map_or_else(|| f(at), micron);
                     break;
@@ -8384,8 +13551,153 @@ fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>
             }
         }
     }
-    // Doors and windows in walls that changed keep their place, or go with their wall.
-    for (&id, e) in &m.elements {
+    // A footing glued to a wall the move dragged (not taken itself) rides it too. Under a taken wall it takes the
+    // command's motion, as the footing under either of two collinear wall segments does; under a dragged wall it
+    // follows that wall's own new line, so a corner does not push it past the wall it carries.
+    let mut glued_ids: BTreeSet<Id> = glued.iter().map(|(id, ..)| *id).collect();
+    let glued_walls: Vec<Id> = walls.keys().copied().collect();
+    for (fid, _) in if end.is_none() { crate::glue::footings_of(m, &glued_walls) } else { Vec::new() } {
+        if glued_ids.contains(&fid) {
+            continue;
+        }
+        let Some(before) = m.run_of(fid).cloned() else { continue };
+        let category = m.elements.get(fid).map(|e| e.category()).unwrap_or_default();
+        let under_taken = moved.iter().any(|(wall, _)| crate::glue::holds(m, wall, &before, category));
+        let along_wall =
+            (!under_taken).then(|| crate::glue::wall_of(m, fid)).flatten().and_then(|w| Some((m.wall(w)?.clone(), walls.get(&w)?.clone())));
+        let after = match along_wall {
+            Some((was, now)) => {
+                let u = was.end - was.start;
+                let along = |p: P2| {
+                    if u.length() <= TOL { f(p) } else { now.start + (now.end - now.start) * ((p - was.start).dot(u) / u.dot(u)) }
+                };
+                crate::glue::mapped(&before, along)
+            }
+            None => crate::glue::mapped(&before, f),
+        };
+        taken.insert(fid, (before.clone(), after.clone()));
+        glued.push((fid, before, after));
+        glued_ids.insert(fid);
+    }
+    // Runs staying put stretch to keep their joins with the taken ones, as the walls above do: an end on
+    // a taken run's end goes with it; an end on its span slides along the staying run's own line onto the
+    // intersection. A strip footing takes a taken wall's end at a corner the same way, and what refuses to
+    // join, doesn't lie flat, or shares no category or heights with the taken run is left where it is — the
+    // flags act on the whole element, both ends alike.
+    if !taken.is_empty() || !moved.is_empty() {
+        // The heights a run reaches: its section's, worked out as every view draws it — of a taken run
+        // from the model, whose plan a command changes nothing of (its heights are what stay put).
+        let span_of = |id: &Id| m.elements.get(*id).and_then(|e| m.run_geom(e)).map(|g| g.z_span());
+        let box_of =
+            |r: &crate::model::Run| [r.start.0.min(r.end.0), r.start.1.min(r.end.1), r.start.0.max(r.end.0), r.start.1.max(r.end.1)];
+        let mut met: BTreeSet<Id> = taken
+            .iter()
+            .filter(|(id, (before, after))| {
+                before.join && after.join && crate::runs::flat(before) && crate::runs::flat(after) && span_of(id).is_some()
+            })
+            .flat_map(|(id, (before, _))| {
+                let (lo, hi) = span_of(id).unwrap_or((0.0, 0.0));
+                index.runs_near_box(box_of(before), 2.0 * TOL, lo, hi)
+            })
+            .collect();
+        // A strip footing ending on a taken wall follows it too: the touch of its top with the wall's base
+        // is its joint, as the run's own outline has it.
+        for (before, after) in &moved {
+            if !before.join || !after.join {
+                continue;
+            }
+            let (lo, hi) = (m.base_z(before), m.top_z(before));
+            met.extend(index.runs_near_box(crate::derived::axis_box(before), 2.0 * TOL, lo - TOL, hi + TOL));
+        }
+        for id in met {
+            if moving.contains(&id) {
+                continue;
+            }
+            let Some(e) = m.elements.get(id) else { continue };
+            let (Some(r), category) = (e.run(), e.category()) else { continue };
+            let Some((lo, hi)) = span_of(&id) else { continue };
+            if !r.join || !crate::runs::flat(r) {
+                continue;
+            }
+            let mut n = r.clone();
+            for (end, at) in [(&mut n.start, r.start), (&mut n.end, r.end)] {
+                for (tid, (before, after)) in taken.iter() {
+                    if !before.join || !after.join || !crate::runs::flat(before) || !crate::runs::flat(after) {
+                        continue;
+                    }
+                    if m.elements.get(*tid).is_none_or(|o| o.category() != category) {
+                        continue;
+                    }
+                    let Some((blo, bhi)) = span_of(tid) else { continue };
+                    if !(lo < bhi && blo < hi) {
+                        continue;
+                    }
+                    if at.dist(before.start) <= TOL {
+                        *end = after.start;
+                        break;
+                    }
+                    if at.dist(before.end) <= TOL {
+                        *end = after.end;
+                        break;
+                    }
+                    if geom::dist_to_segment(at, before.start, before.end) <= TOL {
+                        *end = geom::line_intersection(r.start, r.end, after.start, after.end).map_or_else(|| f(at), micron);
+                        break;
+                    }
+                }
+                if category != "stripfooting" {
+                    continue;
+                }
+                for (before, after) in moved.iter().filter(|(before, after)| before.join && after.join) {
+                    let (wlo, whi) = (m.base_z(before), m.top_z(before));
+                    if !(lo - TOL <= whi && wlo - TOL <= hi) {
+                        continue;
+                    }
+                    // As above: a wall running on over the footing leaves its length be; a corner takes it.
+                    let same = before.arc == 0.0 && same_way((r.start, r.end), (before.start, before.end));
+                    if same && arms_at(m, at, (lo, hi)) <= 2 {
+                        continue;
+                    }
+                    if at.dist(before.start) <= TOL {
+                        *end = after.start;
+                        break;
+                    }
+                    if at.dist(before.end) <= TOL {
+                        *end = after.end;
+                        break;
+                    }
+                    if geom::dist_to_segment(at, before.start, before.end) <= TOL {
+                        let straight = before.arc == 0.0 && after.arc == 0.0;
+                        *end = geom::line_intersection(r.start, r.end, after.start, after.end)
+                            .filter(|_| straight)
+                            .map_or_else(|| f(at), micron);
+                        break;
+                    }
+                }
+            }
+            if n != *r
+                && let Some(moved_run) = Element::of_run(category, n)
+            {
+                others.push((id, moved_run));
+            }
+        }
+    }
+    // The strip footings glued to the walls taken whole ride them in plan, by the very transformation: their
+    // lines are the walls', so the lines still are after. A wall's end dragged (with `end`) doesn't move its
+    // footing as a whole: the condition is left to be read again after the command.
+    for (id, _, after) in glued {
+        if moving.contains(&id) {
+            continue;
+        }
+        if let Some(e) = crate::model::Element::of_run("stripfooting", after) {
+            others.retain(|(other, _)| *other != id);
+            others.push((id, e));
+        }
+    }
+    // Doors and windows in walls that changed keep their place, or go with their wall: those pointing at them, by id.
+    let hosted: BTreeSet<Id> =
+        walls.keys().filter_map(|w| m.elements.guid(*w)).flat_map(|g| lookup.referrers(&g).collect::<Vec<_>>()).collect();
+    for (id, e) in hosted.into_iter().filter_map(|id| Some((id, m.elements.get(id)?))) {
         let (Element::Door(o) | Element::Window(o)) = e else { continue };
         let Some(host) = m.elements.id(o.host) else { continue };
         let (Some(before), Some(after)) = (old(&host), walls.get(&host)) else { continue };
@@ -8428,9 +13740,17 @@ fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>
             })
             .collect();
         let turned = |id: &Guid| moving_guids.contains(id) || hosts.get(id).is_some_and(|h| moving_guids.contains(h));
+        let columns: BTreeSet<Guid> = moving_guids
+            .iter()
+            .copied()
+            .filter(|g| matches!(m.elements.get(*g), Some(Element::Column(_) | Element::StructuralColumn(_))))
+            .collect();
         for e in m.elements.values_mut() {
             if let Element::Dimension(d) = e {
-                d.refs.iter_mut().filter(|r| turned(&r.id)).for_each(|r| r.face = r.face.mirrored());
+                d.refs
+                    .iter_mut()
+                    .filter(|r| turned(&r.id))
+                    .for_each(|r| *r = if columns.contains(&r.id) { r.mirrored_column() } else { r.mirrored(hosts.contains_key(&r.id)) });
             }
         }
     }
@@ -8557,9 +13877,11 @@ fn duplicate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion) -> R {
             Element::Dimension(d) => {
                 for r in &mut d.refs {
                     if let Some(&to) = hosts.get(&r.id) {
+                        let opening = matches!(m.elements.get(r.id), Some(Element::Door(_) | Element::Window(_)));
+                        let column = matches!(m.elements.get(r.id), Some(Element::Column(_) | Element::StructuralColumn(_)));
                         r.id = to;
                         if mo.mirror {
-                            r.face = r.face.mirrored();
+                            *r = if column { r.mirrored_column() } else { r.mirrored(opening) };
                         }
                     }
                 }
@@ -8577,6 +13899,118 @@ fn duplicate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion) -> R {
     Ok(json!({"ids": made}))
 }
 
+fn align_element(s: &mut Session, p: &Value) -> R {
+    let c = "align";
+    let id = id_opt(c, p, "id")?.ok_or_else(|| bad(c, "`id` is required"))?;
+    let line = |name| -> Result<Line, String> {
+        match points(c, p, name)?.as_slice() {
+            [a, b] => Ok((*a, *b)),
+            _ => Err(bad(c, format!("`{name}` must contain two points"))),
+        }
+    };
+    let placement = crate::align::Placement::new(line("reference")?, line("line")?)?;
+    let id = s.model.elements.id(id).ok_or_else(|| bad(c, format!("no element {id}")))?;
+    if crate::align::lines(&s.model, id).is_empty() {
+        return Err(bad(c, format!("element {id} has no straight alignment line in plan")));
+    }
+    if s.model.elements.get(id).and_then(|e| s.model.run_geom(e)).is_some_and(|g| g.vertical()) && placement.angle.abs() > 1e-9 {
+        return Err(bad(c, "an upright run has no plan rotation; choose a parallel reference"));
+    }
+    if let Some(Element::Door(o) | Element::Window(o)) = s.model.elements.get(id)
+        && let Some(w) = s.model.wall(o.host)
+        && (placement.angle.abs() > 1e-9 || placement.by.cross((w.end - w.start).unit()).abs() > TOL)
+    {
+        return Err(bad(c, "a door or window can only slide along its host wall; align its jambs, or align the wall"));
+    }
+    let mo = Motion { map: &|q| placement.map(q), slide: (placement.angle.abs() <= 1e-9).then_some(placement.by), mirror: false };
+    relocate(c, s, &[id], &mo, None)?;
+    let (reference, line) = (line("reference")?, line("line")?);
+    let moved = (placement.map(line.0), placement.map(line.1));
+    let lock = if flag(c, p, "lock")? { Some(alignment_lock(c, s, id, id_opt(c, p, "to")?, reference, moved)?) } else { None };
+    Ok(json!({"aligned": id, "angle": placement.angle, "by": placement.by, "line": [moved.0, moved.1], "lock": lock}))
+}
+
+/// Align's padlock: element `id`'s reference along `moved`, and the reference of element `to` (else of whatever has one) along
+/// `reference`, kept on one line: a dimension between them, its one segment locked at 0 (`Dimension::alignment`), which
+/// `constraints::keep` holds as it holds the others.
+fn alignment_lock(c: &str, s: &mut Session, id: Id, to: Option<Guid>, reference: Line, moved: Line) -> Result<Id, String> {
+    let m = &s.model;
+    // Whether line `l` lies along the line through `on`.
+    let along = |l: Line, on: Line| {
+        let (u, len) = ((on.1 - on.0).unit(), on.0.dist(on.1));
+        len > TOL && l.0.dist(l.1) > TOL && [l.0, l.1].iter().all(|q| (*q - on.0).cross(u).abs() <= TOL)
+    };
+    let of = |e: Id, on: Line| m.reference_lines(e).into_iter().find(|(r, l)| r.point.is_none() && along(*l, on)).map(|(r, _)| r);
+    let mine = of(id, moved).ok_or_else(|| bad(c, format!("element {id} has no line along the one aligned to lock")))?;
+    let theirs = match to {
+        Some(g) => {
+            let t = m.elements.id(g).ok_or_else(|| bad(c, format!("`to`: no element {g:?}")))?;
+            of(t, reference).ok_or_else(|| bad(c, format!("element {t} has no line along the reference to lock to")))?
+        }
+        None => m
+            .elements
+            .keys()
+            .filter(|e| **e != id)
+            .find_map(|e| of(*e, reference))
+            .ok_or_else(|| bad(c, "nothing has a line along the reference to lock to: a wall's face or centre, a grid…"))?,
+    };
+    let level = m
+        .elements
+        .get(id)
+        .and_then(|e| m.level_of(e))
+        .or_else(|| m.levels().first().map(|(l, _)| m.guid(*l)))
+        .ok_or_else(|| bad(c, "the project has no level for the lock"))?;
+    let d = Dimension {
+        level,
+        refs: vec![theirs, mine],
+        at: micron((moved.0 + moved.1) * 0.5),
+        type_name: crate::dims::default_type(&m.dimension_types, DimKind::Aligned).cloned().unwrap_or_default(),
+        locked: vec![crate::model::Lock { segment: 0, length: 0.0 }],
+        alignment: true,
+        ..Dimension::default()
+    };
+    Ok(s.model_mut().insert(Element::Dimension(d)))
+}
+
+/// A typed value for a dimension's segment, as Revit's: what the segment ends at moves along the dimension (its second
+/// reference, as the dimension's line runs) so the segment is that long; a locked segment is locked at it.
+fn dimension_value(s: &mut Session, p: &Value) -> R {
+    let c = "dimension_value";
+    only(c, p, &["id", "value", "segment"])?;
+    let id = element_id(c, &s.model, p.get("id").unwrap_or(&Value::Null))?;
+    let Some(Element::Dimension(d)) = s.model.elements.get(id) else {
+        return Err(bad(c, format!("{} {id} isn't a dimension", s.model.elements.get(id).map_or("nothing", |e| e.category()))));
+    };
+    if !matches!(d.kind, DimKind::Aligned | DimKind::Linear) || d.alignment {
+        return Err(bad(c, format!("dimension {id} isn't an aligned or a linear one: only their lengths are typed")));
+    }
+    let mut d = d.clone();
+    let value = num(c, p, "value")?.ok_or_else(|| bad(c, "`value`, the length in mm, is required"))?;
+    if !(value > TOL && value <= MAX_COORD) {
+        return Err(bad(c, format!("`value` is a length above 0 and at most {MAX_COORD} mm, not {value}")));
+    }
+    let (n, st) = s.model.stations(&d);
+    let segment = count_opt(c, p, "segment", 0)?;
+    let (Some((from, ..)), Some((to, _, r))) = (st.get(segment), st.get(segment + 1)) else {
+        return Err(bad(c, format!("dimension {id} has segments 0 to {}, not {segment}", st.len().saturating_sub(2))));
+    };
+    let by = value - (to - from);
+    let moved = s.model.elements.id(r.id).ok_or_else(|| bad(c, "what it measures to is gone"))?;
+    if let Some(l) = d.locked.iter_mut().find(|l| l.segment == segment) {
+        l.length = value;
+        s.model_mut().elements.insert(id, Element::Dimension(d));
+    }
+    if by.abs() > 1e-9 {
+        move_by(s, moved, n * by)?;
+    }
+    Ok(json!({"id": id, "moved": moved, "by": hundredth(by)}))
+}
+
+/// Element `id` moved `by` in plan, as `move` moves it: what keeps a dimension's constraints.
+pub(crate) fn move_by(s: &mut Session, id: Id, by: P2) -> Result<(), String> {
+    move_elements(s, &json!({"ids": [id], "by": [by.0, by.1]})).map(|_| ())
+}
+
 fn move_elements(s: &mut Session, p: &Value) -> R {
     let c = "move";
     let ids = ids_param(c, &s.model, p)?;
@@ -8590,8 +14024,8 @@ fn move_elements(s: &mut Session, p: &Value) -> R {
         Some("end") => Some(false),
         Some(other) => return Err(bad(c, format!("`end` is `start` or `end`, not `{other}`"))),
     };
-    if end.is_some() && !matches!(ids.as_slice(), [one] if s.model.wall(*one).is_some()) {
-        return Err(bad(c, "`end` moves an end of one wall; give `ids` one wall"));
+    if end.is_some() && !matches!(ids.as_slice(), [one] if s.model.wall(*one).is_some() || s.model.run_of(*one).is_some()) {
+        return Err(bad(c, "`end` moves an end of one wall or one run; give `ids` one wall or one run"));
     }
     relocate(c, s, &ids, &Motion { map: &|q| q + by, slide: Some(by), mirror: false }, end)?;
     if disconnect || dz != 0.0 {
@@ -9399,6 +14833,32 @@ fn delete_type(s: &mut Session, p: &Value) -> R {
     Ok(json!({"deleted": {"kind": label, "name": name}}))
 }
 
+fn rename_type(s: &mut Session, p: &Value) -> R {
+    let c = "rename_type";
+    only(c, p, &["category", "family", "type", "name"])?;
+    let to = name_param(c, p, "name")?.ok_or_else(|| bad(c, "`name` is required: the type's new name"))?;
+    let (kind, from) = entry_of(c, &s.model, p)?;
+    let label = kind.label();
+    // A family's type is `family: type` in the library.
+    let (to_entry, to) = match (&kind, from.split_once(": ")) {
+        (LibKind::FamilyType, Some((f, _))) => (format!("{f}: {to}"), to),
+        _ => (to.clone(), to),
+    };
+    if to_entry == from {
+        return Ok(json!({"renamed": {"kind": label, "from": from, "to": to}}));
+    }
+    let m = s.model_mut();
+    if m.library_names().iter().any(|(k, n)| *k == kind && *n == to_entry) {
+        return Err(bad(c, format!("there's already a {label} `{to}`")));
+    }
+    if !m.move_entry(&kind, &from, &to_entry) {
+        return Err(bad(c, format!("there is no {label} `{from}`")));
+    }
+    rename_entry(m, &kind, &from, &to_entry);
+    let shown = |n: &str| n.split_once(": ").filter(|_| kind == LibKind::FamilyType).map_or(n, |(_, t)| t).to_string();
+    Ok(json!({"renamed": {"kind": label, "from": shown(&from), "to": to}}))
+}
+
 /// How many passes Purge Unused makes at most: what a pass takes out may leave more unused (a family's material), a few deep.
 const PURGE_PASSES: usize = 16;
 
@@ -9442,6 +14902,142 @@ fn purge(s: &mut Session, p: &Value) -> R {
 }
 
 fn delete(s: &mut Session, p: &Value) -> R {
+    #[cfg(test)]
+    let mut twin = s.clone();
+    let result = delete_indexed(s, p);
+    #[cfg(test)]
+    {
+        let expected = delete_from_scratch(&mut twin, p);
+        assert_eq!(result, expected, "indexed deletion returned a different reply");
+        assert_eq!(s.model, twin.model, "indexed deletion left a different model");
+    }
+    result
+}
+
+fn delete_indexed(s: &mut Session, p: &Value) -> R {
+    let m = &s.model;
+    let ids = ids_param("delete", m, p)?;
+    let lookup = m.lookup();
+    let mut gone: BTreeSet<Guid> = ids.iter().map(|id| m.guid(*id)).collect();
+    let mut frontier = gone.clone();
+    // Only referrers can be hosted by a deleted element. Keep the original cascade rules.
+    while !frontier.is_empty() {
+        let candidates: BTreeSet<Id> = frontier.iter().flat_map(|g| lookup.referrers(g)).collect();
+        let mut next = BTreeSet::new();
+        for id in candidates {
+            let guid = m.guid(id);
+            if gone.contains(&guid) {
+                continue;
+            }
+            let hosted = match m.elements.get(id) {
+                Some(Element::Door(o) | Element::Window(o)) => gone.contains(&o.host),
+                Some(Element::Railing(r)) => r.host.is_some_and(|h| gone.contains(&h)),
+                Some(Element::Rebar(rb)) => rb.host.is_some_and(|h| gone.contains(&h)),
+                Some(Element::PlanView(v)) => gone.contains(&v.level) || v.parent.is_some_and(|p| gone.contains(&p)),
+                Some(Element::Tag(t)) => gone.contains(&t.host) || t.view.is_some_and(|v| gone.contains(&v)),
+                Some(Element::Dimension(d)) => d.view.is_some_and(|v| gone.contains(&v)),
+                Some(Element::Dimension3D(d)) => gone.contains(&d.view),
+                Some(Element::Viewport(v)) => gone.contains(&v.sheet) || gone.contains(&v.view),
+                Some(Element::Text(n)) => gone.contains(&n.view),
+                Some(Element::DetailLine(l)) => gone.contains(&l.view),
+                Some(Element::FilledRegion(r)) => gone.contains(&r.view),
+                Some(Element::DetailGroup(g)) => gone.contains(&g.view),
+                Some(Element::RepeatingDetail(r)) => gone.contains(&r.view),
+                Some(Element::Spot(sp)) => gone.contains(&sp.view) || sp.host.is_some_and(|h| gone.contains(&h)),
+                Some(Element::CadImport(ci)) => ci.view.is_some_and(|v| gone.contains(&v)),
+                _ => false,
+            };
+            if hosted {
+                next.insert(guid);
+            }
+        }
+        gone.extend(&next);
+        frontier = next;
+    }
+    let mut dimensions: BTreeSet<Id> =
+        gone.iter().flat_map(|g| lookup.referrers(g)).filter(|id| matches!(m.elements.get(*id), Some(Element::Dimension(_)))).collect();
+    let mut kept = Vec::new();
+    while let Some(id) = dimensions.pop_first() {
+        let guid = m.guid(id);
+        let Some(Element::Dimension(d)) = m.elements.get(id) else { continue };
+        if gone.contains(&guid) || !d.refs.iter().any(|r| gone.contains(&r.id)) {
+            continue;
+        }
+        let mut d = d.clone();
+        d.refs.retain(|r| !gone.contains(&r.id));
+        if d.refs.len() < 2 {
+            gone.insert(guid);
+            // The oracle visits dimensions once in id order; preserve that ordering even
+            // when a dimension references another dimension that has just gone.
+            dimensions.extend(
+                lookup.referrers(&guid).filter(|other| *other > id && matches!(m.elements.get(*other), Some(Element::Dimension(_)))),
+            );
+        } else {
+            kept.push((id, d));
+        }
+    }
+    let mut deleted: Vec<Id> = gone.iter().filter_map(|g| m.elements.id(*g)).collect();
+    deleted.sort_unstable();
+    let ties: BTreeSet<Id> = gone
+        .iter()
+        .flat_map(|g| lookup.referrers(g))
+        .filter(|id| match m.elements.get(*id) {
+            Some(Element::Wall(w)) => w.attach_top.is_some_and(|g| gone.contains(&g)) || w.attach_base.is_some_and(|g| gone.contains(&g)),
+            Some(Element::Roof(r)) => r.join.is_some_and(|g| gone.contains(&g)),
+            // A 3D view whose work plane's level goes sketches on the lowest level again.
+            Some(Element::View3D(v)) => v.work_plane.as_ref().is_some_and(|wp| wp.level.is_some_and(|l| gone.contains(&l))),
+            _ => false,
+        })
+        .collect();
+    // Linework is not currently part of Element::refs; inspect the small view index as
+    // well as graphics overrides, without mutably visiting every model element.
+    let views: BTreeSet<Id> = lookup
+        .levels()
+        .chain(["planview", "section", "elevation", "view3d"].into_iter().flat_map(|cat| lookup.rare(cat)))
+        .filter(|id| !gone.contains(&m.guid(*id)))
+        .filter(|id| {
+            m.elements
+                .get(*id)
+                .and_then(graphics::graphics_of_element)
+                .is_some_and(|g| g.elements.keys().any(|id| gone.contains(id)) || g.linework.iter().any(|l| gone.contains(&l.element)))
+        })
+        .collect();
+    let m = s.model_mut();
+    for id in &gone {
+        m.elements.remove(id);
+    }
+    massing::forget(m, &gone);
+    for id in views {
+        if let Some(g) = m.elements.get_mut(id).and_then(graphics::graphics_mut) {
+            g.elements.retain(|id, _| !gone.contains(id));
+            g.linework.retain(|l| !gone.contains(&l.element));
+        }
+    }
+    for (id, d) in kept {
+        m.elements.insert(id, Element::Dimension(d));
+    }
+    for id in ties {
+        match m.elements.get_mut(id) {
+            Some(Element::Wall(w)) => {
+                if w.attach_top.is_some_and(|g| gone.contains(&g)) {
+                    w.attach_top = None;
+                }
+                if w.attach_base.is_some_and(|g| gone.contains(&g)) {
+                    w.attach_base = None;
+                }
+            }
+            Some(Element::Roof(r)) if r.join.is_some_and(|g| gone.contains(&g)) => r.join = None,
+            Some(Element::View3D(v)) if v.work_plane.as_ref().is_some_and(|wp| wp.level.is_some_and(|l| gone.contains(&l))) => {
+                v.work_plane = None
+            }
+            _ => {}
+        }
+    }
+    Ok(json!({"deleted": deleted}))
+}
+
+#[cfg(test)]
+fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
     let c = "delete";
     let m = &s.model;
     let ids = ids_param(c, m, p)?;
@@ -9458,10 +15054,12 @@ fn delete(s: &mut Session, p: &Value) -> R {
                         Element::ElectricalLine(line) => gone.contains(&line.source),
                         Element::ElectricalTerminal(t) => gone.contains(&t.device),
                         Element::Railing(r) => r.host.is_some_and(|h| gone.contains(&h)),
+                        Element::Rebar(rb) => rb.host.is_some_and(|h| gone.contains(&h)),
                         // A plan view goes with its level and its parent; what is annotated in a view goes with it.
                         Element::PlanView(v) => gone.contains(&v.level) || v.parent.is_some_and(|p| gone.contains(&p)),
                         Element::Tag(t) => gone.contains(&t.host) || t.view.is_some_and(|v| gone.contains(&v)),
                         Element::Dimension(d) => d.view.is_some_and(|v| gone.contains(&v)),
+                        Element::Dimension3D(d) => gone.contains(&d.view),
                         Element::Viewport(v) => gone.contains(&v.sheet) || gone.contains(&v.view),
                         // Notes and spot elevations go with their view, spots with what they read.
                         Element::Text(n) => gone.contains(&n.view),
@@ -9572,11 +15170,19 @@ fn delete(s: &mut Session, p: &Value) -> R {
     }
     let deleted: Vec<Id> = m.elements.with_guids().filter(|(_, g, _)| gone.contains(g)).map(|(id, ..)| id).collect();
     let m = s.model_mut();
+    // A 3D view whose work plane's level goes sketches on the lowest level again.
+    for e in m.elements.values_mut() {
+        if let Element::View3D(v) = e
+            && v.work_plane.as_ref().is_some_and(|wp| wp.level.is_some_and(|l| gone.contains(&l)))
+        {
+            v.work_plane = None;
+        }
+    }
     for id in &gone {
         m.elements.remove(id);
     }
     // What was made from a mass that goes is ordinary from then on.
-    massing::forget(m, &gone);
+    massing::forget_from_scratch(m, &gone);
     // No view keeps an override for what isn't there.
     for g in m.elements.values_mut().filter_map(graphics::graphics_mut) {
         g.elements.retain(|id, _| !gone.contains(id));
@@ -9603,6 +15209,46 @@ fn delete(s: &mut Session, p: &Value) -> R {
 
 // ---------- reading ----------
 
+fn standard(s: &mut Session, p: &Value) -> R {
+    let c = "standard";
+    if let Some(code) = string(c, p, "set")? {
+        let std = crate::standards::TechnicalStandard::from_code(&code)
+            .ok_or_else(|| bad(c, format!("`set` is nbr, iso, ansi, eu or jis, not `{code}`")))?;
+        let flag = |key: &str, default: bool| -> Result<bool, String> {
+            match p.get(key) {
+                None | Some(Value::Null) => Ok(default),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(v) => Err(bad(c, format!("`{key}` is true or false, not {v}"))),
+            }
+        };
+        let adapt_all = flag("adapt_all", true)?;
+        let (lw, os, un) =
+            (flag("adapt_line_weights", adapt_all)?, flag("adapt_object_styles", adapt_all)?, flag("adapt_units", adapt_all)?);
+        s.model_mut().apply_standard(std, lw, os, un);
+    }
+    let m = &s.model;
+    let std = m.standard();
+    Ok(json!({
+        "standard": std.code(),
+        "name": std.name(),
+        "short_name": std.short_name(),
+        "region": std.region(),
+        "governing_body": std.governing_body(),
+        "references": std.reference_standards(),
+        "projection": std.projection_method().name(),
+        "default_units": std.default_units().name(),
+        "default_sheet_size": std.default_sheet_size(),
+        "all": crate::standards::TechnicalStandard::ALL.iter().map(|s| json!({
+            "code": s.code(),
+            "name": s.name(),
+            "short_name": s.short_name(),
+            "region": s.region(),
+            "description": s.description(),
+            "references": s.reference_standards(),
+        })).collect::<Vec<_>>()
+    }))
+}
+
 fn units(s: &mut Session, p: &Value) -> R {
     let c = "units";
     if let Some(name) = string(c, p, "length")? {
@@ -9612,6 +15258,73 @@ fn units(s: &mut Session, p: &Value) -> R {
         }
     }
     Ok(json!({"length": s.model.units.name()}))
+}
+
+fn room_area(s: &mut Session, p: &Value) -> R {
+    let c = "room_area";
+    only(c, p, &["at"])?;
+    if p.get("at").is_some_and(|v| !v.is_string()) {
+        return Err(bad(c, "`at` is centre or finish"));
+    }
+    if let Some(name) = string(c, p, "at")? {
+        let at = RoomArea::parse(&name).ok_or_else(|| bad(c, format!("`at` is centre or finish, not `{name}`")))?;
+        if at != s.model.room_area {
+            s.model_mut().room_area = at;
+        }
+    }
+    Ok(json!({"at": s.model.room_area.name()}))
+}
+
+fn georeference(s: &mut Session, p: &Value) -> R {
+    let c = "georeference";
+    const TEXTS: [&str; 5] = ["description", "geodetic_datum", "vertical_datum", "map_projection", "map_zone"];
+    const NUMBERS: [&str; 5] = ["eastings", "northings", "height", "rotation", "scale"];
+    let keys: Vec<&str> = ["crs", "clear"].into_iter().chain(TEXTS).chain(NUMBERS).collect();
+    only(c, p, &keys)?;
+    let given = keys.iter().filter(|k| **k != "clear").any(|k| !absent(p.get(*k)));
+    match p.get("clear") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(true)) if !given => {
+            if s.model.georeference.is_some() {
+                s.model_mut().georeference = None;
+            }
+            return Ok(json!({"georeference": null}));
+        }
+        Some(Value::Bool(true)) => return Err(bad(c, "`clear` takes the georeference away, and nothing else with it")),
+        Some(Value::Bool(false)) => {}
+        Some(_) => return Err(bad(c, "`clear` is true or false")),
+    }
+    if given {
+        let crs = string(c, p, "crs")?;
+        let mut g = match (&s.model.georeference, &crs) {
+            (Some(g), _) => g.clone(),
+            (None, Some(_)) => crate::model::Georeference { scale: 1.0, ..Default::default() },
+            (None, None) => {
+                return Err(bad(c, "the project has no georeference yet: give its coordinate reference system's name, `crs` (EPSG:31983)"));
+            }
+        };
+        if let Some(crs) = crs {
+            g.crs = crs;
+        }
+        let mut texts = [&mut g.description, &mut g.geodetic_datum, &mut g.vertical_datum, &mut g.map_projection, &mut g.map_zone];
+        for (key, field) in TEXTS.into_iter().zip(texts.iter_mut()) {
+            if let Some(t) = string(c, p, key)? {
+                **field = Some(t).filter(|t| !t.trim().is_empty());
+            }
+        }
+        // Map coordinates run past the model's own (`num`'s `MAX_COORD`): `Georeference::check` bounds them.
+        let mut numbers = [&mut g.eastings, &mut g.northings, &mut g.height, &mut g.rotation, &mut g.scale];
+        for (key, field) in NUMBERS.into_iter().zip(numbers.iter_mut()) {
+            if let Some(v) = p.get(key).filter(|v| !v.is_null()) {
+                **field = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad(c, format!("`{key}` must be a number, got {v}")))?;
+            }
+        }
+        g.check().map_err(|e| bad(c, e))?;
+        if s.model.georeference.as_ref() != Some(&g) {
+            s.model_mut().georeference = Some(g);
+        }
+    }
+    Ok(json!({"georeference": s.model.georeference}))
 }
 
 /// `kind` `from` is called `to` now: its library entry, and everything that names it.
@@ -9938,6 +15651,44 @@ fn import_fill_patterns(s: &mut Session, p: &Value) -> R {
     Ok(json!({"imported": imported, "left_out": left_out, "left_out_count": count}))
 }
 
+fn export_crosscheck(s: &mut Session, p: &Value) -> R {
+    let c = "export_crosscheck";
+    only(c, p, &["path"])?;
+    let description = crate::crosscheck::describe(&s.model);
+    match string(c, p, "path")? {
+        Some(path) => {
+            let text = serde_json::to_string_pretty(&description).map_err(|e| bad(c, e))?;
+            crate::autosave::atomic_write(&PathBuf::from(&path), &text).map_err(|e| bad(c, e))?;
+            Ok(json!({"path": path}))
+        }
+        None => Ok(json!({"description": description})),
+    }
+}
+
+fn compare_crosscheck(s: &mut Session, p: &Value) -> R {
+    let c = "compare_crosscheck";
+    only(c, p, &["path", "text"])?;
+    // A table's text is far longer than a name: `text` takes as much as a file does (`crosscheck::read` refuses more).
+    let text = match p.get("text") {
+        Some(Value::String(t)) => Some(t.clone()),
+        Some(v) if !v.is_null() => return Err(bad(c, "`text` must be the text of a table")),
+        _ => None,
+    };
+    let text = match (string(c, p, "path")?, text) {
+        (Some(path), None) => {
+            let size = std::fs::metadata(&path).map_err(|e| bad(c, format!("{path}: {e}")))?.len();
+            if size > crate::crosscheck::MAX_TEXT as u64 {
+                return Err(bad(c, format!("{path} is over {} MB", crate::crosscheck::MAX_TEXT >> 20)));
+            }
+            std::fs::read_to_string(&path).map_err(|e| bad(c, format!("{path}: {e}")))?
+        }
+        (None, Some(text)) => text,
+        _ => return Err(bad(c, "give `path`, a table's file, or its `text`")),
+    };
+    let theirs = crate::crosscheck::read(&text).map_err(|e| bad(c, e))?;
+    Ok(crate::crosscheck::compare(&crate::crosscheck::ours(&s.model), &theirs).to_json(100))
+}
+
 fn export_fill_patterns(s: &mut Session, p: &Value) -> R {
     let c = "export_fill_patterns";
     only(c, p, &["path", "names"])?;
@@ -9959,7 +15710,7 @@ fn export_fill_patterns(s: &mut Session, p: &Value) -> R {
 
 fn fill_pattern(s: &mut Session, p: &Value) -> R {
     let c = "fill_pattern";
-    only(c, p, &["name", "target", "lines", "rename", "delete"])?;
+    only(c, p, &["name", "target", "lines", "drawn", "rename", "delete"])?;
     let Some(name) = name_param(c, p, "name")? else {
         return Ok(json!({"patterns": s.model.fill_patterns}));
     };
@@ -9986,10 +15737,16 @@ fn fill_pattern(s: &mut Session, p: &Value) -> R {
             return Err(bad(c, format!("there's no fill pattern `{name}`; make one with `lines`{}", known_names(&there))));
         }
     };
-    if let Some(t) = shaped::<Target>(c, p, "target", "drafting or model")? {
-        pattern.target = t;
+    match p.get("drawn") {
+        None => {}
+        Some(Value::Null) => pattern.drawn = None,
+        Some(v) => pattern.drawn = Some(v.as_f64().ok_or_else(|| bad(c, format!("`drawn` is a view's scale, a number, not {v}")))?),
     }
-    if let Some(lines) = shaped(c, p, "lines", "[{angle, spacing, origin?: [x, y], shift?, dashes?: [mm, -mm, …]}, …]")? {
+    let lines = shaped(c, p, "lines", "[{angle, spacing, origin?: [x, y], shift?, dashes?: [mm, -mm, …]}, …]")?;
+    if let Some(t) = shaped::<Target>(c, p, "target", "drafting or model")? {
+        pattern = if lines.is_none() { pattern.retargeted(t) } else { FillPattern { target: t, ..pattern } };
+    }
+    if let Some(lines) = lines {
         pattern.lines = lines;
     }
     let name = match name_param(c, p, "rename")? {
@@ -10007,6 +15764,24 @@ fn fill_pattern(s: &mut Session, p: &Value) -> R {
     if m.fill_patterns.get(&name) != Some(&pattern) {
         m.fill_patterns.insert(name.clone(), pattern.clone());
     }
+    Ok(json!({"name": name, "pattern": pattern}))
+}
+
+fn make_fill_pattern(s: &mut Session, p: &Value) -> R {
+    let c = "make_fill_pattern";
+    only(c, p, &["ids", "from", "to", "name", "target"])?;
+    let m = &s.model;
+    let ids = ids_param(c, m, p)?;
+    let (from, to) = (point_req(c, p, "from")?, point_req(c, p, "to")?);
+    let Some(name) = name_param(c, p, "name")? else { return Err(bad(c, "`name` the new pattern's is required")) };
+    if m.fill_patterns.contains_key(&name) {
+        return Err(bad(c, format!("there's already a fill pattern `{name}`")));
+    }
+    let target = shaped::<Target>(c, p, "target", "drafting or model")?.unwrap_or(Target::Model);
+    let made = crate::fills::make::from_lines(m, &ids, from, to).map_err(|e| bad(c, e))?;
+    let pattern = made.as_target(target);
+    pattern.check(&name).map_err(|e| bad(c, e))?;
+    s.model_mut().fill_patterns.insert(name.clone(), pattern.clone());
     Ok(json!({"name": name, "pattern": pattern}))
 }
 
@@ -10309,12 +16084,16 @@ fn object_styles(s: &mut Session, p: &Value) -> R {
         let given: BTreeMap<String, Given> = serde_json::from_value(v.clone())
             .map_err(|e| bad(c, format!("`categories` is {{category: {{projection?: pen, cut?: pen}}, …}}: {e}")))?;
         let mut styles = s.model.object_styles.clone();
+        // `component` first: the family categories given with it are given on top of it, in whatever order they came.
+        let mut given: Vec<(String, Given)> = given.into_iter().collect();
+        given.sort_by_key(|(cat, _)| cat != graphics::COMPONENT);
         for (cat, g) in given {
             crate::styles::known(&cat).map_err(|e| bad(c, e))?;
-            let was = s.model.object_style(&cat);
+            let was = styles.get(&cat).copied().unwrap_or_else(|| crate::styles::inherited(&styles, &cat));
             let style = crate::styles::ObjectStyle { projection: g.projection.unwrap_or(was.projection), cut: g.cut.unwrap_or(was.cut) };
             style.check(&cat).map_err(|e| bad(c, e))?;
-            if style == crate::styles::default_of(&cat) {
+            // A category given what it starts with has nothing of its own to keep, unless `component` says another.
+            if style == crate::styles::inherited(&styles, &cat) {
                 styles.remove(&cat);
             } else {
                 styles.insert(cat, style);
@@ -10335,7 +16114,12 @@ fn object_styles(s: &mut Session, p: &Value) -> R {
     Ok(json!({"categories": all}))
 }
 
-fn inspect(s: &mut Session, _: &Value) -> R {
+fn inspect(s: &mut Session, p: &Value) -> R {
+    let c = "inspect";
+    only(c, p, &["brief"])?;
+    // `brief`: everything but the library, whose maps are most of the answer and are its size here instead. A
+    // plugin pays for every byte of the answer in fuel, so a summary that needs no type or material asks for this.
+    let brief = p.get("brief").and_then(Value::as_bool).unwrap_or(false);
     let revision = s.revision();
     let m = &s.model;
     let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
@@ -10343,25 +16127,47 @@ fn inspect(s: &mut Session, _: &Value) -> R {
         *counts.entry(e.category()).or_default() += 1;
     }
     let levels: Vec<Value> = m.levels().iter().map(|(id, l)| json!({"id": id, "name": l.name, "elevation": l.elevation})).collect();
-    let mut warnings: Vec<String> = m
-        .elements
-        .iter()
-        .filter_map(|(id, e)| match e {
-            Element::Room(r) if m.room_region(r).is_none() => {
-                Some(format!("room {id} ({} {}) is not enclosed: the walls around it no longer close", r.number, r.name))
-            }
-            _ => None,
-        })
-        .collect();
+    let mut warnings = m.warnings();
     warnings.extend(m.carrier_warnings());
-    Ok(json!({
-        "name": m.name, "units": "mm", "project_units": m.units.name(), "language": m.language.code(), "path": s.path, "levels": levels,
+    let mut out = json!({
+        "name": m.name, "units": "mm", "project_units": m.units.name(), "room_area": m.room_area.name(), "language": m.language.code(), "standard": m.standard().code(), "path": s.path, "levels": levels,
         "counts": counts,
-        "types": m.types, "materials": m.materials, "images": images(m), "families": families(m), "parameters": m.parameters,
-        "view_filters": m.view_filters, "view_templates": m.view_templates, "phases": m.phases, "phase_filters": m.phase_filters,
-        "phase_overrides": m.phase_overrides, "option_sets": m.option_sets, "warnings": warnings,
+        "warnings": warnings,
         "history": s.history(), "revision": revision,
-    }))
+    });
+    if brief {
+        let types = m.types.wall.len()
+            + m.types.floor.len()
+            + m.types.door.len()
+            + m.types.window.len()
+            + m.types.column.len()
+            + m.types.roof.len()
+            + m.types.ceiling.len()
+            + m.types.railing.len()
+            + m.types.structural_column.len()
+            + m.types.footing.len()
+            + m.types.runs.values().map(BTreeMap::len).sum::<usize>();
+        out["library"] = json!({
+            "types": types, "materials": m.materials.len(), "families": m.families.len(),
+            "parameters": m.parameters.len(), "images": m.images.len(),
+        });
+        return Ok(out);
+    }
+    out["types"] = json!(m.types);
+    out["materials"] = json!(m.materials);
+    out["images"] = images(m);
+    out["families"] = families(m);
+    out["parameters"] = json!(m.parameters);
+    out["view_filters"] = json!(m.view_filters);
+    out["view_templates"] = json!(m.view_templates);
+    out["phases"] = json!(m.phases);
+    out["phase_filters"] = json!(m.phase_filters);
+    out["phase_overrides"] = json!(m.phase_overrides);
+    out["option_sets"] = json!(m.option_sets);
+    out["voltages"] = json!(m.voltages);
+    out["distribution_systems"] = json!(m.distribution_systems);
+    out["wire_types"] = json!(m.wire_types);
+    Ok(out)
 }
 
 fn elements(s: &mut Session, p: &Value) -> R {
@@ -10377,6 +16183,7 @@ fn elements(s: &mut Session, p: &Value) -> R {
         .filter(|(_, e)| level.is_none_or(|l| m.level_of(e) == Some(l)))
         .map(|(id, _)| *id)
         .collect();
-    let page: Vec<Value> = hits.iter().skip(offset).take(limit).map(|id| element_json(m, *id)).collect();
+    let rooms = crate::rooms::Rooms::new(m);
+    let page: Vec<Value> = hits.iter().skip(offset).take(limit).map(|id| element_json_with(m, *id, &rooms)).collect();
     Ok(json!({"count": hits.len(), "returned": page.len(), "elements": page}))
 }

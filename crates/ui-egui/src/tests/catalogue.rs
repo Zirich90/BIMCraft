@@ -273,7 +273,7 @@ fn a_bound_catalogue_is_polled_without_a_manual_import() {
     assert!(h.state().session.model.types.runs["wire"].contains_key("External cable"));
     let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
     assert!(rows.iter().find(|r| r[2] == "External cable").unwrap()[0].is_empty(), "polling only reads the workbook");
-    let history = h.state().session.history();
+    let history = h.state().session.history().into_iter().map(str::to_owned).collect::<Vec<_>>();
     for _ in 0..10 {
         h.step();
     }

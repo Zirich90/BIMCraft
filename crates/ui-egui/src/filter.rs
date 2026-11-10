@@ -2,11 +2,13 @@
 //! any parameter every selected element has (`selection::common`): its values, each with how many hold it, to keep or leave
 //! out the same way. OK keeps what is checked selected.
 
+use crate::popup::Modal;
+
 use std::collections::BTreeSet;
 
 use bimcraft_core::model::Id;
 use bimcraft_core::selection::{self, CATEGORY, Group};
-use egui::{Align, Button, ComboBox, Context, Grid, Id as UiId, Layout, Modal, RichText, ScrollArea};
+use egui::{Align, Button, ComboBox, Context, Grid, Id as UiId, Layout, RichText, ScrollArea};
 
 use crate::BimApp;
 use crate::lang::{category, t, tf};
@@ -63,55 +65,56 @@ impl BimApp {
     pub(crate) fn selection_filter_window(&mut self, ctx: &Context) {
         let Some(d) = self.selection_filter.as_mut() else { return };
         let (mut ok, mut close, mut by) = (false, false, None);
-        let r = Modal::new(UiId::new("selection-filter")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(RichText::new(t("Filter")).heading());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(t("Filter by:"));
-                ComboBox::from_id_salt("selection-filter-by").selected_text(t(&d.by)).width(220.0).show_ui(ui, |ui| {
-                    for f in &d.fields {
-                        if ui.selectable_label(*f == d.by, t(f)).clicked() {
-                            by = Some(f.clone());
-                        }
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t(if d.by == CATEGORY { "Category" } else { "Value" })).strong());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(t("Count")).strong()));
-            });
-            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                Grid::new("selection-filter-grid").num_columns(2).striped(true).min_col_width(60.0).show(ui, |ui| {
-                    for g in &d.groups {
-                        let mut on = !d.off.contains(&g.value);
-                        if ui.checkbox(&mut on, shown(&d.by, &g.value)).changed() {
-                            if on {
-                                d.off.remove(&g.value);
-                            } else {
-                                d.off.insert(g.value.clone());
+        let r = Modal::new(UiId::new("selection-filter"), t("Filter")).width(380.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(t("Filter by:"));
+                    ComboBox::from_id_salt("selection-filter-by").selected_text(t(&d.by)).width(220.0).show_ui(ui, |ui| {
+                        for f in &d.fields {
+                            if ui.selectable_label(*f == d.by, t(f)).clicked() {
+                                by = Some(f.clone());
                             }
                         }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(g.ids.len().to_string()));
-                        ui.end_row();
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t(if d.by == CATEGORY { "Category" } else { "Value" })).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(t("Count")).strong()));
+                });
+                ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    Grid::new("selection-filter-grid").num_columns(2).striped(true).min_col_width(60.0).show(ui, |ui| {
+                        for g in &d.groups {
+                            let mut on = !d.off.contains(&g.value);
+                            if ui.checkbox(&mut on, shown(&d.by, &g.value)).changed() {
+                                if on {
+                                    d.off.remove(&g.value);
+                                } else {
+                                    d.off.insert(g.value.clone());
+                                }
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(g.ids.len().to_string()));
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("Check All")).clicked() {
+                        d.off.clear();
+                    }
+                    if ui.button(t("Check None")).clicked() {
+                        d.off = d.groups.iter().map(|g| g.value.clone()).collect();
                     }
                 });
+                ui.label(tf("Total selected items: {}", &[&d.kept().to_string()]));
             });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button(t("Check All")).clicked() {
-                    d.off.clear();
-                }
-                if ui.button(t("Check None")).clicked() {
-                    d.off = d.groups.iter().map(|g| g.value.clone()).collect();
-                }
-            });
-            ui.label(tf("Total selected items: {}", &[&d.kept().to_string()]));
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                close = ui.button(t("Cancel")).clicked();
-                ok = ui.add(Button::new(t("OK"))).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    close = ui.button(t("Cancel")).clicked();
+                    ok = ui.add(Button::new(t("OK"))).clicked();
+                });
             });
         });
         if let Some(by) = by {

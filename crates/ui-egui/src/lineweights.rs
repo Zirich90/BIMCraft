@@ -1,12 +1,14 @@
 //! Manage > Line Weights, as Revit's dialog: what each pen draws on paper, the model's at each of a list of scales and the
 //! annotation's at any, edited as a draft and applied as one `line_weights` command (OK and Apply), or dropped (Cancel).
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use bimcraft_core::model::Model;
 use bimcraft_core::pen::{LineWeights, MAX_PEN, MAX_SCALES, ScalePens, WIDTH_RANGE};
 use bimcraft_core::units::Units;
-use egui::{Align, ComboBox, Context, DragValue, Grid, Id as UiId, Layout, Modal, RichText, ScrollArea, Ui, WidgetInfo, WidgetType};
+use egui::{Align, ComboBox, Context, DragValue, Grid, Id as UiId, Layout, RichText, ScrollArea, Ui, WidgetInfo, WidgetType};
 use serde_json::json;
 
 use crate::BimApp;
@@ -123,31 +125,32 @@ impl BimApp {
         let Some(mut d) = self.line_weights_dialog.take() else { return };
         let units = self.session.model.units;
         let (mut ok, mut apply, mut cancel) = (false, false, false);
-        let r = Modal::new(UiId::new("line-weights")).show(ctx, |ui| {
-            ui.set_width(760.0);
-            ui.label(RichText::new(t("Line Weights")).heading());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (i, label) in TABS.iter().enumerate() {
-                    if ui.selectable_label(d.tab == i, t(label)).clicked() {
-                        d.tab = i;
+        let r = Modal::new(UiId::new("line-weights"), t("Line Weights")).width(760.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (i, label) in TABS.iter().enumerate() {
+                        if ui.selectable_label(d.tab == i, t(label)).clicked() {
+                            d.tab = i;
+                        }
                     }
+                });
+                ui.separator();
+                match d.tab {
+                    0 => model_tab(ui, &mut d, units),
+                    _ => annotation_tab(ui, &mut d),
                 }
             });
-            ui.separator();
-            match d.tab {
-                0 => model_tab(ui, &mut d, units),
-                _ => annotation_tab(ui, &mut d),
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(t("Reset")).on_hover_text(t("Back to the line weights a project in these units starts with")).clicked() {
-                    d.draft = LineWeights::default_for(units);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    apply = ui.button(t("Apply")).clicked();
-                    cancel = ui.button(t("Cancel")).clicked();
-                    ok = ui.button(t("OK")).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(t("Reset")).on_hover_text(t("Back to the line weights a project in these units starts with")).clicked() {
+                        d.draft = LineWeights::default_for(units);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        apply = ui.button(t("Apply")).clicked();
+                        cancel = ui.button(t("Cancel")).clicked();
+                        ok = ui.button(t("OK")).clicked();
+                    });
                 });
             });
         });

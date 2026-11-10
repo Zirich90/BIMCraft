@@ -78,7 +78,7 @@ fn relinking_the_current_catalogue_keeps_open_model_changes_authoritative() {
     row[4] = "18".into();
     let external = ods::write(&rows).unwrap();
     std::fs::write(&catalogue, &external).unwrap();
-    let history = session.history();
+    let history = session.history().into_iter().map(str::to_owned).collect::<Vec<_>>();
     let reply = session.execute("catalogue_link", &json!({"path":catalogue})).unwrap();
     assert_eq!(session.model.types.runs["wire"]["Test cable"].width, 12.0);
     assert_eq!(session.history(), history);
@@ -356,7 +356,7 @@ fn an_open_project_protects_existing_rows_accepts_new_ones_and_backs_up_external
     let backup = std::path::PathBuf::from(reply["backup"].as_str().unwrap());
     assert!(backup.starts_with(temp.path()));
     assert_eq!(std::fs::read(backup).unwrap(), external);
-    let history = session.history();
+    let history = session.history().into_iter().map(str::to_owned).collect::<Vec<_>>();
     let unchanged = session.execute("catalogue_sync", &json!({})).unwrap();
     assert!(unchanged["backup"].is_null(), "An unchanged workbook needs no new backup");
     assert_eq!(session.history(), history, "Polling must not fill the undo history");

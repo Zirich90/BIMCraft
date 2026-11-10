@@ -570,7 +570,7 @@ fn nonspatial_bill_positions_satisfy_imported_catalogue_types_without_placing_ge
     rows.push(row);
     std::fs::write(&path, ods::write(&rows).unwrap()).unwrap();
     s.execute("catalogue_import", &json!({"path":path})).unwrap();
-    let history = s.history();
+    let history = s.history().into_iter().map(str::to_owned).collect::<Vec<_>>();
     assert_eq!(s.execute("catalogue_pending", &json!({})).unwrap()["types"].as_array().unwrap().len(), 1);
     assert_eq!(s.history(), history, "querying the list must not create an undo step");
     s.execute(

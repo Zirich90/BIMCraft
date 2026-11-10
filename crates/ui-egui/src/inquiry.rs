@@ -2,10 +2,12 @@
 //! IFC GlobalId, as many as are pasted at once, and what isn't found is said; the plan that shows them opens, zoomed to them.
 //! What names the selection is each element's id, GUID and IFC GlobalId, to read or copy one, a column, or all.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use bimcraft_core::inquiry::{self, Names};
-use egui::{Align, Button, Context, Grid, Id as UiId, Label, Layout, Modal, RichText, ScrollArea, TextEdit};
+use egui::{Align, Button, Context, Grid, Id as UiId, Label, Layout, RichText, ScrollArea, TextEdit};
 
 use crate::lang::{category, t, tf};
 use crate::{BimApp, Sheet, Status};
@@ -114,32 +116,35 @@ impl BimApp {
         let (mut ok, mut close) = (false, false);
         let found = inquiry::find(&self.session.model, &d.text);
         let any = !found.ids.is_empty() || !found.library.is_empty();
-        let r = Modal::new(UiId::new("select-by-id")).show(ctx, |ui| {
-            ui.set_width(440.0);
-            ui.label(RichText::new(t("Select by ID")).heading());
-            ui.add_space(6.0);
-            let label = ui.label(t("IDs, GUIDs or IFC GlobalIds, as many as you like:"));
-            let edit = ui.add(TextEdit::multiline(&mut d.text).desired_rows(4).desired_width(f32::INFINITY).hint_text("100005, 3f2a…"));
-            if std::mem::take(&mut d.focus) {
-                edit.request_focus();
-            }
-            edit.labelled_by(label.id);
-            // What it finds as it's typed.
-            let summary = match (found.ids.len(), found.missing.is_empty()) {
-                (0, true) if !found.library.is_empty() => tf("Finds {} in the library, not elements.", &[&found.library.len().to_string()]),
-                (0, true) => String::new(),
-                (n, true) => tf("Finds {}.", &[&n.to_string()]),
-                (n, false) => tf("Finds {}; nothing has these: {}", &[&n.to_string(), &found.missing.join(", ")]),
-            };
-            ui.label(summary);
-            ui.checkbox(&mut d.add, t("Add to the selection"));
-            ui.checkbox(&mut d.show, t("Show: open the plan they are in, zoomed to them"));
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                close = ui.button(t("Cancel")).clicked();
-                ok = ui.add_enabled(any, Button::new(t("OK"))).clicked();
+        let r = Modal::new(UiId::new("select-by-id"), t("Select by ID")).width(440.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                let label = ui.label(t("IDs, GUIDs or IFC GlobalIds, as many as you like:"));
+                let edit = ui.add(TextEdit::multiline(&mut d.text).desired_rows(4).desired_width(f32::INFINITY).hint_text("100005, 3f2a…"));
+                if std::mem::take(&mut d.focus) {
+                    edit.request_focus();
+                }
+                edit.labelled_by(label.id);
+                // What it finds as it's typed.
+                let summary = match (found.ids.len(), found.missing.is_empty()) {
+                    (0, true) if !found.library.is_empty() => {
+                        tf("Finds {} in the library, not elements.", &[&found.library.len().to_string()])
+                    }
+                    (0, true) => String::new(),
+                    (n, true) => tf("Finds {}.", &[&n.to_string()]),
+                    (n, false) => tf("Finds {}; nothing has these: {}", &[&n.to_string(), &found.missing.join(", ")]),
+                };
+                ui.label(summary);
+                ui.checkbox(&mut d.add, t("Add to the selection"));
+                ui.checkbox(&mut d.show, t("Show: open the plan they are in, zoomed to them"));
             });
-            ok |= any && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    close = ui.button(t("Cancel")).clicked();
+                    ok = ui.add_enabled(any, Button::new(t("OK"))).clicked();
+                });
+                ok |= any && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+            });
         });
         if ok && let Some(d) = self.select_by_id.take() {
             self.select_named(&d.text, d.add, d.show);
@@ -152,50 +157,51 @@ impl BimApp {
         let Some(d) = self.ids_of_selection.as_mut() else { return };
         let mut close = false;
         let mut copy: Option<(String, String)> = None;
-        let r = Modal::new(UiId::new("ids-of-selection")).show(ctx, |ui| {
-            ui.set_width(760.0);
-            ui.label(RichText::new(t("IDs of Selection")).heading());
-            ui.add_space(6.0);
-            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                Grid::new("ids-of-selection-grid").num_columns(6).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for h in ["Category", "Name", msg!("ID"), msg!("GUID"), msg!("IFC GlobalId"), ""] {
-                        ui.label(RichText::new(t(h)).strong());
-                    }
-                    ui.end_row();
-                    for n in &d.rows {
-                        ui.label(category(&n.category, false));
-                        ui.label(&n.name);
-                        // Each name selectable, to copy a part of it.
-                        ui.add(Label::new(RichText::new(n.id.to_string()).monospace()).selectable(true));
-                        ui.add(Label::new(RichText::new(n.guid.to_string()).monospace()).selectable(true));
-                        ui.add(Label::new(RichText::new(&n.ifc).monospace()).selectable(true));
-                        if ui.button(t("Copy")).on_hover_text(t("Copy its ID, GUID and IFC GlobalId")).clicked() {
-                            let text = format!("{}\t{}\t{}", n.id, n.guid, n.ifc);
-                            copy = Some((text, tf("Copied the names of {} {}.", &[&category(&n.category, false), &n.id.to_string()])));
+        let r = Modal::new(UiId::new("ids-of-selection"), t("IDs of Selection")).width(760.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.add_space(6.0);
+                ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    Grid::new("ids-of-selection-grid").num_columns(6).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+                        for h in ["Category", "Name", msg!("ID"), msg!("GUID"), msg!("IFC GlobalId"), ""] {
+                            ui.label(RichText::new(t(h)).strong());
                         }
                         ui.end_row();
-                    }
+                        for n in &d.rows {
+                            ui.label(category(&n.category, false));
+                            ui.label(&n.name);
+                            // Each name selectable, to copy a part of it.
+                            ui.add(Label::new(RichText::new(n.id.to_string()).monospace()).selectable(true));
+                            ui.add(Label::new(RichText::new(n.guid.to_string()).monospace()).selectable(true));
+                            ui.add(Label::new(RichText::new(&n.ifc).monospace()).selectable(true));
+                            if ui.button(t("Copy")).on_hover_text(t("Copy its ID, GUID and IFC GlobalId")).clicked() {
+                                let text = format!("{}\t{}\t{}", n.id, n.guid, n.ifc);
+                                copy = Some((text, tf("Copied the names of {} {}.", &[&category(&n.category, false), &n.id.to_string()])));
+                            }
+                            ui.end_row();
+                        }
+                    });
                 });
-            });
-            ui.add_space(6.0);
-            let count = d.rows.len().to_string();
-            ui.label(tf("{} selected.", &[&count]));
-            if let Some(c) = &d.copied {
-                ui.label(RichText::new(c).weak());
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (label, column, what) in [
-                    (msg!("Copy IDs"), Some(Column::Id), msg!("Copied {} IDs.")),
-                    (msg!("Copy GUIDs"), Some(Column::Guid), msg!("Copied {} GUIDs.")),
-                    (msg!("Copy IFC GlobalIds"), Some(Column::Ifc), msg!("Copied {} IFC GlobalIds.")),
-                    (msg!("Copy All"), None, msg!("Copied {} rows, tab-separated.")),
-                ] {
-                    if ui.add_enabled(!d.rows.is_empty(), Button::new(t(label))).clicked() {
-                        copy = Some((copied(&d.rows, column), tf(what, &[&count])));
-                    }
+                ui.add_space(6.0);
+                ui.label(tf("{} selected.", &[&d.rows.len().to_string()]));
+                if let Some(c) = &d.copied {
+                    ui.label(RichText::new(c).weak());
                 }
-                ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+            });
+            crate::popup::footer(ui, |ui| {
+                let count = d.rows.len().to_string();
+                ui.horizontal(|ui| {
+                    for (label, column, what) in [
+                        (msg!("Copy IDs"), Some(Column::Id), msg!("Copied {} IDs.")),
+                        (msg!("Copy GUIDs"), Some(Column::Guid), msg!("Copied {} GUIDs.")),
+                        (msg!("Copy IFC GlobalIds"), Some(Column::Ifc), msg!("Copied {} IFC GlobalIds.")),
+                        (msg!("Copy All"), None, msg!("Copied {} rows, tab-separated.")),
+                    ] {
+                        if ui.add_enabled(!d.rows.is_empty(), Button::new(t(label))).clicked() {
+                            copy = Some((copied(&d.rows, column), tf(what, &[&count])));
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| close = ui.button(t("Close")).clicked());
+                });
             });
         });
         if let Some((text, said)) = copy {

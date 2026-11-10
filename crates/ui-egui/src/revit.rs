@@ -4,6 +4,8 @@
 //! says so and holds the window still; what comes back replaces the project as a new unsaved one, and a refusal, a panic or a
 //! lost thread is said in the status box.
 
+use crate::popup::Modal;
+
 use bimcraft_i18n::msg;
 
 use std::any::Any;
@@ -14,7 +16,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 
 use bimcraft_core::import::Imported;
-use egui::{Align, Context, Id, Label, Layout, Modal, RichText, ScrollArea};
+use egui::{Align, Context, Id, Label, Layout, RichText, ScrollArea};
 
 use crate::lang::{category, t, tf};
 use crate::style::pal;
@@ -206,10 +208,12 @@ impl BimApp {
     /// replaces this one.
     pub(crate) fn importing_box(&self, ctx: &Context) {
         let Some(job) = &self.revit_job else { return };
-        Modal::new(Id::new("revit-import")).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new(tf("Opening a Revit file: {}", &[&job.file])).strong());
+        Modal::new(Id::new("revit-import"), t("Opening")).width(580.0).closable(false).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(tf("Opening a Revit file: {}", &[&job.file])).strong());
+                });
             });
         });
     }
@@ -224,36 +228,37 @@ impl BimApp {
         let (mut close, mut copy) = (false, false);
         // As tall as the window allows, so that a long list is read without scrolling where it can be.
         let height = (ctx.content_rect().height() * 0.65).max(200.0);
-        let r = Modal::new(Id::new("revit-report")).show(ctx, |ui| {
-            ui.set_width(560.0);
-            ui.label(RichText::new(t("Revit import report")).heading());
-            ui.label(RichText::new(format!("{} · {}", report.file, report.schema)).color(pal().muted));
-            ui.add_space(6.0);
-            ScrollArea::vertical().max_height(height).show(ui, |ui| {
-                ui.label(RichText::new(tf("Came in: {}", &[&came_in.to_string()])).strong());
-                for (cat, n) in &report.counts {
-                    ui.label(format!("{n} {}", category(cat, *n != 1)));
-                }
-                ui.add_space(8.0);
-                ui.label(RichText::new(tf("Left out: {}", &[&left_out.to_string()])).strong());
-                if left.is_empty() {
-                    ui.label(t("Nothing was left out."));
-                }
-                for note in left {
-                    note_row(ui, note);
-                }
-                if !noted.is_empty() {
+        let r = Modal::new(Id::new("revit-report"), t("Revit import report")).width(560.0).show(ctx, |ui| {
+            crate::popup::body(ui, |ui| {
+                ui.label(RichText::new(format!("{} · {}", report.file, report.schema)).color(pal().muted));
+                ui.add_space(6.0);
+                ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                    ui.label(RichText::new(tf("Came in: {}", &[&came_in.to_string()])).strong());
+                    for (cat, n) in &report.counts {
+                        ui.label(format!("{n} {}", category(cat, *n != 1)));
+                    }
                     ui.add_space(8.0);
-                    ui.label(RichText::new(t("Noted")).strong());
-                    for note in noted {
+                    ui.label(RichText::new(tf("Left out: {}", &[&left_out.to_string()])).strong());
+                    if left.is_empty() {
+                        ui.label(t("Nothing was left out."));
+                    }
+                    for note in left {
                         note_row(ui, note);
                     }
-                }
+                    if !noted.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(t("Noted")).strong());
+                        for note in noted {
+                            note_row(ui, note);
+                        }
+                    }
+                });
             });
-            ui.add_space(8.0);
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                close = ui.button(t("Close")).clicked();
-                copy = ui.button(t(if report.copied { msg!("Copied") } else { msg!("Copy Report") })).clicked();
+            crate::popup::footer(ui, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    close = ui.button(t("Close")).clicked();
+                    copy = ui.button(t(if report.copied { msg!("Copied") } else { msg!("Copy Report") })).clicked();
+                });
             });
         });
         if copy {

@@ -92,7 +92,7 @@ impl BimApp {
                 self.equipment_draft.name.clear();
             }
         }
-        let linked = self.session.catalogue_path().is_some();
+        let linked = self.session.catalogue_path().map(|path| path.display().to_string());
         let writable = self.session.catalogue_writable();
         let mut close = false;
         let response = egui::Modal::new(egui::Id::new("equipment-catalogue")).show(ctx, |ui| {
@@ -220,10 +220,10 @@ impl BimApp {
                 });
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.add_enabled(linked && writable, egui::Button::new(t("Synchronize"))).clicked() {
+                if ui.add_enabled(linked.is_some() && writable, egui::Button::new(t("Synchronize"))).clicked() {
                     self.sync_catalogue(ctx, true);
                 }
-                if ui.add_enabled(linked, egui::Button::new(t("Unlink"))).clicked() {
+                if ui.add_enabled(linked.is_some(), egui::Button::new(t("Unlink"))).clicked() {
                     self.run("catalogue_link", json!({"path":null}));
                 }
                 close = ui.button(t("Close")).clicked();

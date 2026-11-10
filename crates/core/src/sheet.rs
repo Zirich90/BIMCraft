@@ -1,4 +1,4 @@
-//! Sheets: paper with a title block, and views placed on it at a scale. A sheet is drawn once,
+//! Sheets: paper with an optional title block, and views placed on it at a scale. A sheet is drawn once,
 //! at [`DENSITY`] px per paper mm, as a display list in paper pixels: what the PNG, the PDF and the
 //! desktop's sheet view show. Each view on it is drawn as its own view draws it, moved onto the
 //! paper and made the viewport's to pick, and titled under it; a section's picture of what lies
@@ -10,7 +10,7 @@ use bimcraft_i18n::msg;
 use crate::geom::P2;
 use crate::graphics::Look;
 use crate::language::Language;
-use crate::model::{Element, Id, Key, Model, Schedule, Sheet, Viewport, paper};
+use crate::model::{Element, Id, Key, Model, Schedule, Viewport, paper};
 use crate::pen::Pen;
 use crate::render::{self, Drawing, PAPER, Part, Prim, Rgb, View};
 use crate::{font, schedule, view3d};
@@ -19,8 +19,6 @@ use crate::{font, schedule, view3d};
 pub const DENSITY: f64 = 5.0;
 /// Room around what a view shows, on paper, for grid bubbles and the like: mm.
 const ROOM: f64 = 12.0;
-/// The title box in the bottom right corner, inside the border: mm.
-const TITLE: P2 = P2(180.0, 40.0);
 const INK: Rgb = Rgb(25, 25, 25);
 /// A schedule's lettering and its title's, px: 2.5 mm and 3.5 mm on paper.
 const CELL_TEXT: f32 = 12.5;
@@ -44,10 +42,20 @@ fn page(paper: P2) -> View {
 /// View `view` at 1 : `scale` on paper: the frame its drawing gets, `ROOM` mm around what it shows
 /// (a 3D view's picture, as large as the model comes out); a schedule's, its table's.
 fn framing(m: &Model, view: impl Key, scale: f64) -> Option<View> {
+    framing_in(m, &Work::new(), view, scale)
+}
+
+/// What a sheet's sections and elevations ask of the whole model, made once a sheet when the first asks.
+type Work = std::cell::OnceCell<render::SectionWork>;
+
+/// [`framing`], a section's of `work`.
+fn framing_in(m: &Model, work: &Work, view: impl Key, scale: f64) -> Option<View> {
     let k = DENSITY / scale;
     let pts: Vec<P2> = match m.elements.get(view)? {
         Element::Level(_) | Element::PlanView(_) => render::plan_extent(m, view),
-        Element::Section(_) | Element::Elevation(_) => render::section_extent(m, view, k, 1.0)?.to_vec(),
+        Element::Section(_) | Element::Elevation(_) => {
+            render::section_extent(m, work.get_or_init(|| render::SectionWork::new(m)), view, k, 1.0)?.to_vec()
+        }
         Element::Schedule(sc) => {
             let (width, height) = table_size(&sc.name, &table_of(m, sc));
             return Some(View { scale: 1.0, cx: 0.0, cy: 0.0, width, height });
@@ -74,8 +82,13 @@ pub fn size(m: &Model, view: impl Key, scale: f64) -> Option<P2> {
 /// Viewport `id`'s view frame, and where that frame's top left corner sits in its sheet's drawing,
 /// px: a point `p` of the view is at `frame.px(p)` plus that corner.
 pub fn frame(m: &Model, id: impl Key) -> Option<(View, (f32, f32))> {
+    frame_in(m, &Work::new(), id)
+}
+
+/// [`frame`], a section's of `work`.
+fn frame_in(m: &Model, work: &Work, id: impl Key) -> Option<(View, (f32, f32))> {
     let Some(Element::Viewport(vp)) = m.elements.get(id) else { return None };
-    let view = framing(m, vp.view, vp.scale)?;
+    let view = framing_in(m, work, vp.view, vp.scale)?;
     let (x, y) = page(paper(&m.sheet(vp.sheet)?.size)?).px(vp.at);
     Some((view, (x - view.width as f32 / 2.0, y - view.height as f32 / 2.0)))
 }
@@ -85,19 +98,24 @@ pub fn frame(m: &Model, id: impl Key) -> Option<(View, (f32, f32))> {
 /// in the paper's top right corner.
 pub fn spot(m: &Model, sheet: impl Key, view: impl Key, scale: f64) -> P2 {
     let sheet = m.guid(sheet);
-    let paper = m.sheet(sheet).and_then(|s| paper(&s.size)).unwrap_or(P2(420.0, 297.0));
-    let middle = P2((20.0 + paper.0 - 10.0) / 2.0, (10.0 + TITLE.1 + paper.1 - 10.0) / 2.0);
+    let sh = m.sheet(sheet);
+    let size_name = sh.map(|s| s.size.as_str()).unwrap_or("A3");
+    let paper = sh.and_then(|s| paper(&s.size)).unwrap_or(P2(420.0, 297.0));
+    let margins = m.standard().sheet_margins(size_name);
+    // Above its title block: the project's it names, else the built-in one, whose room a sheet with none keeps too.
+    let title = sh.and_then(|s| m.title_blocks.get(&s.title_block)).map_or(margins.title_height, |t| t.height);
+    let middle = P2((margins.left + paper.0 - margins.right) / 2.0, (margins.bottom + title + paper.1 - margins.top) / 2.0);
     let taken = size(m, view, scale).unwrap_or(P2(0.0, 0.0));
     let right = m
-        .elements
-        .values()
-        .filter_map(|e| match e {
-            Element::Viewport(v) if v.sheet == sheet => Some(v.at.0 + size(m, v.view, v.scale)?.0 / 2.0),
+        .on_sheet(sheet)
+        .into_iter()
+        .filter_map(|id| match m.elements.get(id) {
+            Some(Element::Viewport(v)) if v.sheet == sheet => Some(v.at.0 + size(m, v.view, v.scale)?.0 / 2.0),
             _ => None,
         })
         .fold(None, |r: Option<f64>, x| Some(r.map_or(x, |r| r.max(x))));
     // Inside the border, 5 mm clear of it.
-    let (east, north) = (paper.0 - 15.0, paper.1 - 15.0);
+    let (east, north) = (paper.0 - margins.right - 5.0, paper.1 - margins.top - 5.0);
     match right {
         None => middle,
         Some(r) if r + 10.0 + taken.0 <= east => P2(r + 10.0 + taken.0 / 2.0, middle.1),
@@ -112,22 +130,71 @@ fn left(d: &mut Drawing, text: &str, at: P2, height: f64) {
     d.text(text, (x + font::width(text, h) / 2.0, y), h, INK);
 }
 
-/// The border, 20 mm in on the left (for binding) and 10 mm on the other sides, and the title
-/// box in the bottom right corner: the project, the sheet's name, its scale, and its number.
-fn title_block(d: &mut Drawing, project: &str, sheet: &Sheet, paper: P2, scale: &str) {
+/// Draw standard folding marks (marcas de dobramento) as specified in NBR 17067.
+fn draw_folding_marks(d: &mut Drawing, paper: P2, size: &str, margins: crate::standards::SheetMargins) {
+    let s = crate::model::paper_name(size);
+    let x_folds: &[f64] = match s.as_str() {
+        "A3" => &[210.0],
+        "A2" => &[210.0, 402.0],
+        "A1" => &[210.0, 395.0, 580.0, 765.0],
+        "A0" => &[210.0, 395.0, 580.0, 765.0, 950.0, 1135.0],
+        _ => &[],
+    };
+    for &dist_from_right in x_folds {
+        let x = paper.0 - dist_from_right;
+        if x > margins.left && x < paper.0 - margins.right {
+            d.line(&[P2(x, 0.0), P2(x, margins.bottom)], Pen::FINE, INK, false);
+            d.line(&[P2(x, paper.1 - margins.top), P2(x, paper.1)], Pen::FINE, INK, false);
+        }
+    }
+    let y_folds: &[f64] = match s.as_str() {
+        "A2" | "A1" => &[297.0],
+        "A0" => &[297.0, 594.0],
+        _ => &[],
+    };
+    for &y in y_folds {
+        if y < paper.1 - margins.top {
+            d.line(&[P2(0.0, y), P2(margins.left, y)], Pen::FINE, INK, false);
+            d.line(&[P2(paper.0 - margins.right, y), P2(paper.0, y)], Pen::FINE, INK, false);
+        }
+    }
+}
+
+/// The border, filing margin on the left and borders on the other sides, and the title
+/// box in the bottom right corner, adapted to `std`: the project, the sheet's name, its scale, and its number. A sheet that
+/// names a title block of the project's has that one there instead, its fields filled in; one with none
+/// ([`crate::titleblock::NONE`]) has nothing of it, border and folding marks included, for one drawn on the sheet itself.
+fn title_block(d: &mut Drawing, m: &Model, id: impl Key, paper: P2, views: &[&Viewport]) {
+    let Some(sheet) = m.sheet(id).filter(|sh| !sh.has_no_title_block()) else { return };
+    let (project, std) = (&m.name, m.standard());
+    let margins = std.sheet_margins(&sheet.size);
     let rect = |a: P2, b: P2| vec![a, P2(b.0, a.1), b, P2(a.0, b.1)];
-    d.line(&rect(P2(20.0, 10.0), P2(paper.0 - 10.0, paper.1 - 10.0)), Pen::BORDER, INK, true);
-    let width = TITLE.0.min(paper.0 - 30.0);
-    let (x0, x1, y0, y1) = (paper.0 - 10.0 - width, paper.0 - 10.0, 10.0, 10.0 + TITLE.1);
+    d.line(&rect(P2(margins.left, margins.bottom), P2(paper.0 - margins.right, paper.1 - margins.top)), Pen::BORDER, INK, true);
+    if let Some(tb) = m.title_blocks.get(&sheet.title_block) {
+        let at = P2(paper.0 - margins.right - tb.width, margins.bottom);
+        let scale = scale_value(views, m.language, m.units);
+        crate::titleblock::draw(d, tb, at, &crate::titleblock::values(m, id, &scale));
+        if margins.folding_marks {
+            draw_folding_marks(d, paper, &sheet.size, margins);
+        }
+        return;
+    }
+    let width = margins.title_width.min(paper.0 - margins.left - margins.right);
+    let height = margins.title_height;
+    let (x0, x1, y0, y1) = (paper.0 - margins.right - width, paper.0 - margins.right, margins.bottom, margins.bottom + height);
     d.line(&rect(P2(x0, y0), P2(x1, y1)), Pen::BORDER, INK, true);
     d.line(&[P2(x0, y0 + 26.0), P2(x1, y0 + 26.0)], Pen::PROJECTION, INK, false);
     d.line(&[P2(x1 - 50.0, y0), P2(x1 - 50.0, y0 + 26.0)], Pen::PROJECTION, INK, false);
     left(d, project, P2(x0 + 4.0, y0 + 33.0), 5.0);
     left(d, &sheet.name, P2(x0 + 4.0, y0 + 17.0), 3.5);
-    left(d, scale, P2(x0 + 4.0, y0 + 7.0), 2.0);
+    left(d, &scale_note(views, m.language, m.units), P2(x0 + 4.0, y0 + 7.0), 2.0);
     let number = (7.0 * DENSITY) as f32;
     let at = d.view.px(P2(x1 - 25.0, y0 + 13.0));
     d.text(&sheet.number, at, number, INK);
+
+    if margins.folding_marks {
+        draw_folding_marks(d, paper, &sheet.size, margins);
+    }
 }
 
 /// A schedule's table: its headings; its rows' cells as shown, its totals' last; each column's
@@ -216,15 +283,39 @@ fn scale_note(views: &[&Viewport], language: Language, units: crate::units::Unit
     }
 }
 
+/// The scale a title block's `{SCALE}` gives: its views' (`1 : 100`), when they share one, else "AS INDICATED", in `language`.
+fn scale_value(views: &[&Viewport], language: Language, units: crate::units::Units) -> String {
+    match views.split_first() {
+        None => String::new(),
+        Some((first, rest)) if rest.iter().all(|v| v.scale == first.scale) => units.scale(first.scale),
+        Some(_) => language.word(msg!("AS INDICATED")).into(),
+    }
+}
+
+/// What each field of sheet `id`'s title block says, by key: [`crate::titleblock::values`], its scale as its title box gives it.
+pub fn title_values(m: &Model, id: impl Key) -> std::collections::BTreeMap<String, String> {
+    let guid = m.guid(id);
+    let scaled: Vec<&Viewport> = m
+        .on_sheet(id)
+        .into_iter()
+        .filter_map(|v| match m.elements.get(v) {
+            Some(Element::Viewport(vp)) if vp.sheet == guid && !matches!(m.elements.get(vp.view), Some(Element::Schedule(_))) => Some(vp),
+            _ => None,
+        })
+        .collect();
+    crate::titleblock::values(m, id, &scale_value(&scaled, m.language, m.units))
+}
+
 /// Sheet `id` on its paper: its title block, then each view on it, at its scale and titled.
 pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
     let sheet = m.sheet(id)?;
     let guid = m.guid(id);
     let paper = paper(&sheet.size)?;
-    let views: Vec<(Id, &Viewport)> = m
-        .elements
+    // What is on it, in the order of its ids: its viewports, and the 2D drawn on it.
+    let on: Vec<(Id, &Element)> = m.on_sheet(id).into_iter().filter_map(|id| Some((id, m.elements.get(id)?))).collect();
+    let views: Vec<(Id, &Viewport)> = on
         .iter()
-        .filter_map(|(&vid, e)| match e {
+        .filter_map(|&(vid, e)| match e {
             Element::Viewport(v) if v.sheet == guid => Some((vid, v)),
             _ => None,
         })
@@ -236,10 +327,11 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
     // Schedules keep their own size: no scale of theirs.
     let scaled: Vec<&Viewport> =
         views.iter().filter(|(_, v)| !matches!(m.elements.get(v.view), Some(Element::Schedule(_)))).map(|(_, v)| *v).collect();
-    title_block(&mut d, &m.name, sheet, paper, &scale_note(&scaled, m.language, m.units));
+    title_block(&mut d, m, id, paper, &scaled);
     let mut scene = None;
+    let work = Work::new();
     for (vid, vp) in views {
-        let Some((view, (ox, oy))) = frame(m, vid) else { continue };
+        let Some((view, (ox, oy))) = frame_in(m, &work, vid) else { continue };
         d.own(Some(vid));
         // Paper under it, its own: a click anywhere over a view picks it.
         let (w, h) = (view.width as f32, view.height as f32);
@@ -247,11 +339,11 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
         let inner = match m.elements.get(vp.view) {
             Some(Element::Level(_) | Element::PlanView(_)) => render::draw_at(m, vp.view, view, 1.0),
             Some(Element::Section(_) | Element::Elevation(_)) => {
-                let scene = scene.get_or_insert_with(|| view3d::Scene::new(m));
                 // Its regions keep the ink of this very picture.
-                let img = render::section_image(m, scene, vp.view, view, &[]);
+                let w = work.get_or_init(|| render::SectionWork::new(m));
+                let img = render::section_picture_in(m, w, vp.view, view, &[]);
                 let drawing = match &img {
-                    Some(img) => render::section_at_over(m, vp.view, view, 1.0, img),
+                    Some(img) => render::section_at_over_in(m, w, vp.view, view, 1.0, img),
                     None => render::section_at(m, vp.view, view, 1.0),
                 };
                 if let Some(img) = img {
@@ -265,10 +357,17 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
                 continue;
             }
             Some(Element::View3D(v)) => {
-                let cam = view3d::camera_in(m, v.azimuth, v.elevation, view.scale, ROOM * DENSITY, &Look::of(m, vp.view));
-                let img = scene.get_or_insert_with(|| view3d::Scene::new(m)).render_in(&cam, &[], &Look::of(m, vp.view));
+                let look = Look::of(m, vp.view);
+                let cam = view3d::camera_of(m, v, view.scale, ROOM * DENSITY, &look);
+                let img = scene.get_or_insert_with(|| view3d::Scene::new(m)).render_in(&cam, &[], &look);
                 d.push(Prim::Image { at: (ox, oy), width: img.width, height: img.height, rgba: img.rgba, ink: false });
-                Drawing::new(view)
+                // Its dimensions, over the picture: lines of the sheet's, at paper size.
+                let mut inner = Drawing::new(view);
+                for mk in crate::dims3d::marks(m, vp.view, &cam, &look, DENSITY) {
+                    inner.own(Some(mk.owner));
+                    inner.push(Prim::Line { pts: mk.pts, width: mk.width, color: mk.color, dash: None, closed: false });
+                }
+                inner
             }
             _ => continue,
         };
@@ -294,7 +393,7 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
         d.line(&[P2(x, corner.1 - 8.0), P2(x + line, corner.1 - 8.0)], Pen::MEDIUM, INK, false);
         left(&mut d, &m.units.scale(vp.scale), P2(x, corner.1 - 11.0), 2.0);
     }
-    for (&nid, e) in &m.elements {
+    for &(nid, e) in &on {
         if let Element::FilledRegion(r) = e
             && r.view == guid
         {
@@ -302,7 +401,7 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
             render::filled_region(&mut d, m, r);
         }
     }
-    for (&nid, e) in &m.elements {
+    for &(nid, e) in &on {
         if let Element::DetailGroup(g) = e
             && g.view == guid
         {
@@ -319,7 +418,7 @@ pub fn draw(m: &Model, id: impl Key) -> Option<Drawing> {
             && n.view == guid
         {
             d.own(Some(nid));
-            render::note(&mut d, n);
+            render::note(&mut d, m, n);
         }
         if let Element::DetailLine(l) = e
             && l.view == guid

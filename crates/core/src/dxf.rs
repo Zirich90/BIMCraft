@@ -176,12 +176,14 @@ pub enum Shape {
     },
     Point(P2),
     /// One line of lettering: `height` is its capital height, `angle` its baseline's in degrees counter-clockwise from east.
+    /// An attribute's (ATTRIB) has its tag: what a title block reads it as a field of.
     Text {
         at: P2,
         height: f64,
         angle: f64,
         text: String,
         align: Align,
+        tag: Option<String>,
     },
     /// A hatch's boundaries, or a solid: `solid` when filled through, else patterned, which a view draws as it can.
     Fill {
@@ -316,10 +318,12 @@ pub fn read(bytes: &[u8]) -> Result<Dxf, String> {
         return Err("it's a binary DXF; save it as an ASCII DXF (any version) and bring that in".into());
     }
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    // A file before 2007 is in a code page; Latin-1 reads the West's as it should and never fails.
+    // A file of 2007 and later is UTF-8. One before is in the code page its header names in $DWGCODEPAGE: the header is ASCII
+    // in every page, so the bytes are scanned for it before any decoding. A page this doesn't know, and a file that names none,
+    // read as Latin-1, as the West's always have and never fail.
     let text: Cow<str> = match std::str::from_utf8(bytes) {
         Ok(t) => Cow::Borrowed(t),
-        Err(_) => Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()),
+        Err(_) => Cow::Owned(codepage(bytes).map_or_else(|| latin1(bytes), |e| e.decode(bytes).0.into_owned())),
     };
     read_text(&text)
 }
@@ -328,6 +332,63 @@ pub fn read(bytes: &[u8]) -> Result<Dxf, String> {
 pub fn read_text(text: &str) -> Result<Dxf, String> {
     Reader { p: Pairs::new(text), header: HashMap::new(), layers: Vec::new(), linetypes: Vec::new(), blocks: HashMap::new(), ents: None }
         .read()
+}
+
+/// The text as Latin-1, byte for byte.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// The encoding the file's `$DWGCODEPAGE` names, looked for in the first 64 KiB: the header is there, and it is ASCII in every
+/// page, so the bytes scan line by line without any decoding.
+fn codepage(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let head = &bytes[..bytes.len().min(65_536)];
+    let mut lines = head.split(|&b| b == b'\n').map(|l| std::str::from_utf8(l).ok().map(str::trim).unwrap_or(""));
+    while let Some(line) = lines.next() {
+        if line != "$DWGCODEPAGE" {
+            continue;
+        }
+        // The variable's name (9), the value's code (3), then the page: anything else is not a header this reads the page from.
+        let Some(3) = lines.next().and_then(|l| l.trim().parse::<i32>().ok()) else { return None };
+        return lines.next().map(str::trim).and_then(page);
+    }
+    None
+}
+
+/// The encoding a code page's name says, where a decoder here has one: the East Asian pages, the Windows ones and the few
+/// others. The DOS pages (437, 850, …) have no decoder here and keep the Latin-1 they always had.
+fn page(name: &str) -> Option<&'static encoding_rs::Encoding> {
+    use encoding_rs::*;
+    Some(match name.to_ascii_uppercase().as_str() {
+        "ANSI_874" => WINDOWS_874,
+        "ANSI_932" => SHIFT_JIS,
+        "ANSI_936" => GBK,
+        "ANSI_949" => EUC_KR,
+        "ANSI_950" => BIG5,
+        "ANSI_1250" => WINDOWS_1250,
+        "ANSI_1251" => WINDOWS_1251,
+        "ANSI_1252" => WINDOWS_1252,
+        "ANSI_1253" => WINDOWS_1253,
+        "ANSI_1254" => WINDOWS_1254,
+        "ANSI_1255" => WINDOWS_1255,
+        "ANSI_1256" => WINDOWS_1256,
+        "ANSI_1257" => WINDOWS_1257,
+        "ANSI_1258" => WINDOWS_1258,
+        "ANSI_8859_2" => ISO_8859_2,
+        "ANSI_8859_3" => ISO_8859_3,
+        "ANSI_8859_4" => ISO_8859_4,
+        "ANSI_8859_5" => ISO_8859_5,
+        "ANSI_8859_6" => ISO_8859_6,
+        "ANSI_8859_7" => ISO_8859_7,
+        "ANSI_8859_8" => ISO_8859_8,
+        // Latin-5's bytes are the Windows Turkish ones', so the decoder here has no ISO_8859_9 of its own.
+        "ANSI_8859_9" => WINDOWS_1254,
+        "DOS866" => IBM866,
+        "KOI8_R" => KOI8_R,
+        "MACINTOSH" => MACINTOSH,
+        "ANSI_65001" => UTF_8,
+        _ => return None,
+    })
 }
 
 // ---------- the pairs of a file ----------
@@ -555,11 +616,18 @@ impl<'a> Reader<'a> {
     fn entity(&mut self, kind: &'a str) -> Result<Ent<'a>, String> {
         let line = self.p.line;
         let mut codes = Vec::new();
+        // After a 101, an embedded object's data (an MTEXT's columns, written since 2018), whose 10s and 11s aren't the
+        // entity's: read past, not kept, or its point and direction would be the object's.
+        let mut embedded = false;
         while let Some((c, v)) = self.p.peek()? {
             if c == 0 {
                 break;
             }
             self.p.next()?;
+            embedded |= c == 101;
+            if embedded {
+                continue;
+            }
             codes.push((c, v));
             if codes.len() > MAX_PAIRS {
                 return Err(format!("line {line}: one {kind} holds more than {MAX_PAIRS} values"));
@@ -838,10 +906,13 @@ impl<'a> Reader<'a> {
                     text(e)?
                 }
                 "MTEXT" => {
+                    // A colour its formatting gives the whole of it, before its first word, over the entity's.
+                    let raw: String = e.codes.iter().filter(|(c, _)| *c == 3 || *c == 1).map(|(_, v)| *v).collect();
+                    let color = leading_color(&raw).unwrap_or(style.color);
                     for line in mtext(e)? {
                         out.push(Entity {
                             layer: style.layer.clone(),
-                            color: style.color,
+                            color,
                             linetype: style.linetype.clone(),
                             weight: style.weight,
                             shape: transformed(line, xf),
@@ -956,9 +1027,9 @@ fn transformed(shape: Shape, xf: Xf) -> Shape {
             }
             None => Shape::Polyline { pts: arc_points(c, r, start, end - start).into_iter().map(at).collect(), closed: false },
         },
-        Shape::Text { at: p, height, angle, text, align } => {
+        Shape::Text { at: p, height, angle, text, align, tag } => {
             let (k, turn) = xf.similarity().map_or((xf.x.length(), xf.x.1.atan2(xf.x.0).to_degrees()), |(k, t, _)| (k, t));
-            Shape::Text { at: at(p), height: height * k, angle: angle + turn, text, align }
+            Shape::Text { at: at(p), height: height * k, angle: angle + turn, text, align, tag }
         }
     }
 }
@@ -1102,10 +1173,41 @@ fn de_boor(degree: usize, knots: &[f64], controls: &[(P2, f64)], u: f64) -> Opti
     (w.abs() > 1e-12).then(|| P2(x / w, y / w))
 }
 
+/// The colour a multi-line text's formatting sets before its first word (`\C1;` an index, `\c255;` a true colour as
+/// AutoCAD writes it, blue in the high byte): the last of them, if any.
+fn leading_color(raw: &str) -> Option<Color> {
+    let mut chars = raw.chars().peekable();
+    let mut color = None;
+    while let Some(c) = chars.next() {
+        match c {
+            '{' | '}' => {}
+            '\\' => {
+                let code = chars.next()?;
+                let body: String = chars.by_ref().take_while(|c| *c != ';').collect();
+                match code {
+                    'C' => color = body.trim().parse::<i64>().ok().map(index_color).or(color),
+                    'c' => {
+                        color = body.trim().parse::<i64>().ok().map(|v| {
+                            // AutoCAD's MTEXT true colour: red in the low byte.
+                            let (r, g, b) = ((v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8);
+                            Color::True(r, g, b)
+                        });
+                    }
+                    'f' | 'F' | 'H' | 'W' | 'Q' | 'T' | 'A' | 'p' => {}
+                    _ => return color,
+                }
+            }
+            _ => return color,
+        }
+    }
+    color
+}
+
 /// A text's words as a file writes them: `%%d` is a degree sign, `%%p` plus or minus, `%%c` a diameter, `%%%` a
 /// percent, `%%u` and `%%o` underline and overline (dropped), `\U+XXXX` a character, and the formatting codes of
-/// multi-line text (`\P` a new line, `{…}` groups, `\f…;` fonts, `\H…;` heights and the rest) are dropped.
-fn decode(s: &str) -> String {
+/// multi-line text (`\P` a new line, `{…}` groups, `\f…;` fonts, `\H…;` heights and the rest) are dropped. A single line
+/// of text (`mtext` false) has no groups: its braces are its own, as a title block's fields (`{CLIENT}`) are.
+fn decode(s: &str, mtext: bool) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1128,7 +1230,7 @@ fn decode(s: &str) -> String {
                     None => out.push_str("%%"),
                 }
             }
-            '{' | '}' => {}
+            '{' | '}' if mtext => {}
             '\\' => match chars.next() {
                 Some('P') => out.push('\n'),
                 Some('~') => out.push(' '),
@@ -1151,7 +1253,7 @@ fn decode(s: &str) -> String {
                     let body: String = chars.by_ref().take_while(|c| *c != ';').collect();
                     out.push_str(&body.replace(['^', '#'], "/"));
                 }
-                Some('A' | 'C' | 'F' | 'f' | 'H' | 'Q' | 'T' | 'W' | 'p') => {
+                Some('A' | 'C' | 'c' | 'F' | 'f' | 'H' | 'Q' | 'T' | 'W' | 'p') => {
                     chars.by_ref().take_while(|c| *c != ';').for_each(drop);
                 }
                 Some('L' | 'l' | 'O' | 'o' | 'K' | 'k' | 'N') => {}
@@ -1172,7 +1274,7 @@ fn text(e: &Ent) -> Result<Option<Shape>, String> {
     if height <= 0.0 {
         return Ok(None);
     }
-    let words = decode(words).replace('\n', " ");
+    let words = decode(words, false).replace('\n', " ");
     if words.trim().is_empty() {
         return Ok(None);
     }
@@ -1196,7 +1298,8 @@ fn text(e: &Ent) -> Result<Option<Shape>, String> {
             (p, Align { h, v })
         }
     };
-    Ok(Some(Shape::Text { at, height, angle: e.num(50)?.unwrap_or(0.0), text: words, align }))
+    let tag = (e.kind == "ATTRIB").then(|| e.str(2).map(|t| t.trim().to_string())).flatten().filter(|t| !t.is_empty());
+    Ok(Some(Shape::Text { at, height, angle: e.num(50)?.unwrap_or(0.0), text: words, align, tag }))
 }
 
 /// A multi-line text's lines, each a text of its own, stepped down from where its attachment point puts the block.
@@ -1212,7 +1315,7 @@ fn mtext(e: &Ent) -> Result<Vec<Shape>, String> {
         }
     }
     raw.push_str(e.str(1).unwrap_or(""));
-    let words = decode(&raw);
+    let words = decode(&raw, true);
     let lines: Vec<&str> = words.lines().collect();
     if lines.iter().all(|l| l.trim().is_empty()) {
         return Ok(Vec::new());
@@ -1246,6 +1349,7 @@ fn mtext(e: &Ent) -> Result<Vec<Shape>, String> {
             angle,
             text: line.to_string(),
             align: Align { h, v: Vertical::Baseline },
+            tag: None,
         })
         .collect())
 }
@@ -1832,25 +1936,60 @@ mod tests {
                     height: 2.5,
                     angle: 30.0,
                     text: "Room ° Ø ± % é x".into(),
-                    align: Align { h: Horizontal::Left, v: Vertical::Baseline }
+                    align: Align { h: Horizontal::Left, v: Vertical::Baseline },
+                    tag: None
                 },
                 &Shape::Text {
                     at: P2(8.0, 9.0),
                     height: 1.0,
                     angle: 0.0,
                     text: "Centred".into(),
-                    align: Align { h: Horizontal::Center, v: Vertical::Top }
+                    align: Align { h: Horizontal::Center, v: Vertical::Top },
+                    tag: None
                 },
                 &Shape::Text {
                     at: P2(8.0, 9.0),
                     height: 1.0,
                     angle: 0.0,
                     text: "Middle".into(),
-                    align: Align { h: Horizontal::Center, v: Vertical::Middle }
+                    align: Align { h: Horizontal::Center, v: Vertical::Middle },
+                    tag: None
                 },
             ]
         );
         assert_eq!(d.left_out.get("empty"), Some(&1), "blank text");
+    }
+
+    /// A file whose text is in a code page, as bytes: the header names the page, one TEXT holds the words as the page's bytes.
+    fn codepage_file(page: &str, words: &[u8]) -> Vec<u8> {
+        let mut f = format!(
+            "0\nSECTION\n2\nHEADER\n9\n$DWGCODEPAGE\n3\n{page}\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nTEXT\n10\n0\n20\n0\n40\n2.5\n1\n"
+        )
+        .into_bytes();
+        f.extend_from_slice(words);
+        f.extend_from_slice(b"\n0\nENDSEC\n0\nEOF\n");
+        f
+    }
+
+    fn is_the_words(words: &str) -> impl Fn(&Entity) -> bool + '_ {
+        move |e| matches!(&e.shape, Shape::Text { text, align: Align { h: Horizontal::Left, v: Vertical::Baseline }, .. } if text == words)
+    }
+
+    #[test]
+    fn a_file_in_the_korean_code_page_reads_its_hangul() {
+        // "제1층", a floor's name as the issue shows it, in the bytes EUC-KR holds.
+        let d = read(&codepage_file("ANSI_949", &[0xC1, 0xA6, b'1', 0xC3, 0xFE])).unwrap();
+        assert!(d.entities.iter().any(is_the_words("제1층")), "{d:?}");
+    }
+
+    #[test]
+    fn a_page_this_does_not_know_reads_latin1_and_a_utf8_file_its_own_words_whatever_the_header_says() {
+        // A page without a decoder here keeps the Latin-1 it always had.
+        let d = read(&codepage_file("DOS437", &[0xC1])).unwrap();
+        assert!(d.entities.iter().any(is_the_words("Á")), "{d:?}");
+        // A file of 2007 and later is UTF-8 even when its header names a page.
+        let d = read(&codepage_file("ANSI_949", "제1층".as_bytes())).unwrap();
+        assert!(d.entities.iter().any(is_the_words("제1층")), "{d:?}");
     }
 
     #[test]
