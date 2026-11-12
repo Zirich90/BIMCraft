@@ -29,6 +29,8 @@ jobs:
 
       - name: Sample plugin
         run: |
+          # Cargo points TEMP and TMP at target/tmp, which must exist for the MSVC linker.
+          New-Item -ItemType Directory -Force -Path target/tmp | Out-Null
           rustup target add wasm32-unknown-unknown
           cargo build --manifest-path crates/plugin/tests/sample-plugin/Cargo.toml --target wasm32-unknown-unknown --release
 
