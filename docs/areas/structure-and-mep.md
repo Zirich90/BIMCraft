@@ -340,13 +340,51 @@ other runs. Logical references are set through the `wire` and `modify` commands,
 CI shortcut and Divide Panel command have been removed. Format 8 migrates old carrier categories and logical loops to the new
 elements, preserving their ids and GUIDs; an old loop's physical axis starts at its source toward its first distinct device.
 
-`detectors` lays point fire detectors over a room (SP 484.1311500.2020): `Region::cover` puts a square grid over the room's
-bounds, its cells' diagonal twice the detector's reach (a smoke detector's 6400 mm, a heat detector's 3500, closed in
-proportion when the room's ceiling, to the level above, stands higher than the family's mounting height, or the `radius`
-given), and a detector in each cell the room has, at the cell's centre or the point of the cell nearest it that is inside and
-`margin` (500) off the walls. A rectangle is covered exactly; a cell an edge cuts is covered from its part inside; a `radius`
-whose grid would ask for over 2000 detectors is refused. It leaves to the designer what SP 484 asks besides: two detectors
-where one alone would trip the alarm, and beams and ducts that split a ceiling.
+`detectors` lays point fire detectors over a room. Under SP 484.1311500.2020 Amendment 1, point smoke detectors use a
+radius of up to 6400 mm in rooms up to 12000 mm high, and point heat detectors use up to 3500 mm in rooms up to 9000 mm high.
+Above 6000 mm, heat placement and adaptation require the declared detector class and temperature evidence.
+See [the Russian rules package](low-voltage-standards.md) for the `heat` input and sources.
+
+`fire_zone` lists the zones. With `id` it reports the zone, its member devices and
+any room overrides whose boundaries could not be resolved. Pass `zone` to create
+one, or pass `id` and `zone` together to replace its settings and preserve its GUID.
+Each zone has `name`, `kind` (`detection` or `notification`), `level`, `boundary`,
+`height` and an optional `base_offset` in millimetres from that level. Rooms on the
+same level can extend or cut the footprint through `include_rooms` and `exclude_rooms`.
+A detection zone can match a specific hidden `space` and list notification-zone
+IDs or GUIDs in `notify` for its fire event. The file format is 24 because the
+zone is a new element category. Earlier projects open without a zone migration.
+Its report has a separate `assessment` for the effective plan area, the rooms
+intersected in plan, and the projection of a hidden zone onto the main zone.
+Each result names the rule and distinguishes a passed check, an exceeded
+limit and missing data. See [the Russian rules package](low-voltage-standards.md).
+
+Use Low Voltage > Fire Zones to sketch a detection or notification boundary.
+The default zone height reaches the next level, or 3000 mm when there is no level
+above. In Engineering Level Mode, the plan draws each zone's named sketch outline.
+Select it to edit its boundary, name, base offset, height or room overrides in
+Properties. A detection zone also lets you select a hidden space and the
+notification zones its fire event activates.
+`Region::cover` lays out a grid within those limits. It tries the centre of each cell, then searches for an interior point
+that meets the wall clearance. A grid requiring over 2000 positions or yielding zero positions is refused. An explicit
+`radius` can tighten the grid. An explicit `margin` can override the default 500 mm for a geometry study.
+Outside the regular rectangular case, both commands sample the interior and room contours, including holes.
+A sample counts as covered when a detector is within reach and the segment to it stays clear of room boundaries.
+The commands add positions for uncovered samples or return the coordinate of a sample the layout cannot reach.
+Sampling is bounded, with a spacing of at most 250 mm or one eighth of the radius. Beams, multiple-detector coverage
+and maintenance access require separate checks.
+
+`detectors` and `resat` partition the room by the lowest modeled ceiling over each part. They fit each detector to the
+underside of its compartment. Adjacent panels at the same elevation share one grid. The boundary of a compartment blocks
+visibility and uses the grid clearance. Where no ceiling is modeled, the height check uses the next level or the default height,
+and device offsets stay as set by the family or the existing instance. Narrow compartments can require manual placement.
+
+Pass `space: {above, below}` with ids or GUIDs of the modeled bounds to lay detectors in a hidden void.
+A ceiling as the lower bound identifies a plenum. A flat floor as the lower bound identifies an underfloor void.
+The upper bound is a flat, unshaped floor slab. The grid covers the overlap of both slabs and the room in plan,
+excluding their openings and shafts crossing the void. Height is measured from the lower face's top to the upper
+slab's underside. Devices meet that underside and their bodies must fit in the gap. The native project saves the
+space kind on the detector. Rules for perforation, remote indicators and maintenance access require separate inputs.
 
 Panel-limit automation is a future Wire workflow; panel families still describe their capacity in their type names.
 
@@ -445,14 +483,114 @@ The whole contact segment must lie on the named face: triangle-interval union
 rejects a segment crossing an opening even if both endpoints are supported.
 Host motion follows the old host frame, including level elevation exactly once.
 Copy remaps a copied host; deleting the host detaches at the previous physical
-axis. Creating a carrier from the mounted wire transfers ownership to that
-carrier and preserves physical wire geometry. These cascades share the command's
+axis. Creating a carrier from a mounted wire transfers its host and contact line
+to the carrier and preserves the wire's physical axis. Use centre placement with
+zero lateral offset. A batch can reuse a compatible carrier on the same face
+or create a new supported carrier. These cascades share the command's
 Undo step. Save/Open and deletion Undo/Redo have command-level regression tests.
 
 Unchanged linked cables follow a mounted carrier's physical frame when its host
 moves or its section depth changes. Explicitly edited cables take precedence.
 Their physical endpoints and section orientation are mapped together in the
 same command, before the owned connection legs are refreshed.
+
+### Adapt existing point detectors
+
+Run `resat {room, ids?, kind?, radius?, margin?, space?}` from the CLI or MCP after
+editing a room. Omit `ids` to use main-space detectors inside the current room boundary.
+Use explicit IDs or GUIDs for detectors left outside by the edit. The command
+requires unmounted detectors of a single kind on the room's level, one per
+position in the recomputed grid. It keeps each identity and refreshes cable
+connections in the same undo step. The same ceiling partitions and grid used
+for initial placement determine the updated positions. Targets without a
+ceiling keep their offsets. For a hidden space, give its bounds and the
+detector ids explicitly. This lets the operator pick the replacement slabs if
+geometry has been reimported.
+
+For linked IFC, `detectors` and `resat` accept `architecture` with the link's id
+or GUID. They calculate against local geometry and the selected link at its
+placed transform, using the linked wall and slab type dimensions. After
+`reload`, give the room anchor and explicit detector ids to `resat`. Duplicate
+geometry GUIDs or room anchors require resolution. Use `preview: true` to see
+the proposed XY positions, ceiling contact offsets in the room's level, and
+whether the selected device count matches. A matching layout can then be
+applied in one undo step. Reload also returns a preview for saved detector
+groups while leaving the detector positions and routes in place.
+
+`fire_line_faults` accepts `power: {lines:[{id, source_isolates_ports?}, …], independent?}`
+to assess a single open or short across up to 16 separate supply lines.
+A line whose source is a load on another listed line follows that upstream
+supply. Other line sources are treated as externally powered. Devices
+confirmed to have separate power can be given in `independent`. The result
+reports lost communication for each cable fault. The existing single-line
+`power.id` input is also accepted.
+
+A rectangular ceiling bay under 1000 mm wide between deep parallel beams,
+between a deep beam and a finished wall face, or between two finished wall
+faces can use its middle line
+under SP 484 Amendment 1 clause 6.6.36. This exception still requires corner
+coverage and clearance at the ends of the row. A boundary introduced only
+by a ceiling height change or a room separator does not qualify as a wall.
+
+For an ordinary detection zone, `fire_zone {id, room_group:{…}}` checks the
+general limits in SP 484 Amendment 1 clause 6.3.4. Supply `same_floor` and
+`same_fire_compartment`, and classify the isolated rooms by listing their
+IDs or GUIDs in `isolated_rooms` (an empty list confirms none). Their full
+modeled areas count toward the 500 m² limit. Supply `common_exit` for isolated
+rooms and, where there are multiple isolated rooms, the longest interval
+between exits and the total of the intervals as `max_exit_gap` and
+`total_exit_gap`, in millimetres. The report includes area and room-count
+limits for the whole zone. These confirmations apply to the current report.
+Apartment, hotel-room and small vestibule exceptions require separate review.
+
+For a hidden detection zone, `fire_zone {id, remote_indicators:[{detector, connected?, visible?},…]}`
+can assess the remote indicator option in SP 484 Amendment 1 clause 6.2.13.
+Use detector IDs or GUIDs from the zone report. Provide field evidence of both
+connection and free visibility for each member. The report identifies failed or
+missing evidence and marks clause 6.2.13 as satisfied if either the projection
+or the indicator check passes. Evidence applies to the current inspection.
+The check does not derive indicator wiring or visibility from model geometry.
+See the [text of Amendment 1 approved by MChS order 252](https://www.consultant.ru/document/cons_doc_LAW_502477/63ae4b26b06dfdfed67188ae8ba1eb08ef879405/).
+
+`detector_ceiling_check {open_percent?, min_opening?, thickness?}` checks SP 484
+Amendment 1 clause 6.6.7 for a point detector above a perforated suspended ceiling.
+Enter measurements for that detector's projected coverage, with opening and
+thickness in millimetres. The criteria are at least 40% open area, a minimum
+opening greater than 10 mm, and thickness at most three times that minimum.
+The result marks each criterion and identifies insufficient data or the need
+for a detector below the ceiling. Eligibility covers the perforation criteria.
+The command does not infer measurements from the model or place devices.
+See the [text of Amendment 1 approved by MChS order 252](https://www.consultant.ru/document/cons_doc_LAW_502477/63ae4b26b06dfdfed67188ae8ba1eb08ef879405/).
+
+`adapt_ifc {id, groups?, apply?, expected?}` reads a fresh copy of the IFC and stages
+the same recalculation for each explicit group of room and detector ids. It
+returns proposed detector positions and old and new endpoints of affected
+feeder segments. A detector can appear in only one group. With `apply: true`
+the refreshed link, devices, connections and GUID-based group definitions
+are saved in one undo step. Omit `groups` to reuse the definitions or apply
+an empty list to clear them. In hidden spaces, name a local slab by id or
+GUID and a linked slab by GUID. A count mismatch, unresolved group or
+feeder error keeps the earlier link and model in place.
+
+In the desktop, **Reload All** under **Linked Models** opens a review for each
+IFC with saved groups. The dialog shows target positions, affected feeder
+endpoints and crossings. The earlier link stays in use until **Apply IFC
+Adaptation**. The desktop passes the reviewed report as `expected`. If the
+new report differs, the command returns `review_required` with the replacement
+preview and the desktop waits for confirmation again.
+
+The IFC preview checks main cable segments, generated feeders and associated
+carriers on the selected detectors' connected lines. It checks their modeled
+round or rectangular sections against linked
+walls, beams, columns, floors, roofs and ceilings in `route_clashes`, with
+the main wire id, the segment id, the obstacle GUID and a point in project
+coordinates. Geometry openings are respected. A cable end touching a mounting
+surface is allowed. Crossings require review before `adapt_ifc` applies, even
+if the IFC was already refreshed with `reload`. For an axis wholly inside a
+solid, the report gives the midpoint. The section comes from the geometric
+wire or carrier type. A shared carrier is reported once, with `carrier: true`
+and the lowest associated wire ID. Extra clearance and penetration approval
+remain separate checks.
 
 This implementation accepts independent round MEP runs and rectangular cable
 carriers. Floor mounting uses the actual sloped plane and vertical slab depth;

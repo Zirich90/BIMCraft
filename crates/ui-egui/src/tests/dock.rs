@@ -69,7 +69,7 @@ fn palettes_dock_left_right_or_bottom_float_and_close_by_their_menus() {
     press(&mut h, "Close Properties");
     assert!(!docking(&h).shown(Palette::Properties) && h.query_by_label("Dock Properties").is_none());
     press(&mut h, "View");
-    press(&mut h, "User Interface");
+    press_ribbon(&mut h, "Windows", "User Interface");
     pick(&mut h, Role::CheckBox, "Properties");
     assert_eq!(docking(&h).docked(Palette::Properties), Some(Side::Right));
     // PP hides it and shows it again.

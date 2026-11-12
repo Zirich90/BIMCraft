@@ -57,7 +57,7 @@ fn model_categories_hold_each_family_category_and_no_component_row() {
     // A door's or a window's family is placed in a wall, as a door or a window: it is no component.
     assert!(super::component_category(crate::family::Category::Door).is_none());
     assert!(super::component_category(crate::family::Category::Window).is_none());
-    assert_eq!(COMPONENTS.len(), 18);
+    assert_eq!(COMPONENTS.len(), 27);
 }
 
 #[test]

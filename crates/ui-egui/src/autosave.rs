@@ -15,7 +15,7 @@ use egui::{Context, Id};
 use serde_json::json;
 
 use crate::lang::{t, tf};
-use crate::{BimApp, Pending, Status};
+use crate::{BimApp, Pending, Status, catalogue_metadata_matches};
 
 pub(crate) struct State {
     worker: Option<Worker>,
@@ -25,7 +25,7 @@ pub(crate) struct State {
     pub active: Option<PathBuf>,
     pub interval_minutes: u32,
     pub next_due: Instant,
-    snapshot: Weak<Model>,
+    snapshot: Option<(Weak<Model>, Arc<Model>)>,
     generation: u64,
     pub discovering: usize,
     pub busy: bool,
@@ -46,7 +46,7 @@ impl Default for State {
             active: None,
             interval_minutes: 2,
             next_due: Instant::now() + Duration::from_secs(120),
-            snapshot: Weak::new(),
+            snapshot: None,
             generation: 0,
             discovering: 0,
             busy: false,
@@ -122,7 +122,7 @@ impl BimApp {
         }
         self.autosave.generation += 1;
         self.autosave.discovering = 0;
-        self.autosave.snapshot = Weak::new();
+        self.autosave.snapshot = None;
         self.autosave.project = self.session.path.clone();
         self.autosave.recovery_error = None;
         // Saved projects are rediscovered when opened again. Postponed copies stay on disk.
@@ -188,7 +188,7 @@ impl BimApp {
             }
         }
         self.autosave.select_destination(self.session.path.as_deref());
-        self.autosave.snapshot = Weak::new();
+        self.autosave.snapshot = None;
         self.autosave.reset_timer();
     }
 
@@ -197,11 +197,13 @@ impl BimApp {
             match note {
                 Notice::Saved { path, snapshot, result } => {
                     self.autosave.busy = false;
-                    if self.autosave.active.as_ref() == Some(&path) && self.autosave.snapshot.ptr_eq(&snapshot) {
+                    if self.autosave.active.as_ref() == Some(&path)
+                        && self.autosave.snapshot.as_ref().is_some_and(|(live, _)| live.ptr_eq(&snapshot))
+                    {
                         match result {
                             Ok(()) => self.cleanup_retired_autosaves(),
                             Err(e) => {
-                                self.autosave.snapshot = Weak::new();
+                                self.autosave.snapshot = None;
                                 self.autosave_error(&e);
                             }
                         }
@@ -215,7 +217,7 @@ impl BimApp {
                             self.autosave.candidates.retain(|b| b.path != path);
                             self.autosave.show_recovery = !self.autosave.candidates.is_empty();
                             self.autosave.select_destination(self.session.path.as_deref());
-                            self.autosave.snapshot = Weak::new();
+                            self.autosave.snapshot = None;
                         } else if let Err(e) = &result {
                             self.autosave.recovery_error = Some(e.clone());
                         }
@@ -258,13 +260,18 @@ impl BimApp {
         if now >= self.autosave.next_due {
             // Capture only committed model state. An unfinished sketch is kept by its tool.
             if self.dirty() && self.autosave.discovering == 0 && !self.autosave.busy {
-                let same = self.autosave.snapshot.upgrade().is_some_and(|m| Arc::ptr_eq(&m, &self.session.model));
+                let live = Arc::downgrade(&self.session.model);
+                let snapshot = self.session.snapshot();
+                let same = self
+                    .autosave
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|(previous, persisted)| previous.ptr_eq(&live) && catalogue_metadata_matches(persisted, &snapshot));
                 if !same && let Some(path) = self.autosave.active.clone() {
-                    let snapshot = Arc::clone(&self.session.model);
                     let result = self.autosave.worker.as_mut().map(|w| w.save_session(path, &self.session));
                     match result {
                         Some(Ok(true)) => {
-                            self.autosave.snapshot = Arc::downgrade(&snapshot);
+                            self.autosave.snapshot = Some((live, snapshot));
                             self.autosave.busy = true;
                         }
                         Some(Err(e)) => self.autosave_error(&e),
@@ -329,6 +336,7 @@ impl BimApp {
 
     pub(crate) fn recover_backup(&mut self, backup: Backup) {
         let saved = Arc::clone(&self.saved);
+        let saved_snapshot = Arc::clone(&self.saved_snapshot);
         let Some(reply) = self.run("recover", json!({"path": backup.path, "project": backup.project})) else {
             self.autosave.recovery_error = Some(self.status.text.clone());
             self.autosave.show_recovery = true;
@@ -341,6 +349,7 @@ impl BimApp {
             self.catalogue_open_failed(error);
         }
         self.saved = saved;
+        self.saved_snapshot = saved_snapshot;
         self.autosave.candidates.retain(|b| b != &backup);
         self.autosave.recovery_error = None;
         self.autosave.show_recovery = !self.autosave.candidates.is_empty();
@@ -351,7 +360,7 @@ impl BimApp {
         if backup.project.is_none() {
             self.autosave.temporary = backup.path;
         }
-        self.autosave.snapshot = Arc::downgrade(&self.session.model);
+        self.autosave.snapshot = Some((Arc::downgrade(&self.session.model), self.session.snapshot()));
         self.autosave.reset_timer();
     }
 }

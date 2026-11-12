@@ -84,7 +84,7 @@ pub mod window;
 mod workplane;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -702,6 +702,7 @@ pub struct BimApp {
     seen: Option<(Arc<Model>, Arc<Model>)>,
     /// Link Model was asked for: its file dialog opens on the next frame, so a shortcut typed alone never waits on one.
     link_dialog: bool,
+    ifc_reviews: VecDeque<links::IfcReview>,
     /// Insert > Point Cloud was pressed: its file dialog opens this frame.
     cloud_dialog: bool,
     /// Bringing scan files in: the box, while it's open.
@@ -747,6 +748,8 @@ pub struct BimApp {
     paper: paper::Papers,
     /// The model as last opened or saved: any other is unsaved.
     saved: Arc<Model>,
+    /// The persisted snapshot also includes catalogue changes kept outside the undo history.
+    saved_snapshot: Arc<Model>,
     autosave: autosave::State,
     /// The palette field being typed in: element, field, text so far.
     edit: Option<(Id, String, String)>,
@@ -1259,12 +1262,19 @@ fn rail_button(ui: &mut Ui, icon: Icon, label: &str, open: bool) -> Response {
     r.on_hover_text(label)
 }
 
+fn catalogue_metadata_matches(a: &Model, b: &Model) -> bool {
+    a.catalogue_retired == b.catalogue_retired
+        && a.catalogue_unexported == b.catalogue_unexported
+        && a.catalogue_pending_edits == b.catalogue_pending_edits
+}
+
 impl BimApp {
     pub fn new(session: Session) -> BimApp {
         let first = Sheet::Plan(session.model.levels().first().map_or(0, |(id, _)| *id));
         let units = session.model.units;
         BimApp {
             saved: Arc::clone(&session.model),
+            saved_snapshot: session.snapshot(),
             project: session.model.uid,
             autosave: autosave::State::default(),
             session,
@@ -1403,6 +1413,7 @@ impl BimApp {
             linked_3d: None,
             seen: None,
             link_dialog: false,
+            ifc_reviews: VecDeque::new(),
             cloud_dialog: false,
             cloud_box: None,
             cad_dialog: None,
@@ -1513,7 +1524,10 @@ impl BimApp {
 
     /// Whether the model changed since it was last opened or saved.
     pub fn dirty(&self) -> bool {
-        !Arc::ptr_eq(&self.saved, &self.session.model)
+        if !Arc::ptr_eq(&self.saved, &self.session.model) {
+            return true;
+        }
+        !catalogue_metadata_matches(&self.session.snapshot(), &self.saved_snapshot)
     }
 
     /// Where model point `p` shows on screen, on the plan drawn last.
@@ -1522,13 +1536,21 @@ impl BimApp {
     }
 
     /// Run a command; when it fails, say why.
-    fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+    fn run(&mut self, id: &str, mut params: Value) -> Option<Value> {
         self.made_in();
+        if id == "reload"
+            && let Some(params) = params.as_object_mut()
+        {
+            params.insert("review".into(), json!(true));
+        }
         match self.session.execute(id, &params) {
             Ok(v) => {
                 self.status = Status::default();
                 // The core renames and drops the option with its set.
                 self.active_option = self.session.option.clone();
+                if id == "reload" {
+                    self.review_ifc_reload(&v);
+                }
                 if let Some(report) = v.get("carrier_check").or_else(|| (id == "cable_carrier_check").then_some(&v)) {
                     self.carrier_feedback(report);
                 }
@@ -2005,6 +2027,7 @@ impl BimApp {
             || self.show_shortcuts
             || self.show_snaps
             || self.show_catalogue
+            || !self.ifc_reviews.is_empty()
             || self.pending.is_some()
             || self.autosave.show_recovery
             || self.installing()
@@ -3097,6 +3120,7 @@ impl BimApp {
         // Exports (IFC, glTF, the sheets' PDF) leave the project unsaved.
         if saved && !matches!(ext.as_str(), "ifc" | "glb" | "pdf") {
             self.saved = Arc::clone(&self.session.model);
+            self.saved_snapshot = self.session.snapshot();
             self.note_recent(path);
             self.autosave_saved();
         }
@@ -5427,6 +5451,7 @@ impl BimApp {
         if std::mem::take(&mut self.link_dialog) {
             self.link_model_dialog(ctx);
         }
+        self.ifc_review_window(ctx);
         if std::mem::take(&mut self.cloud_dialog) {
             self.point_cloud_dialog(ctx);
         }

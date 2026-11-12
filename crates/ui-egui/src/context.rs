@@ -574,7 +574,10 @@ impl BimApp {
     }
 
     pub(crate) fn carrier_from_wire_window(&mut self, ctx: &egui::Context) {
+        use bimcraft_core::model::Element;
+
         let Some(mut dialog) = self.carrier_from_wire.take() else { return };
+        let mounted = self.session.model.elements.get(dialog.wire).and_then(Element::run).is_some_and(|run| run.mount.is_some());
         let mut create = false;
         let mut cancel = false;
         let response = egui::Modal::new(egui::Id::new("carrier-from-wire")).show(ctx, |ui| {
@@ -588,26 +591,32 @@ impl BimApp {
                 }
             });
             combo.response.labelled_by(label.id);
-            ui.label(t(msg!("Wire placement inside carrier:")));
-            ui.horizontal(|ui| {
-                for (value, label) in [("top", "Top"), ("centre", "Centre"), ("bottom", "Bottom")] {
-                    ui.radio_value(&mut dialog.placement, value, t(label));
-                }
-            });
-            let label = ui.label(t(msg!("Lateral Offset:")));
-            ui.add(egui::TextEdit::singleline(&mut dialog.lateral).desired_width(100.0)).labelled_by(label.id);
+            if mounted {
+                ui.label(t(msg!("The carrier will keep the wire's mounting surface.")));
+            } else {
+                ui.label(t(msg!("Wire placement inside carrier:")));
+                ui.horizontal(|ui| {
+                    for (value, label) in [("top", "Top"), ("centre", "Centre"), ("bottom", "Bottom")] {
+                        ui.radio_value(&mut dialog.placement, value, t(label));
+                    }
+                });
+                let label = ui.label(t(msg!("Lateral Offset:")));
+                ui.add(egui::TextEdit::singleline(&mut dialog.lateral).desired_width(100.0)).labelled_by(label.id);
+            }
             ui.horizontal(|ui| {
                 create = ui.button(t(msg!("Create Carrier"))).clicked();
                 cancel = ui.button(t("Cancel")).clicked();
             });
         });
         if create {
-            if let Some(lateral) = self.session.model.units.parse(&dialog.lateral) {
+            let lateral = if mounted { Some(0.0) } else { self.session.model.units.parse(&dialog.lateral) };
+            if let Some(lateral) = lateral {
+                let placement = if mounted { "centre" } else { dialog.placement };
                 if self
                     .run(
                         "cable_carrier",
                         serde_json::json!({"from_wire":dialog.wire,"type":dialog.type_name,
-                    "placement":dialog.placement,"local_offset":lateral}),
+                    "placement":placement,"local_offset":lateral}),
                     )
                     .is_some()
                 {

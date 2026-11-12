@@ -2789,6 +2789,7 @@ pub(crate) fn from_step(file: File, name: &str, seed: u64) -> Result<Imported, S
                 params: BTreeMap::new(),
                 provision: None,
                 mount: None,
+                detector_space: None,
                 connection_sides: Vec::new(),
             };
             let cid = m.insert(Element::Component(c));

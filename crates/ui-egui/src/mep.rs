@@ -348,6 +348,21 @@ impl BimApp {
         panel(ui, msg!("Alarm & Voice"), |ui| {
             self.buttons(ui, &[Self::fixture_button("sounder"), Self::fixture_button("exitsign"), Self::fixture_button("speaker")]);
         });
+        panel(ui, msg!("Fire Zones"), |ui| {
+            use bimcraft_core::model::FireZoneKind;
+            let level = self.plan_level();
+            ui.add_enabled_ui(level.is_some(), |ui| {
+                for (label, kind) in
+                    [(msg!("Detection Zone"), FireZoneKind::Detection), (msg!("Notification Zone"), FireZoneKind::Notification)]
+                {
+                    if ui.button(crate::lang::t(label)).clicked()
+                        && let Some(level) = level
+                    {
+                        self.start_sketch(crate::sketch::Of::FireZone(level, kind), Vec::new());
+                    }
+                }
+            });
+        });
         panel(ui, msg!("Security"), |ui| {
             self.buttons(ui, &[Self::fixture_button("motiondetector"), Self::fixture_button("camera")]);
         });

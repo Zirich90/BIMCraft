@@ -223,6 +223,7 @@ fn boxes(
                 params,
                 provision: None,
                 mount: None,
+                detector_space: None,
                 connection_sides: Vec::new(),
             })
         })();

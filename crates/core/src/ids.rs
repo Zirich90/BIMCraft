@@ -785,7 +785,7 @@ mod journal_tests {
         assert_eq!(changed(&mut s, "undo", json!({})), ids(&[door]));
         assert_eq!(changed(&mut s, "redo", json!({})), ids(&[door]));
         // A command that changes a setting changes everything there is to check, and so does undoing it.
-        assert_eq!(changed(&mut s, "room_area", json!({"at": "finish"})), Changed::All);
+        assert_eq!(changed(&mut s, "room_area", json!({"at": "centre"})), Changed::All);
         assert_eq!(changed(&mut s, "undo", json!({})), Changed::All);
         // Another model's elements: everything.
         assert_eq!(Model::new("x").changed_since(&s.model), Changed::All);

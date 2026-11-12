@@ -23,16 +23,15 @@ fn area(s: &mut Session) -> f64 {
 fn a_room_is_measured_at_the_centre_lines_or_inside_the_finish_faces() {
     let mut s = Session::new();
     box_with_room(&mut s);
-    assert_eq!(run(&mut s, "room_area", json!({})), json!({"at": "centre"}), "centre unless set");
-    assert_eq!(area(&mut s), 12.0);
-    assert_eq!(run(&mut s, "room_area", json!({"at": "finish"})), json!({"at": "finish"}));
+    assert_eq!(run(&mut s, "room_area", json!({})), json!({"at": "finish"}), "new projects measure the usable room");
     assert_eq!(area(&mut s), 9.99, "(4000 - 300) x (3000 - 300)");
-    assert_eq!(run(&mut s, "inspect", json!({}))["room_area"], "finish");
-    // Asking without `at` changes nothing.
-    assert_eq!(run(&mut s, "room_area", json!({})), json!({"at": "finish"}));
-    run(&mut s, "undo", json!({}));
+    assert_eq!(run(&mut s, "room_area", json!({"at": "centre"})), json!({"at": "centre"}));
     assert_eq!(area(&mut s), 12.0);
-    assert_eq!(run(&mut s, "inspect", json!({}))["room_area"], "centre");
+    // Asking without `at` changes nothing.
+    assert_eq!(run(&mut s, "room_area", json!({})), json!({"at": "centre"}));
+    run(&mut s, "undo", json!({}));
+    assert_eq!(area(&mut s), 9.99);
+    assert_eq!(run(&mut s, "inspect", json!({}))["room_area"], "finish");
 }
 
 #[test]
@@ -69,8 +68,7 @@ fn the_setting_is_saved_and_a_file_without_it_reads_as_centre() {
     file.as_object_mut().unwrap().remove("room_area");
     let (m, left_out) = Model::read(&file.to_string()).unwrap();
     assert_eq!((m.room_area, left_out.len()), (crate::model::RoomArea::Centre, 0));
-    // And a project on the default doesn't write it.
-    assert!(serde_json::to_value(Model::new("t")).unwrap().get("room_area").is_none());
+    assert_eq!(serde_json::to_value(Model::new("t")).unwrap()["room_area"], "finish");
 }
 
 #[test]
@@ -80,7 +78,7 @@ fn the_command_names_what_there_is_when_given_what_there_isnt() {
         let e = s.execute("room_area", &bad).unwrap_err();
         assert!(e.contains("centre") && e.contains("finish"), "{bad}: {e}");
     }
-    assert_eq!(s.model.room_area, crate::model::RoomArea::Centre);
+    assert_eq!(s.model.room_area, crate::model::RoomArea::Finish);
 }
 
 /// Every room's area, smallest first.
@@ -139,6 +137,7 @@ fn a_room_in_the_clear_next_to_a_wall_is_still_a_room_at_the_finish_faces() {
 #[test]
 fn an_l_shaped_room_is_measured_inside_its_walls() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     wall(&mut s, json!([[0, 0], [6000, 0], [6000, 2000], [2000, 2000], [2000, 5000], [0, 5000]]), true);
     run(&mut s, "room", json!({"point": [1000, 1000]}));
     near(areas(&mut s)[0], 18.0); // 6000 x 2000 + 2000 x 3000 on the centre lines
@@ -150,6 +149,7 @@ fn an_l_shaped_room_is_measured_inside_its_walls() {
 #[test]
 fn an_island_of_walls_is_taken_from_the_room_at_the_finish_faces() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     wall(&mut s, json!([[0, 0], [6000, 0], [6000, 5000], [0, 5000]]), true);
     wall(&mut s, json!([[2500, 2000], [3500, 2000], [3500, 3000], [2500, 3000]]), true);
     run(&mut s, "room", json!({"point": [1000, 1000]}));
@@ -166,6 +166,7 @@ fn an_island_of_walls_is_taken_from_the_room_at_the_finish_faces() {
 #[test]
 fn four_rooms_round_a_wall_crossing_are_each_measured_at_the_finish_faces() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     wall(&mut s, json!([[0, 0], [6000, 0], [6000, 4000], [0, 4000]]), true);
     wall(&mut s, json!([[3000, 0], [3000, 4000]]), false);
     wall(&mut s, json!([[0, 2000], [6000, 2000]]), false);

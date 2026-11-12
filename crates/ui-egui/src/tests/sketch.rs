@@ -19,6 +19,26 @@ fn sketched(h: &Harness<BimApp>) -> usize {
 }
 
 #[test]
+fn low_voltage_ribbon_sketches_a_fire_zone() {
+    let mut h = app(BOX);
+    press(&mut h, "Low Voltage");
+    press(&mut h, "Detection Zone");
+    press(&mut h, "Rectangle");
+    click(&mut h, P2(2000.0, 1000.0));
+    click(&mut h, P2(6000.0, 4000.0));
+    assert_eq!(sketched(&h), 4);
+    assert!(ids(&h, "fire_zone").is_empty());
+    press(&mut h, "Finish Edit Mode");
+    assert!(h.state().sketch.is_none(), "{}", h.state().status.text);
+    let zones = ids(&h, "fire_zone");
+    assert_eq!(zones.len(), 1);
+    assert_eq!(h.state().selection, zones);
+    let Some(Element::FireZone(zone)) = h.state().session.model.elements.get(zones[0]) else { panic!("missing zone") };
+    assert_eq!(zone.kind, bimcraft_core::model::FireZoneKind::Detection);
+    assert_eq!(zone.boundary.len(), 4);
+}
+
+#[test]
 fn edit_boundary_draws_a_hole_with_a_rectangle_and_finish_makes_it_the_floors_in_one_step() {
     let (mut h, f) = floored();
     press(&mut h, "Edit Boundary");

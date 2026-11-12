@@ -471,9 +471,10 @@ const OWN: &[(&str, usize, &[Own])] = &[
             DESIGN_OPTION,
             (msg!("Placement"), Kind::Text, From::ComponentPlacement),
             (msg!("System"), Kind::Text, From::ComponentSystem),
+            ROOM_NUMBER,
+            ROOM_NAME,
         ],
     ),
-    ("component", 4, &[FAMILY, TYPE, LEVEL, COUNT, PHASE_CREATED, PHASE_DEMOLISHED, DESIGN_OPTION, ROOM_NUMBER, ROOM_NAME]),
     (
         "stair",
         7,
@@ -1359,8 +1360,8 @@ mod tests {
         assert_eq!(
             t.rows,
             [
-                vec![json!("1"), json!("Kitchen"), json!("Level 1"), json!(18.0), json!(18000.0)],
-                vec![json!("10"), json!("Living"), json!("Level 1"), json!(30.0), json!(22000.0)],
+                vec![json!("1"), json!("Kitchen"), json!("Level 1"), json!(16.53), json!(17300.0)],
+                vec![json!("10"), json!("Living"), json!("Level 1"), json!(28.13), json!(21300.0)],
             ]
         );
         assert!(t.totals.is_none());
@@ -1422,7 +1423,7 @@ mod tests {
         assert!(parts["xl/workbook.xml"].contains(r#"name="Room Schedule""#));
         let sheet = &parts["xl/worksheets/sheet1.xml"];
         assert!(sheet.contains(r#"<t xml:space="preserve">Area (m²)</t>"#), "{sheet}");
-        assert!(sheet.contains(r#"<t xml:space="preserve">Kitchen</t></is></c><c r="C2" t="inlineStr"><is><t xml:space="preserve">Level 1</t></is></c><c r="D2"><v>18</v></c><c r="E2"><v>18000</v></c>"#), "{sheet}");
+        assert!(sheet.contains(r#"<t xml:space="preserve">Kitchen</t></is></c><c r="C2" t="inlineStr"><is><t xml:space="preserve">Level 1</t></is></c><c r="D2"><v>16.53</v></c><c r="E2"><v>17300</v></c>"#), "{sheet}");
     }
 
     fn multi(cats: &[&str], fields: &[&str]) -> Schedule {

@@ -98,7 +98,12 @@ fn the_manage_tab_offers_link_model_and_the_linked_models_group_reloads_them_all
     let path = shell("manage");
     let mut h = app("");
     press(&mut h, "Manage");
+    if h.query_by_label("Link Model").is_none() {
+        press(&mut h, "Links ▾");
+    }
     assert!(h.query_by_label("Link Model").is_some());
+    h.key_press(Key::Escape);
+    h.run();
     h.state_mut().link_path(&path);
     h.run();
     let walls = |h: &mut Harness<BimApp>| h.state_mut().view_model().elements.values().filter(|e| e.category() == "wall").count();
@@ -123,6 +128,134 @@ fn lk_asks_for_the_file_on_the_next_frame_and_is_listed_in_ks() {
     assert!(app.shortcut());
     assert!(app.link_dialog, "the dialog is asked for, not opened where the shortcut is typed");
     assert!(crate::shortcuts().iter().any(|(letters, name)| *letters == "LK" && *name == "Link Model"));
+}
+
+#[test]
+fn an_ifc_link_can_preview_the_selected_room_and_detectors() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("architecture.ifc");
+    let mut architecture = Session::new();
+    architecture.script(BOX).unwrap();
+    architecture.execute("ceiling", &json!({"boundary":[[0,0],[8000,0],[8000,6000],[0,6000]],"offset":2500})).unwrap();
+    architecture.execute("save", &json!({"path":path})).unwrap();
+
+    let mut h = app("");
+    h.state_mut().link_path(&path);
+    let link = links(&h)[0];
+    let session = &mut h.state_mut().session;
+    let room = session.execute("room", &json!({"point":[4000,3000]})).unwrap()["id"].as_u64().unwrap();
+    let detector = session.execute("detectors", &json!({"room":room,"architecture":link})).unwrap()["ids"][0].as_u64().unwrap();
+    let guid = session.model.guid(detector);
+    h.state_mut().selection = vec![room, detector];
+    h.run();
+    type_into(&mut h, FIND, "architecture");
+    h.get_by_label("architecture").click_secondary();
+    h.run();
+    press(&mut h, "Preview IFC Detector Group");
+    assert!(h.query_by_label("Review IFC Adaptation").is_some());
+    assert!(h.state_mut().session.execute("adapt_ifc", &json!({"id":link})).is_err());
+    press(&mut h, "Refresh IFC Preview");
+    press(&mut h, "Apply IFC Adaptation");
+    assert!(h.query_by_label("Review IFC Adaptation").is_none());
+    assert_eq!(h.state().session.model.guid(detector), guid);
+    let saved = h.state_mut().session.execute("adapt_ifc", &json!({"id":link})).unwrap();
+    assert_eq!(saved["status"], "ready");
+    let duplicate = json!({"id":link,"groups":[{"room":room,"ids":[guid]}],"append":true,"apply":true});
+    let error = h.state_mut().session.execute("adapt_ifc", &duplicate).unwrap_err();
+    assert!(error.contains("selected in more than one group"), "{error}");
+    assert_eq!(h.state_mut().session.execute("adapt_ifc", &json!({"id":link})).unwrap(), saved);
+}
+
+#[test]
+fn reloading_an_ifc_link_reviews_detector_changes_and_rechecks_before_applying() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("architecture.ifc");
+    let mut architecture = Session::new();
+    architecture.script(BOX).unwrap();
+    let ceiling = architecture.execute("ceiling", &json!({"boundary":[[0,0],[8000,0],[8000,6000],[0,6000]],"offset":2500})).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    architecture.execute("save", &json!({"path":path})).unwrap();
+
+    #[cfg(not(feature = "visual-tests"))]
+    let mut h = app("");
+    #[cfg(feature = "visual-tests")]
+    let output = std::env::var_os("IFC_REVIEW_DUMP").map(PathBuf::from);
+    #[cfg(feature = "visual-tests")]
+    let mut h = if output.is_some() {
+        let mut state = BimApp::new(Session::new());
+        (state.profile, state.docking) = (crate::style::Profile::Rev, crate::dock::Docking::revit());
+        Harness::builder()
+            .with_size([1280.0, 800.0])
+            .with_max_steps(32)
+            .renderer(egui_kittest::wgpu::WgpuTestRenderer::new())
+            .build_ui_state(|ui, state: &mut BimApp| state.show(ui), state)
+    } else {
+        app("")
+    };
+    h.state_mut().link_path(&path);
+    let link = links(&h)[0];
+    let session = &mut h.state_mut().session;
+    let room = session.execute("room", &json!({"point":[4000,3000]})).unwrap()["id"].as_u64().unwrap();
+    let detector = session.execute("detectors", &json!({"room":room,"architecture":link})).unwrap()["ids"][0].as_u64().unwrap();
+    let guid = session.model.guid(detector);
+    let saved = session.execute("adapt_ifc", &json!({"id":link,"groups":[{"room":room,"ids":[guid]}],"apply":true})).unwrap();
+    assert_eq!(saved["status"], "applied");
+    let link_path = match session.model.elements.get(link) {
+        Some(Element::Link(link)) => link.path.clone(),
+        _ => panic!("link is missing"),
+    };
+    let original = session.model.loaded[&link_path].clone();
+    let contact = |h: &Harness<BimApp>| {
+        let model = &h.state().session.model;
+        let Some(Element::Component(c)) = model.elements.get(detector) else { panic!("detector is missing") };
+        c.offset + model.component_contact_height(c, "bottom")
+    };
+    let mut raise = |offset| {
+        architecture.execute("modify", &json!({"id":ceiling,"offset":offset})).unwrap();
+        architecture.execute("save", &json!({"path":path})).unwrap();
+    };
+    raise(2800);
+    h.run();
+    type_into(&mut h, FIND, "linked");
+    h.get_by_label("Linked Models").click_secondary();
+    h.run();
+    press(&mut h, "Reload All");
+    assert!(h.query_by_label("Review IFC Adaptation").is_some());
+    assert!((contact(&h) - 2500.0).abs() < 0.01);
+    assert!(std::sync::Arc::ptr_eq(&original, &h.state().session.model.loaded[&link_path]));
+
+    #[cfg(feature = "visual-tests")]
+    if let Some(output) = output {
+        std::fs::create_dir_all(&output).unwrap();
+        let Some(Element::Room(room)) = h.state().session.model.elements.get(room) else { panic!("room is missing") };
+        let room_label = format!("{} {}", room.number, room.name);
+        press(&mut h, &room_label);
+        for (name, theme, light_canvas) in [
+            ("light", egui::ThemePreference::Light, false),
+            ("dark", egui::ThemePreference::Dark, false),
+            ("dark-light-canvas", egui::ThemePreference::Dark, true),
+        ] {
+            let state = h.state_mut();
+            state.theme_wanted = Some(theme);
+            state.light_canvas = light_canvas;
+            h.run();
+            h.render().unwrap().save(output.join(format!("ifc-review-{name}.png"))).unwrap();
+        }
+    }
+
+    raise(2900);
+    press(&mut h, "Apply IFC Adaptation");
+    assert!(h.query_by_label("The IFC preview changed. Review it again before applying.").is_some());
+    assert!((contact(&h) - 2500.0).abs() < 0.01);
+    press(&mut h, "Apply IFC Adaptation");
+    assert!(h.query_by_label("Review IFC Adaptation").is_none());
+    assert!((contact(&h) - 2900.0).abs() < 0.01);
+    assert_eq!(h.state().session.model.guid(detector), guid);
+    assert!(!std::sync::Arc::ptr_eq(&original, &h.state().session.model.loaded[&link_path]));
+    h.state_mut().session.execute("undo", &json!({})).unwrap();
+    assert!((contact(&h) - 2500.0).abs() < 0.01);
+    assert!(std::sync::Arc::ptr_eq(&original, &h.state().session.model.loaded[&link_path]));
 }
 
 #[test]

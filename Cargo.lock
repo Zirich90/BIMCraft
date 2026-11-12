@@ -490,6 +490,7 @@ dependencies = [
  "getrandom 0.3.4",
  "quick-xml",
  "rayon",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

@@ -21,6 +21,28 @@ use crate::pen::{LineWeights, MAX_PEN, Pen, Row, ScalePens};
 use crate::styles::ObjectStyle;
 use crate::units::Units;
 
+/// The edition of the fire rules pinned to a project. Missing fields in old files use this original edition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FireStandard {
+    #[default]
+    #[serde(rename = "ru_sp484_2020_a1_sp486_2020_a1")]
+    RuSp484And486Amendment1,
+}
+
+impl FireStandard {
+    pub fn detector_rules(self) -> &'static str {
+        match self {
+            Self::RuSp484And486Amendment1 => "SP 484.1311500.2020 Amendment 1",
+        }
+    }
+
+    pub fn hidden_space_rules(self) -> &'static str {
+        match self {
+            Self::RuSp484And486Amendment1 => "SP 486.1311500.2020 Amendment 1",
+        }
+    }
+}
+
 /// A technical standard preset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TechnicalStandard {

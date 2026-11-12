@@ -115,7 +115,7 @@ impl BimApp {
         let Some(sk) = &self.sketch else { return raw };
         let (level, editing) = match sk.of {
             Of::Edit(id) => (m.elements.get(id).and_then(|e| m.level_of(e)).and_then(|g| m.elements.id(g)), Some(id)),
-            Of::Floor(level) | Of::Ceiling(level) | Of::Roof(level) | Of::Shaft(level) => (Some(level), None),
+            Of::Floor(level) | Of::Ceiling(level) | Of::Roof(level) | Of::Shaft(level) | Of::FireZone(level, _) => (Some(level), None),
             Of::Region { .. } => (None, None),
         };
         let Some(level) = level else { return raw };

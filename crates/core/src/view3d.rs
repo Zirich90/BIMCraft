@@ -1477,6 +1477,50 @@ pub(crate) fn surface_patch_frame(corners: [P3; 4]) -> Result<(P3, P3, f64, f64)
     Ok((x, y, width, height))
 }
 
+fn ray_triangle(points: [P3; 3], origin: P3, direction: P3) -> Option<(f64, P3)> {
+    let e1 = sub(points[1], points[0]);
+    let e2 = sub(points[2], points[0]);
+    let area = cross(e1, e2);
+    let area_length = dot(area, area).sqrt();
+    let h = cross(direction, e2);
+    let determinant = dot(e1, h);
+    if area_length <= 1e-12 || determinant.abs() <= 1e-12 * area_length {
+        return None;
+    }
+    let from = sub(origin, points[0]);
+    let u = dot(from, h) / determinant;
+    let q = cross(from, e1);
+    let v = dot(direction, q) / determinant;
+    if u < -1e-10 || v < -1e-10 || u + v > 1.0 + 1e-10 {
+        return None;
+    }
+    Some((dot(e2, q) / determinant, mul(area, 1.0 / area_length)))
+}
+
+fn triangle_in_run(points: [P3; 3], run: crate::runs::Geom, axes: [P3; 3], length: f64) -> Option<P3> {
+    // Clip in the triangle's own parameter space so the result maps back to the obstacle's surface.
+    let [a, b, c] = points.map(|p| axes.map(|axis| dot(sub(p, run.a), axis)));
+    let coord = |P2(u, v), i: usize| a[i] + (b[i] - a[i]) * u + (c[i] - a[i]) * v;
+    let ring = [P2(0.0, 0.0), P2(1.0, 0.0), P2(0.0, 1.0)];
+    let lower = geom::clip(&ring, |p| coord(p, 0) - 0.01);
+    let mut clipped = geom::clip(&lower, |p| length - 0.01 - coord(p, 0));
+    let param = if run.round {
+        let xy = |p| P2(coord(p, 1), coord(p, 2));
+        geom::ring_edges(&clipped).find_map(|(a, b)| {
+            let t = geom::param_on_segment(P2(0.0, 0.0), xy(a), xy(b));
+            let p = a + (b - a) * t;
+            (xy(p).dist(P2(0.0, 0.0)) < run.width * 0.5).then_some(p)
+        })?
+    } else {
+        for (i, half) in [(1, run.width * 0.5), (2, run.depth * 0.5)] {
+            let lower = geom::clip(&clipped, |p| coord(p, i) + half);
+            clipped = geom::clip(&lower, |p| half - coord(p, i));
+        }
+        *clipped.first()?
+    };
+    Some(add(points[0], add(mul(sub(points[1], points[0]), param.0), mul(sub(points[2], points[0]), param.1))))
+}
+
 impl Scene {
     /// Continuous support of a contact line, including openings between its endpoints.
     pub(crate) fn supports_segment(&self, host: Id, face: &str, a: P3, b: P3, normal: P3) -> Result<bool, String> {
@@ -1627,37 +1671,69 @@ impl Scene {
         self.tris.iter().zip(self.faces.iter()).filter_map(move |(tri, face)| (tri.owner == hit.host && *face == hit.face).then_some(tri.p))
     }
 
+    /// Where the modeled run intersects a selected solid. Endpoint contact alone is excluded.
+    pub(crate) fn run_clashes<'a>(
+        &'a self,
+        run: crate::runs::Geom,
+        x: P3,
+        y: P3,
+        solid: impl Fn(Id) -> bool + 'a,
+    ) -> impl Iterator<Item = (Id, P3)> + 'a {
+        let (a, b) = (run.a, run.b);
+        let delta = sub(b, a);
+        let length = dot(delta, delta).sqrt();
+        let direction = unit(delta);
+        let axes = [direction, x, y];
+        let reach: P3 = std::array::from_fn(|i| (x[i].abs() * run.width + y[i].abs() * run.depth) * 0.5);
+        let range = 0.01..length - 0.01;
+        self.spans.iter().filter_map(move |span| {
+            if range.is_empty()
+                || !solid(span.id)
+                || (0..3).any(|i| a[i].max(b[i]) + reach[i] < span.bounds[0][i] || a[i].min(b[i]) - reach[i] > span.bounds[1][i])
+            {
+                return None;
+            }
+            let triangles = &self.tris[span.at.clone()];
+            let distance = triangles
+                .iter()
+                .filter_map(|tri| ray_triangle(tri.p, a, direction).map(|(distance, _)| distance))
+                .filter(|distance| range.contains(distance))
+                .min_by(f64::total_cmp);
+            if let Some(distance) = distance {
+                return Some((span.id, add(a, mul(direction, distance))));
+            }
+            // A segment wholly inside the solid crosses no surface. Count the distinct exits and entries of
+            // an oblique ray so two triangles sharing a face diagonal contribute only one crossing.
+            let midpoint = add(a, mul(delta, 0.5));
+            if (0..3).all(|i| midpoint[i] > span.bounds[0][i] && midpoint[i] < span.bounds[1][i]) {
+                let ray = unit([1.0, 0.371, 0.583]);
+                let mut hits: Vec<_> = triangles
+                    .iter()
+                    .filter_map(|tri| ray_triangle(tri.p, midpoint, ray).map(|(distance, _)| distance))
+                    .filter(|distance| *distance > 0.01)
+                    .collect();
+                hits.sort_unstable_by(f64::total_cmp);
+                hits.dedup_by(|left, right| (*left - *right).abs() < 0.01);
+                if hits.len() % 2 == 1 {
+                    return Some((span.id, midpoint));
+                }
+            }
+            triangles.iter().find_map(|tri| triangle_in_run(tri.p, run, axes, length)).map(|point| (span.id, point))
+        })
+    }
+
     fn cast_surface(&self, host: Id, origin: P3, direction: P3, range: std::ops::RangeInclusive<f64>) -> Option<SurfaceHit> {
         let mut nearest: Option<SurfaceHit> = None;
         for (t, &face) in self.tris.iter().zip(self.faces.iter()) {
             if t.owner != host || face.is_empty() {
                 continue;
             }
-            let e1 = sub(t.p[1], t.p[0]);
-            let e2 = sub(t.p[2], t.p[0]);
-            let area = cross(e1, e2);
-            let area_length = dot(area, area).sqrt();
-            let h = cross(direction, e2);
-            let determinant = dot(e1, h);
-            if area_length <= 1e-12 || determinant.abs() <= 1e-12 * area_length {
-                continue;
-            }
-            let from = sub(origin, t.p[0]);
-            let u = dot(from, h) / determinant;
-            let q = cross(from, e1);
-            let v = dot(direction, q) / determinant;
-            let distance = dot(e2, q) / determinant;
-            if u < -1e-10 || v < -1e-10 || u + v > 1.0 + 1e-10 || !range.contains(&distance) {
+            let Some((distance, normal)) = ray_triangle(t.p, origin, direction) else { continue };
+            if !range.contains(&distance) {
                 continue;
             }
             if nearest.as_ref().is_none_or(|hit| distance < hit.distance) {
-                nearest = Some(SurfaceHit {
-                    host,
-                    face,
-                    point: add(origin, mul(direction, distance)),
-                    normal: mul(area, 1.0 / area_length),
-                    distance,
-                });
+                nearest = Some(SurfaceHit { host, face, point: add(origin, mul(direction, distance)), normal, distance });
             }
         }
         nearest

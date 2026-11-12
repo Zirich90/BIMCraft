@@ -110,12 +110,17 @@ impl<'a> Rooms<'a> {
         if let Some(k) = &r.kept {
             return k.at(at).cloned().ok_or(Unbound::NotEnclosed);
         }
-        let plan = self.plan(r.level, at);
-        if plan.walls.iter().any(|(_, ring)| geom::contains(ring, r.point)) {
-            return Err(Unbound::NotEnclosed);
-        }
-        let g = geom::region_in(&plan.faces, r.point, TOL).ok_or(Unbound::NotEnclosed)?;
+        let g = self.region_at_point(r.level, r.point, at).ok_or(Unbound::NotEnclosed)?;
         self.before(r, &g).map_or(Ok(g), |id| Err(Unbound::Shared(id)))
+    }
+
+    /// An enclosed space at a point, before a room has been placed there.
+    pub fn region_at_point(&self, level: Guid, point: P2, at: RoomArea) -> Option<Region> {
+        let plan = self.plan(level, at);
+        if plan.walls.iter().any(|(_, ring)| geom::contains(ring, point)) {
+            return None;
+        }
+        geom::region_in(&plan.faces, point, TOL)
     }
 
     /// The room on `level` that point `p` stands in, as Revit's Room parameter of a family instance: the first, in order of id,

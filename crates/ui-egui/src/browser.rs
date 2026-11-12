@@ -87,6 +87,7 @@ enum Act {
     Pick(&'static str, String),
     /// A link: it is the selection, for Properties.
     Select(Id),
+    PreviewIfcGroup(Id, serde_json::Value),
 }
 
 /// An entry of the tree, or a group of them.
@@ -310,6 +311,7 @@ impl BimApp {
                 self.types.insert(category, name);
             }
             Some(Act::Select(id)) => self.selection = vec![id],
+            Some(Act::PreviewIfcGroup(id, group)) => self.preview_ifc_group(id, group),
             _ => {}
         }
     }
@@ -498,13 +500,20 @@ impl BimApp {
     /// The linked models, each with a menu to read it again or take it out; none where the project links nothing.
     fn links_node(&self) -> Option<Node> {
         let m = &self.session.model;
+        let group = self.selected_ifc_group();
         let kids: Vec<Node> = m
             .rare("link")
             .into_iter()
             .filter_map(|id| match m.elements.get(id) {
                 Some(Element::Link(l)) => {
                     let label = if m.loaded.contains_key(&l.path) { l.name.clone() } else { tf("{} (not loaded)", &[&l.name]) };
-                    let menu = vec![(msg!("Reload"), Act::Do("reload", serde_json::json!({"id": id}))), ("Remove", Act::Delete(vec![id]))];
+                    let mut menu =
+                        vec![(msg!("Reload"), Act::Do("reload", serde_json::json!({"id": id}))), ("Remove", Act::Delete(vec![id]))];
+                    if let Some(group) = &group
+                        && std::path::Path::new(&l.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ifc"))
+                    {
+                        menu.insert(1, (msg!("Preview IFC Detector Group"), Act::PreviewIfcGroup(id, group.clone())));
+                    }
                     Some(Node::leaf(&label, Act::Select(id), self.selection == [id]).with_menu(menu))
                 }
                 _ => None,

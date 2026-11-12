@@ -150,6 +150,11 @@ impl egui_kittest::TestRenderer for Pictures {
         }
         delta.clear();
     }
+
+    #[cfg(feature = "visual-tests")]
+    fn render(&mut self, _ctx: &egui::Context, _output: &egui::FullOutput) -> Result<image::RgbaImage, String> {
+        Err("the background grid test captures textures without rendering frames".into())
+    }
 }
 
 #[test]

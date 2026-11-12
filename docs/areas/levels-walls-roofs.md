@@ -39,7 +39,7 @@ A copy is new walls with new GUIDs, so a copied corner can run the other core th
 core reads as one. The cap is then five points, a step round the core (`walls::cap`), and plans and sections draw each
 layer to where it ends (`walls::layer_geometry`, `LayerGeometry::band`, `LayerGeometry::interfaces`).
 
-Room areas are measured at the walls' centre
+New projects measure room areas at the interior finish faces. Centre-line measurement uses the walls' centre
 lines, run on or back to meet at joins (`walls::centre_line`). A room separator (`roomseparator`, made by `room_separator` a line per segment) bounds rooms as a wall's centre line
 would and nothing else: it is no edge of a floor, a ceiling or a roof (`Model::bounding_lines` takes it, `wall_lines` and
 `face_lines` don't; an end drawn to a wall's face runs on to its centre line there, so the line splits rooms measured at
@@ -75,7 +75,8 @@ view rooms are off until shown (`graphics::OFF_IN_3D`, `Graphics::shows_in_3d`; 
 or ticked in its Visibility/Graphics), every new 3D view so; shown, each is drawn as below, fainter than a selected one,
 and a selected room is seen whatever the view says: a see-through solid in the selection's colour from its bottom to its top
 (`orbit::room_solid`, drawn over the picture, so it shows through walls). With `room_area {at: "finish"}` (`Model::room_area`, Revit's Area and
-Volume Computations) room areas are measured at the walls' faces instead (`face_lines` and the separators), the floor inside them; the IFC space
+Volume Computations) room areas are measured at the walls' faces (`face_lines` and the separators), the floor inside them. A saved
+project without the setting keeps centre-line measurement. The IFC space
 takes that outline, and its `Qto_SpaceBaseQuantities` give both whichever is set: `GrossFloorArea` and `GrossPerimeter` at
 the centre lines, `NetFloorArea` and `NetPerimeter` at the faces, `Height` (the room's Unbounded Height) and `GrossVolume` and `NetVolume`. Walls, slabs, doors and windows
 carry theirs too (`ifc::wall_quantities`): a wall its `Length` on its axis, `Width`, `Height` and side and volume, gross and less the

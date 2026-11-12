@@ -853,6 +853,7 @@ impl BimApp {
                 params: Default::default(),
                 provision: None,
                 mount: None,
+                detector_space: None,
                 connection_sides: Vec::new(),
             })
         } else {

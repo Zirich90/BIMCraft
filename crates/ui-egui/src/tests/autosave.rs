@@ -52,7 +52,7 @@ fn background_autosave_remembers_undo_before_the_catalogue_poll_runs() {
     h.state_mut().autosave.next_due = Instant::now();
     // Queue recovery directly to exercise the snapshot of the just-undone edit.
     h.state_mut().poll_autosave(&ctx);
-    assert!(h.state().autosave.busy);
+    assert!(h.state().autosave.busy, "dirty: {}, status: {}", h.state().dirty(), h.state().status.text);
     until(&mut h, |h| !h.state().autosave.busy);
     assert!(Arc::ptr_eq(&original, &h.state().session.model));
     let backup = h.state().autosave.active.as_ref().unwrap();
@@ -63,6 +63,9 @@ fn background_autosave_remembers_undo_before_the_catalogue_poll_runs() {
     due(&mut h);
     assert!(!h.state().autosave.busy, "an unchanged editing snapshot must not be written repeatedly");
     assert!(h.state().dirty());
+    let project = dir.path().join("house.bimcraft");
+    assert!(h.state_mut().save_to(&project));
+    assert!(!h.state().dirty(), "manual save records the pending catalogue changes");
 }
 
 #[test]

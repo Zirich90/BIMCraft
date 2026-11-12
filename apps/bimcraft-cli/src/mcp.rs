@@ -44,7 +44,7 @@ undo history, replace it or write over its file is refused.";
 
 /// Where the tools run: on a session of the server's own, or on a window's.
 enum Backend {
-    Own(Session),
+    Own(Box<Session>),
     Window(Window),
 }
 
@@ -154,7 +154,7 @@ impl Server {
         session.dwg = crate::dwg_reader();
         let plugins = crate::load_plugins(&mut session);
         let seen = plugins.log().len();
-        Server { backend: Backend::Own(session), plugins: Some(plugins), seen }
+        Server { backend: Backend::Own(Box::new(session)), plugins: Some(plugins), seen }
     }
 
     /// A server whose tools work on the project `window` has open.
@@ -468,10 +468,11 @@ mod tests {
         let doors = tool(&mut s, "query_elements", json!({"category": "door"}));
         assert_eq!(doors["elements"][0]["at"], json!([3000.0, 0.0]));
         let rooms = tool(&mut s, "schedule", json!({"category": "rooms"}));
-        assert_eq!(rooms["rows"][0][3], 24.0);
+        // The 200 mm walls are centered on the sketch, leaving a 5.8 × 3.8 m interior.
+        assert_eq!(rooms["rows"][0][3], 22.04);
         let big = json!({"name": "Big Rooms", "category": "rooms", "fields": ["Name", {"name": "Cost", "formula": "Area * 100", "total": true}], "filters": [{"field": "Area", "op": "greater", "value": 20}]});
         let big = tool(&mut s, "schedule", big);
-        assert_eq!((big["rows"].clone(), big["totals"].clone()), (json!([["Cabin", 2400.0]]), json!([null, 2400.0])));
+        assert_eq!((big["rows"].clone(), big["totals"].clone()), (json!([["Cabin", 2204.0]]), json!([null, 2204.0])));
         let img = tool(&mut s, "render", json!({"width": 400, "height": 300}));
         assert_eq!((img["type"].as_str(), img["mimeType"].as_str()), (Some("image"), Some("image/png")));
         let r = call(&mut s, 10, "tools/call", json!({"name": "render", "arguments": {"view": "{3D}", "azimuth": 135, "elevation": 20}}));
@@ -629,7 +630,7 @@ mod tests {
         assert_eq!(m["counts"]["wall"], 4);
         assert_eq!(m["counts"]["door"], 1, "what the agent made is in the window's project");
         assert_eq!(tool(&mut s, "query_elements", json!({"category": "room"}))["elements"][0]["name"], "Cabin");
-        assert_eq!(tool(&mut s, "schedule", json!({"category": "rooms"}))["rows"][0][3], 24.0);
+        assert_eq!(tool(&mut s, "schedule", json!({"category": "rooms"}))["rows"][0][3], 22.04);
         let img = tool(&mut s, "render", json!({"width": 400, "height": 300}));
         assert_eq!((img["type"].as_str(), img["mimeType"].as_str()), (Some("image"), Some("image/png")));
         // list_commands is the engine's catalog, with or without a window.

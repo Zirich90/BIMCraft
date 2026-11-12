@@ -212,8 +212,8 @@ transparent), in hidden line and in wireframe too, and point clouds. Sections an
   its levels, walls, floors and ceilings, doors and windows, columns, rooms and roofs (flat ones by footprint, and gables and sheds
   by extrusion) into a project, listing what was left out and why. The desktop app's File > Open takes a `.rvt` too: it is read
   while the window says so, comes in as a new unsaved project, and a "Revit import report" lists what came in and what was left out.
-- **Built for agents.** Every tool, button and field is a command. Agents call any of them with JSON, inspect the model to
-  check their work, and render any view to look at it, over MCP or the CLI.
+- **Built for agents.** Agents call model commands with JSON, inspect the model to check their work, and render views
+  over MCP or the CLI. Some window interactions, including edits to a sketch in progress, live in the desktop UI.
 - **Fast and native.** Pure Rust and egui: no Electron, no web view. Packaged for Windows, Linux and macOS; developed on
   Linux, and the macOS app isn't tried by hand yet.
 - **Free.** MIT OR Apache-2.0, with no account and no subscription.
@@ -473,6 +473,8 @@ or to any MCP client's configuration:
 
 A command that fails comes back as a tool error saying what to fix (`door: no wall at [4000, 3000] on Level 1`), and it
 changes nothing.
+
+For fire alarm and voice alarm work, see the [CLI and MCP workflow](docs/areas/low-voltage-agent.md).
 
 ### On the project you have open
 

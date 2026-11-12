@@ -92,7 +92,7 @@ fn title_of(h: &Harness<BimApp>) -> Rect {
 fn the_title_stays_between_the_quick_access_and_the_caption_buttons_whatever_the_projects_name() {
     let long = "Long ".repeat(40);
     let names = ["House", "A Project With A Rather Long Name For A Small Window, Its Second Phase", long.as_str()];
-    for size in [least(), vec2(1280.0, 800.0)] {
+    for size in [least(), vec2(1280.0, 800.0), vec2(1800.0, 800.0)] {
         for name in names {
             let mut h = own(BOX);
             h.set_size(size);
@@ -103,7 +103,7 @@ fn the_title_stays_between_the_quick_access_and_the_caption_buttons_whatever_the
             let title = title_of(&h);
             let said = format!("{name:?} in {size:?}: the title is {title:?}, between the gear's {gear:?} and the buttons' {captions:?}");
             assert!(title.left() >= gear.right() && title.right() <= captions.left(), "{said}");
-            if name == "House" && size.x > 1000.0 {
+            if name == "House" && size.x == 1800.0 {
                 assert!((title.center().x - size.x / 2.0).abs() < 1.0, "a title that fits is in the window's middle: {said}");
             }
         }

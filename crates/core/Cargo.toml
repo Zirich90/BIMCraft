@@ -20,6 +20,7 @@ encoding_rs = { workspace = true }
 getrandom = { workspace = true }
 tempfile = { workspace = true }
 rayon = { workspace = true }
+ring = { workspace = true }
 ttf-parser = { workspace = true }
 zip = { version = "9.2.0", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"

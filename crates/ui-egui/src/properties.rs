@@ -1029,6 +1029,12 @@ impl BimApp {
         }
         let model = Arc::clone(&self.session.model);
         let subject = self.subject();
+        if let Subject::Element(id) = subject
+            && let Some(Element::FireZone(zone)) = model.elements.get(id)
+        {
+            self.fire_zone_properties(ui, &model, id, zone);
+            return;
+        }
         // A camera view picked on a plan: its Properties are its camera's, the same panel the 3D tab shows for it.
         let camera_view = match subject {
             Subject::Element(id) => matches!(model.elements.get(id), Some(Element::View3D(v)) if v.camera.is_some()),
@@ -1825,6 +1831,102 @@ impl BimApp {
         });
         if let Some(other) = select {
             self.selection = vec![other];
+        }
+    }
+
+    fn fire_zone_properties(&mut self, ui: &mut Ui, model: &Model, id: Id, zone: &bimcraft_core::model::FireZone) {
+        use bimcraft_core::model::{DetectorSpace, FireZoneKind};
+
+        let mut changed = zone.clone();
+        let title = match zone.kind {
+            FireZoneKind::Detection => msg!("Detection Zone"),
+            FireZoneKind::Notification => msg!("Notification Zone"),
+        };
+        ui.heading(t(title));
+        ScrollArea::vertical().show(ui, |ui| {
+            let name = ui.label(t(msg!("Name")));
+            if let Some(value) = self.field(ui, id, "zone_name", changed.name.clone(), name.id, "") {
+                changed.name = value;
+            }
+            for (key, label, dimension) in
+                [("zone_height", msg!("Height"), &mut changed.height), ("zone_base", msg!("Base Offset"), &mut changed.base_offset)]
+            {
+                let label = ui.label(t(label));
+                if let Some(value) = self.field(ui, id, key, model.units.length(*dimension), label.id, "") {
+                    if let Some(mm) = model.units.parse(&value) {
+                        *dimension = mm;
+                    } else {
+                        self.status = Status { text: t(msg!("Enter a valid length.")).to_string(), error: true };
+                    }
+                }
+            }
+            if ui.button(t(msg!("Edit Boundary"))).clicked() {
+                self.edit_boundary();
+            }
+            if zone.kind == FireZoneKind::Detection {
+                let options = [
+                    (None, msg!("Main Space")),
+                    (Some(DetectorSpace::Plenum), msg!("Above Suspended Ceiling")),
+                    (Some(DetectorSpace::Underfloor), msg!("Below Raised Floor")),
+                ];
+                let label = options.iter().find(|(space, _)| *space == changed.space).map_or("", |(_, label)| label);
+                ComboBox::from_id_salt((id, "zone_space")).selected_text(t(label)).show_ui(ui, |ui| {
+                    for (space, label) in options {
+                        ui.selectable_value(&mut changed.space, space, t(label));
+                    }
+                });
+                ui.collapsing(t(msg!("Notify on Fire")), |ui| {
+                    for target in model.rare("fire_zone") {
+                        let Some(Element::FireZone(target_zone)) = model.elements.get(target) else { continue };
+                        if target_zone.kind == FireZoneKind::Notification {
+                            let guid = model.guid(target);
+                            let mut on = changed.notify.contains(&guid);
+                            if ui.checkbox(&mut on, format!("{} ({target})", target_zone.name)).changed() {
+                                changed.notify.retain(|g| *g != guid);
+                                changed.notify.extend(on.then_some(guid));
+                            }
+                        }
+                    }
+                });
+            }
+            ui.collapsing(t(msg!("Room Overrides")), |ui| {
+                let lookup = model.lookup();
+                for room_id in lookup.referrers(&zone.level) {
+                    let Some(Element::Room(room)) = model.elements.get(room_id) else { continue };
+                    if room.level != zone.level {
+                        continue;
+                    }
+                    let guid = model.guid(room_id);
+                    let options = [(None, msg!("By Boundary")), (Some(true), msg!("Include")), (Some(false), msg!("Exclude"))];
+                    let mut rule = options
+                        .iter()
+                        .find(|(value, _)| match value {
+                            Some(true) => changed.include_rooms.contains(&guid),
+                            Some(false) => changed.exclude_rooms.contains(&guid),
+                            None => false,
+                        })
+                        .and_then(|(value, _)| *value);
+                    let was = rule;
+                    let label = options.iter().find(|(value, _)| *value == rule).map_or("", |(_, label)| label);
+                    ui.horizontal(|ui| {
+                        ComboBox::from_id_salt((id, room_id)).selected_text(t(label)).show_ui(ui, |ui| {
+                            for (value, label) in options {
+                                ui.selectable_value(&mut rule, value, t(label));
+                            }
+                        });
+                        ui.label(format!("{} {} ({room_id})", room.number, room.name));
+                    });
+                    if rule != was {
+                        changed.include_rooms.retain(|g| *g != guid);
+                        changed.exclude_rooms.retain(|g| *g != guid);
+                        changed.include_rooms.extend((rule == Some(true)).then_some(guid));
+                        changed.exclude_rooms.extend((rule == Some(false)).then_some(guid));
+                    }
+                }
+            });
+        });
+        if changed != *zone {
+            self.run("fire_zone", json!({"id":id,"zone":changed}));
         }
     }
 

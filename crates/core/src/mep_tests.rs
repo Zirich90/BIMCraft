@@ -703,9 +703,65 @@ fn stage4_round_mount_checks_openings_copy_and_transfer_to_carrier() {
     let g = s.model.run_geom(element).unwrap();
     assert!((g.a[0] - original.a[0] - 100.0).abs() < 1e-8 && (g.a[1] - original.a[1] - 300.0).abs() < 1e-8);
     let carrier = made(&mut s, "cable_carrier", json!({"from_wire":wire,"type":"Tray 100 x 50"}));
-    assert!(s.model.elements.get(carrier).unwrap().run().unwrap().mount.is_none());
+    let mount = s.model.elements.get(carrier).unwrap().run().unwrap().mount.as_ref().unwrap();
+    assert_eq!(mount.host, s.model.guid(wall));
+    assert_eq!(mount.face, "interior");
     assert!(s.model.elements.get(wire).unwrap().run().unwrap().mount.is_none());
     assert_eq!(s.model.run_geom(s.model.elements.get(wire).unwrap()).unwrap(), original);
+}
+
+#[test]
+fn stage4_carrier_from_wire_refuses_a_lateral_offset_on_a_mounted_wire() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    let wire = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500}));
+    run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    let before = s.model.to_json().unwrap();
+    fails(&mut s, "cable_carrier", json!({"from_wire":wire,"type":"Tray 100 x 50","placement":"bottom","local_offset":10}));
+    assert_eq!(s.model.to_json().unwrap(), before);
+}
+
+#[test]
+fn stage4_batch_carrier_shares_an_existing_mounted_carrier_and_keeps_host_support() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    let wire = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500}));
+    run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    let carrier = made(
+        &mut s,
+        "cable_carrier",
+        json!({"points":[[3500,-100],[5000,-100]],"offset":1500,"type":"Tray 100 x 50",
+            "mount":{"host":wall,"face":"interior"}}),
+    );
+    let original_wire = s.model.run_geom(s.model.elements.get(wire).unwrap()).unwrap();
+    let made_ids = ids(&run(&mut s, "cable_carrier", json!({"from_wires":{},"type":"Tray 100 x 50"})));
+    assert!(made_ids.is_empty());
+    let mounted_wire = s.model.elements.get(wire).unwrap().run().unwrap().mount.clone();
+    assert!(mounted_wire.is_none());
+    let carrier_mount = s.model.elements.get(carrier).unwrap().run().unwrap().mount.clone();
+    assert_eq!(carrier_mount.as_ref().unwrap().host, s.model.guid(wall));
+    assert_eq!(carrier_mount.as_ref().unwrap().face, "interior");
+    assert_eq!(s.model.elements.get(wire).unwrap().run().unwrap().carrier, Some(s.model.guid(carrier)));
+    assert_eq!(s.model.run_geom(s.model.elements.get(wire).unwrap()).unwrap(), original_wire);
+}
+
+#[test]
+fn stage4_batch_carrier_creates_a_supported_carrier_when_an_existing_carrier_cannot_keep_it() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    let wire = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500}));
+    run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    let existing = made(&mut s, "cable_carrier", json!({"points":[[3500,-110],[5000,-110]],"offset":1500,"type":"Tray 100 x 50"}));
+    let made_ids = ids(&run(&mut s, "cable_carrier", json!({"from_wires":{},"type":"Tray 100 x 50"})));
+    assert_eq!(made_ids.len(), 1);
+    let created = made_ids[0];
+    let existing_mount = s.model.elements.get(existing).unwrap().run().unwrap().mount.clone();
+    assert!(existing_mount.is_none());
+    let created_mount = s.model.elements.get(created).unwrap().run().unwrap().mount.clone();
+    assert_eq!(created_mount.as_ref().unwrap().host, s.model.guid(wall));
+    assert_eq!(created_mount.as_ref().unwrap().face, "interior");
+    assert_eq!(s.model.elements.get(wire).unwrap().run().unwrap().carrier, Some(s.model.guid(created)));
+    assert!(s.model.elements.get(wire).unwrap().run().unwrap().mount.is_none());
 }
 
 #[test]
@@ -1780,7 +1836,9 @@ fn a_system_an_ifc_file_names_comes_back_on_its_runs_and_a_class_alone_says_the_
         let mut t = Session::new();
         run(&mut t, "open", json!({"path": path}));
         let _ = std::fs::remove_file(&path);
-        let id = t.model.elements.iter().find(|(_, e)| e.category() == c.category).map(|(id, _)| *id);
+        // Without BIMCraft's category property, a round carrier is the same IFC class and predefined type as a conduit.
+        let category = if c.category == "cablecarrier" { "conduit" } else { c.category };
+        let id = t.model.elements.iter().find(|(_, e)| e.category() == category).map(|(id, _)| *id);
         let e = element_json(&t.model, id.unwrap_or_else(|| panic!("a {} came back", c.category)));
         assert_eq!((e["system"].as_str(), e["justify"].as_str()), (Some("Cold water"), Some("centre")), "{}", c.category);
     }

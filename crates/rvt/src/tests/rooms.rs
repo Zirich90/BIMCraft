@@ -59,7 +59,7 @@ fn a_room_comes_in_with_its_number_name_level_and_a_point_inside_its_walls() {
         let [r] = rooms(&i)[..] else { panic!("Revit {release}: {:?}", i.skipped) };
         assert_eq!((r.number.as_str(), r.name.as_str(), r.level), ("101", "Kitchen ☃", level_named(&i, "Level 1")), "Revit {release}");
         let region = i.model.room_region(r).expect("enclosed");
-        assert!((region.area() - 6096.0 * 3048.0).abs() < 1.0, "{}", region.area());
+        assert!((region.area() - (6096.0 - 228.6) * (3048.0 - 228.6)).abs() < 1.0, "{}", region.area());
     }
 }
 
@@ -173,20 +173,23 @@ fn a_value_far_beyond_revits_limits_is_damage_and_never_reaches_the_geometry() {
 #[test]
 fn a_room_whose_middle_is_inside_a_core_standing_free_has_its_point_at_the_nearest_grid_point_outside_it() {
     // A 4 by 4 ft core in the middle of the 20 by 10 ft room: the middle of the box is inside the core, whose region is not the
-    // room's, so the point is the nearest point of the 9 by 9 grid over the box that is outside the core's centre lines (areas are measured there).
+    // room's, so the point is the nearest point of the 9 by 9 grid over the box outside the core's finish faces.
     let mut p = walled(2024);
     enclose(&mut p, 110, [8.0, 3.0, 12.0, 7.0]);
     room(&mut p, 300, "101", "Hall", [0.2, 0.2, 0.0, 19.8, 9.8, 8.0]);
     let i = import(&p);
     let [r] = rooms(&i)[..] else { panic!("{:?}", i.skipped) };
     let region = i.model.room_region(r).expect("enclosed");
-    assert!((region.area() - (6096.0 * 3048.0 - 1219.2 * 1219.2)).abs() < 1.0, "the room round the core: {}", region.area());
+    let finish_area = (6096.0 - 228.6) * (3048.0 - 228.6) - (1219.2_f64 + 228.6).powi(2);
+    assert!((region.area() - finish_area).abs() < 1.0, "the room round the core: {}", region.area());
     // The grid has its points at a ninth of the box, from half a ninth in; the nearest to the middle outside the core, the first.
     let (box_x, box_y) = ((0.2 * 304.8, 19.8 * 304.8), (0.2 * 304.8, 9.8 * 304.8));
     let at = |i: f64, j: f64| (box_x.0 + (box_x.1 - box_x.0) * i / 9.0, box_y.0 + (box_y.1 - box_y.0) * j / 9.0);
     let near = (0..81)
         .map(|k| at((k % 9) as f64 + 0.5, (k / 9) as f64 + 0.5))
-        .filter(|(x, y)| !((8.0 * 304.8..12.0 * 304.8).contains(x) && (3.0 * 304.8..7.0 * 304.8).contains(y)))
+        .filter(|(x, y)| {
+            !((8.0 * 304.8 - 114.3..12.0 * 304.8 + 114.3).contains(x) && (3.0 * 304.8 - 114.3..7.0 * 304.8 + 114.3).contains(y))
+        })
         .map(|(x, y)| (x - 10.0 * 304.8).hypot(y - 5.0 * 304.8))
         .fold(f64::MAX, f64::min);
     let got = (r.point.0 - 10.0 * 304.8).hypot(r.point.1 - 5.0 * 304.8);

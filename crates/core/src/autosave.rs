@@ -55,7 +55,7 @@ pub enum Notice {
     Discovered { generation: u64, result: Result<Vec<Backup>, String> },
 }
 
-type CatalogueSnapshot = (BTreeSet<Guid>, Arc<BTreeMap<Guid, Vec<String>>>);
+type CatalogueSnapshot = (BTreeSet<Guid>, Arc<BTreeMap<Guid, Vec<String>>>, Option<PathBuf>);
 
 enum Job {
     Save(PathBuf, Arc<Model>, Option<CatalogueSnapshot>),
@@ -91,9 +91,10 @@ impl Worker {
                                 lease(&path, &mut leases)?;
                                 let mut session = Session::new();
                                 session.model = model;
-                                if let Some((owned, baseline)) = owned {
+                                if let Some((owned, baseline, catalogue)) = owned {
                                     session.catalogue_owned = owned;
                                     session.catalogue_baseline = baseline;
+                                    session.catalogue_untitled = catalogue;
                                 } else {
                                     session.remember_catalogue();
                                 }
@@ -142,7 +143,11 @@ impl Worker {
 
     /// Preserve session-owned catalogue changes while identifying the original editing snapshot.
     pub fn save_session(&mut self, path: PathBuf, session: &Session) -> Result<bool, String> {
-        self.queue_save(path, Arc::clone(&session.model), Some((session.catalogue_owned.clone(), session.catalogue_baseline.clone())))
+        self.queue_save(
+            path,
+            Arc::clone(&session.model),
+            Some((session.catalogue_owned.clone(), session.catalogue_baseline.clone(), session.catalogue_path().map(Path::to_path_buf))),
+        )
     }
 
     fn queue_save(&mut self, path: PathBuf, model: Arc<Model>, owned: Option<CatalogueSnapshot>) -> Result<bool, String> {

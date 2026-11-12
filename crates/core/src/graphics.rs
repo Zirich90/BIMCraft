@@ -27,7 +27,7 @@ mod fill_tests;
 /// The categories a plan, a section or a 3D view draws, and so may hide and override: those of the
 /// model, then those of the annotation. A family component is of its family's category (see [`COMPONENTS`]); `component`, which
 /// names them all, is no row of its own (see [`COMPONENT`]).
-pub const MODEL: [&str; 46] = [
+pub const MODEL: [&str; 55] = [
     "wall",
     "floor",
     "ceiling",
@@ -70,6 +70,15 @@ pub const MODEL: [&str; 46] = [
     "voiceoutlet",
     "patchpanel",
     "rack",
+    "alarmpanel",
+    "smokedetector",
+    "heatdetector",
+    "callpoint",
+    "sounder",
+    "exitsign",
+    "speaker",
+    "motiondetector",
+    "camera",
     "stair",
     "ramp",
     "railing",
@@ -81,7 +90,7 @@ pub const MODEL: [&str; 46] = [
 pub const COMPONENT: &str = "component";
 /// The categories of family components, the names a family's category goes by in a file: one row each in Visibility/Graphics
 /// and Object Styles, in [`MODEL`]. A door's or a window's family is placed in a wall as a door or a window, so it has none.
-pub const COMPONENTS: [&str; 18] = [
+pub const COMPONENTS: [&str; 27] = [
     "furniture",
     "casework",
     "plumbing",
@@ -100,6 +109,15 @@ pub const COMPONENTS: [&str; 18] = [
     "voiceoutlet",
     "patchpanel",
     "rack",
+    "alarmpanel",
+    "smokedetector",
+    "heatdetector",
+    "callpoint",
+    "sounder",
+    "exitsign",
+    "speaker",
+    "motiondetector",
+    "camera",
 ];
 pub const ANNOTATION: [&str; 10] = ["dimension", "tag", "text", "line", "region", "spot", "grid", "level", "section", "elevation"];
 /// The point clouds, which views hide and override as Revit's Visibility/Graphics does on a tab of their own: not a model
@@ -170,15 +188,15 @@ pub fn component_category(category: crate::family::Category) -> Option<&'static 
         C::VoiceOutlet => "voiceoutlet",
         C::PatchPanel => "patchpanel",
         C::Rack => "rack",
-        C::AlarmPanel
-        | C::SmokeDetector
-        | C::HeatDetector
-        | C::CallPoint
-        | C::Sounder
-        | C::ExitSign
-        | C::Speaker
-        | C::MotionDetector
-        | C::Camera => "generic",
+        C::AlarmPanel => "alarmpanel",
+        C::SmokeDetector => "smokedetector",
+        C::HeatDetector => "heatdetector",
+        C::CallPoint => "callpoint",
+        C::Sounder => "sounder",
+        C::ExitSign => "exitsign",
+        C::Speaker => "speaker",
+        C::MotionDetector => "motiondetector",
+        C::Camera => "camera",
         C::Door | C::Window => return None,
     })
 }

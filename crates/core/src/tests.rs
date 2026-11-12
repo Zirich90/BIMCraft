@@ -448,6 +448,7 @@ fn undo_and_redo_back_to_a_model_that_passed_the_check_dont_check_it_again() {
 #[test]
 fn rooms_need_walls_around_them_and_follow_the_walls() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     // Outside the walls it is placed unbounded, with a warning; taken back.
     let made = run(&mut s, "room", json!({"point": [9000, 1000]}));
@@ -520,6 +521,7 @@ fn element(s: &mut Session, id: u64) -> Value {
 #[test]
 fn moving_a_wall_drags_the_walls_joined_to_it_and_the_rooms_follow() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     let ids = house(&mut s);
     let part = run(&mut s, "wall", json!({"points": [[0, 3000], [8000, 3000]], "type": "Interior - 100mm"}))["ids"][0].as_u64().unwrap();
     let room = run(&mut s, "room", json!({"point": [4000, 1500]}))["id"].as_u64().unwrap();
@@ -658,6 +660,7 @@ fn trim_to_corner_extends_or_trims_two_walls_to_meet() {
 #[test]
 fn split_cuts_a_wall_in_two_and_its_doors_go_with_their_part() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     let ids = house(&mut s);
     let room = run(&mut s, "room", json!({"point": [4000, 3000]}))["id"].as_u64().unwrap();
     let door = run(&mut s, "door", json!({"at": [2000, 0]}))["id"].as_u64().unwrap();
@@ -1037,7 +1040,8 @@ fn project_parameters_give_the_elements_of_their_categories_values_of_their_own(
 /// Two rooms, Kitchen (18 m²) and Living (30 m²), and three doors: D2 and two numbered ones.
 fn flat(s: &mut Session) {
     s.script(
-        r#"wall {"points": [[0,0],[8000,0],[8000,6000],[0,6000]], "closed": true}
+        r#"room_area {"at": "centre"}
+           wall {"points": [[0,0],[8000,0],[8000,6000],[0,6000]], "closed": true}
            wall {"points": [[5000,0],[5000,6000]], "type": "Interior - 100mm"}
            room {"point": [6500, 3000], "name": "Kitchen"}
            room {"point": [2000, 3000], "name": "Living", "number": "10"}
@@ -2582,6 +2586,7 @@ fn temp(name: &str) -> std::path::PathBuf {
 #[test]
 fn plans_have_a_view_range_that_modify_merges_into() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     // Revit's: cut 1200 mm up, the top at the level above, the bottom and the view depth at the level.
     assert_eq!(element(&mut s, 100_000)["view_range"], json!({"top": null, "cut": 1200.0, "bottom": 0.0, "depth": 0.0}));
@@ -2980,7 +2985,7 @@ fn the_sample_house_builds_with_four_rooms() {
     assert_eq!(i["counts"]["ceiling"].as_u64(), Some(4), "a ceiling in every room");
     let rooms = run(&mut s, "schedule", json!({"category": "rooms"}));
     let areas: Vec<f64> = rooms["rows"].as_array().unwrap().iter().map(|r| r[3].as_f64().unwrap()).collect();
-    assert_eq!(areas, [24.0, 18.0, 14.0, 14.0]);
+    assert_eq!(areas, [22.04, 16.24, 12.54, 12.54]);
 }
 
 #[test]
@@ -3683,6 +3688,7 @@ fn walls_stand_on_their_location_line_with_their_exterior_to_the_left() {
 #[test]
 fn curved_walls_bound_rooms_and_carry_openings_along_their_arc() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     // A room closed on the east by a half circle 3 m across: turning left from south to north, it bulges east.
     run(&mut s, "wall", json!({"points": [[4000, 3000], [0, 3000], [0, 0], [4000, 0]]}));
     let arc = run(&mut s, "wall", json!({"points": [[4000, 0], [4000, 3000]], "arc": 180}))["ids"][0].as_u64().unwrap();
@@ -6155,6 +6161,7 @@ fn each_undo_step_says_what_it_made_or_took_away_and_undo_and_redo_go_back_sever
 #[test]
 fn room_separators_split_rooms_without_walls_and_survive_ifc() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     let r = run(&mut s, "room", json!({"point": [2000, 3000], "name": "Living"}));
     assert_eq!(r["area_m2"], 48.0);
@@ -6197,12 +6204,13 @@ fn room_separators_split_rooms_without_walls_and_survive_ifc() {
     let rooms = run(&mut t, "elements", json!({"category": "room"}));
     let mut areas: Vec<f64> = rooms["elements"].as_array().unwrap().iter().filter_map(|r| r["area_m2"].as_f64()).collect();
     areas.sort_by(f64::total_cmp);
-    assert_eq!(areas, vec![18.0, 30.0]);
+    assert_eq!(areas, vec![16.82, 28.42], "the imported project uses finish faces");
 }
 
 #[test]
 fn a_separator_drawn_to_the_wall_faces_splits_rooms_measured_at_the_centre_lines_too() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     let half = run(&mut s, "elements", json!({"category": "wall"}))["elements"][0]["thickness"].as_f64().unwrap() / 2.0;
     // Drawn from face to face, as on a plan, and one more at a slant from a face to the first line.
@@ -6236,6 +6244,7 @@ fn a_separator_drawn_to_the_wall_faces_splits_rooms_measured_at_the_centre_lines
 #[test]
 fn a_wall_that_is_not_room_bounding_lets_rooms_run_past_it() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     // A partition at x = 5000 splits the house in two.
     let partition = run(&mut s, "wall", json!({"points": [[5000, 0], [5000, 6000]]}))["ids"][0].as_u64().unwrap();
@@ -6272,11 +6281,12 @@ fn a_wall_that_is_not_room_bounding_lets_rooms_run_past_it() {
 #[test]
 fn rooms_measure_at_the_wall_centre_lines_or_at_their_faces() {
     let mut s = Session::new();
+    run(&mut s, "room_area", json!({"at": "centre"}));
     house(&mut s);
     let t = run(&mut s, "elements", json!({"category": "wall"}))["elements"][0]["thickness"].as_f64().unwrap();
     run(&mut s, "room", json!({"point": [4000, 3000], "name": "Living"}));
     let area = |s: &mut Session| run(s, "elements", json!({"category": "room"}))["elements"][0]["area_m2"].as_f64().unwrap();
-    assert_eq!(run(&mut s, "room_area", json!({}))["at"], "centre", "as a project starts");
+    assert_eq!(run(&mut s, "room_area", json!({}))["at"], "centre");
     assert_eq!(area(&mut s), 48.0);
     // At the faces: the floor inside the walls, half a wall in from each centre line.
     assert_eq!(run(&mut s, "room_area", json!({"at": "finish"}))["at"], "finish");

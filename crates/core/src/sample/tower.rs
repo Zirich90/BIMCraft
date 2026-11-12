@@ -791,7 +791,7 @@ mod tests {
         // standing on its outer ring, which bound rooms (as Revit's do): half of each along its sides, a quarter at its
         // corners.
         let corridor = all.iter().find(|r| r.name == "Corridor").unwrap();
-        let area = m.room_region(corridor).unwrap().area();
+        let area = m.room_region_at(corridor, crate::model::RoomArea::Centre).unwrap().area();
         let Plate { width, depth } = Plate::REFERENCE;
         let ring = (width - 12_000) * (depth - 12_000) - (width - 16_000) * (depth - 16_000);
         let column = m.elements.values().find(|e| e.category() == "structuralcolumn").map(|e| geom::area(&m.column_outline(e)).abs());

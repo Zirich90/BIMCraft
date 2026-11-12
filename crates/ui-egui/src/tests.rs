@@ -61,6 +61,14 @@ fn press(h: &mut Harness<BimApp>, label: &str) {
     h.run();
 }
 
+fn press_ribbon(h: &mut Harness<BimApp>, panel: &str, label: &str) {
+    if h.query_by_label(label).is_some() {
+        press(h, label);
+    } else {
+        from_list(h, panel, label);
+    }
+}
+
 /// One of Manage > Annotation Settings' dialogs (Line Weights, Line Styles, Line Patterns, Fill Patterns), from its list.
 fn annotation(h: &mut Harness<BimApp>, item: &str) {
     if h.query_by_label("Annotation Settings").is_none() {
@@ -589,7 +597,7 @@ fn a_flick_on_a_sheets_view_selects_it_and_does_not_move_it() {
     press(&mut h, "View");
     press(&mut h, "Sheet");
     press(&mut h, "View");
-    press(&mut h, "Place View");
+    press_ribbon(&mut h, "Sheet Composition", "Place View");
     press(&mut h, "Floor Plan: Level 1");
     let vp = ids(&h, "viewport")[0];
     let at = field(&h, vp, "at");
@@ -633,9 +641,9 @@ fn doors_and_windows_go_into_the_wall_clicked() {
 fn rooms_go_where_clicked_and_their_area_follows_the_walls() {
     let mut h = app(BOX);
     tool(&mut h, "Room");
-    click(&mut h, P2(2000.0, 3000.0));
+    click(&mut h, P2(1800.0, 3000.0));
     let room = ids(&h, "room")[0];
-    assert_eq!(field(&h, room, "area_m2"), json!(48.0));
+    assert_eq!(field(&h, room, "area_m2"), json!(45.24));
     // A partition clicked a little off the walls' centre lines, away from their middles: its ends
     // snap onto them, so it meets them and splits the room.
     tool(&mut h, "Wall");
@@ -643,7 +651,7 @@ fn rooms_go_where_clicked_and_their_area_follows_the_walls() {
     click(&mut h, P2(2040.0, 5970.0));
     key(&mut h, Key::Enter);
     assert_eq!(walls(&h).last(), Some(&(P2(2040.0, 0.0), P2(2040.0, 6000.0))));
-    assert_eq!(field(&h, room, "area_m2"), json!(12.24));
+    assert_eq!(field(&h, room, "area_m2"), json!(10.67));
 }
 
 #[test]
@@ -1147,7 +1155,11 @@ fn the_ribbon_has_revit_tabs_and_a_contextual_tab_for_the_tool_or_selection() {
     press(&mut h, "Delete");
     assert_eq!(ids(&h, "wall").len(), walls_before - 1, "the contextual tab's Delete");
     press(&mut h, "View");
-    for label in ["Thin Lines", "Schedules", "Close Inactive", "User Interface"] {
+    for label in ["Thin Lines", "Schedules"] {
+        assert!(h.query_by_label(label).is_some(), "{label}");
+    }
+    press(&mut h, "Windows ▾");
+    for label in ["Close Inactive", "User Interface"] {
         assert!(h.query_by_label(label).is_some(), "{label}");
     }
 }
@@ -1221,7 +1233,7 @@ fn views_open_in_tabs_that_switch_and_close() {
     press(&mut h, "Close Room Schedule");
     assert!(h.query_by_label("Close Room Schedule").is_none());
     press(&mut h, "View");
-    press(&mut h, "Close Inactive");
+    press_ribbon(&mut h, "Windows", "Close Inactive");
     assert!(h.query_by_label("Close Level 2").is_none(), "only the active view stays open");
     assert!(h.query_by_label("Close Level 1").is_none(), "and the last view can't close");
     assert_eq!(h.state().sheet, Sheet::Plan(100000));
@@ -1272,7 +1284,7 @@ fn dragging_a_wall_moves_it_and_the_walls_and_room_around_follow() {
     drag(&mut h, P2(8000.0, 3000.0), P2(9000.0, 3000.0));
     assert_eq!(walls(&h)[1], (P2(9000.0, 0.0), P2(9000.0, 6000.0)));
     assert_eq!(walls(&h)[0], (P2(0.0, 0.0), P2(9000.0, 0.0)), "the corner went along");
-    assert_eq!(field(&h, room, "area_m2"), json!(54.0));
+    assert_eq!(field(&h, room, "area_m2"), json!(51.04));
     assert_eq!(h.state().session.history().last(), Some(&"Move"));
 }
 
@@ -2245,7 +2257,7 @@ fn sheets_take_views_from_the_view_tab_and_viewports_move_and_open() {
     assert_eq!(h.query_all_by_label("A101 - Unnamed").count(), 2, "its entry in the browser, and its tab");
     // Place View offers the views on no sheet yet.
     press(&mut h, "View");
-    press(&mut h, "Place View");
+    press_ribbon(&mut h, "Sheet Composition", "Place View");
     press(&mut h, "Floor Plan: Level 1");
     let vp = ids(&h, "viewport");
     assert_eq!((vp.len(), field(&h, vp[0], "view")), (1, json!(100000)));
@@ -2755,14 +2767,14 @@ fn place_view_puts_schedules_and_the_3d_view_on_sheets() {
     press(&mut h, "Sheet");
     for view in ["Schedule: Room Schedule", "3D View: {3D}"] {
         press(&mut h, "View");
-        press(&mut h, "Place View");
+        press_ribbon(&mut h, "Sheet Composition", "Place View");
         press(&mut h, view);
     }
     let (schedules, views) = (ids(&h, "schedule"), ids(&h, "view3d"));
     assert_eq!((schedules.len(), views.len(), ids(&h, "viewport").len()), (1, 1, 2));
     // Placed, they're no longer offered.
     press(&mut h, "View");
-    press(&mut h, "Place View");
+    press_ribbon(&mut h, "Sheet Composition", "Place View");
     assert!(h.query_by_label("Schedule: Room Schedule").is_none() && h.query_by_label("Schedule: Door Schedule").is_some());
     key(&mut h, Key::Escape);
     // A double click on the schedule opens it.
@@ -2818,7 +2830,7 @@ fn lengths_typed_while_drawing_read_in_the_project_units() {
 fn the_interface_speaks_portuguese() {
     let mut h = app(BOX);
     press(&mut h, "View");
-    press(&mut h, "User Interface");
+    press_ribbon(&mut h, "Windows", "User Interface");
     press(&mut h, "Português (Brasil)");
     for label in ["Arquitetura", "Anotar", "Vista", "Gerenciar", "Modificar", "Propriedades", "Plantas de piso", "Intervalo da vista"] {
         assert!(h.query_by_label(label).is_some(), "{label}");
@@ -2842,7 +2854,7 @@ fn the_interface_speaks_portuguese() {
 fn the_interface_speaks_spanish() {
     let mut h = app(BOX);
     press(&mut h, "View");
-    press(&mut h, "User Interface");
+    press_ribbon(&mut h, "Windows", "User Interface");
     press(&mut h, "Español");
     for label in ["Arquitectura", "Anotar", "Vista", "Gestionar", "Modificar", "Propiedades", "Plantas", "Rango de vista"] {
         assert!(h.query_by_label(label).is_some(), "{label}");
@@ -2862,7 +2874,7 @@ fn the_interface_speaks_spanish() {
 fn the_interface_speaks_dutch() {
     let mut h = app(BOX);
     press(&mut h, "View");
-    press(&mut h, "User Interface");
+    press_ribbon(&mut h, "Windows", "User Interface");
     press(&mut h, "Nederlands");
     assert_eq!(h.state().lang, crate::lang::Lang::Dutch);
     for label in ["Architectuur", "Annoteren", "Beheren", "Wijzigen", "Eigenschappen", "Plattegronden", "Weergavebereik"] {
@@ -3870,7 +3882,8 @@ fn a_schedule_of_the_projects_own_is_deleted_from_the_browser_and_its_tab_closes
 #[test]
 fn a_new_schedule_takes_its_fields_filter_and_sorting_from_schedule_properties() {
     use bimcraft_core::schedule::{Filter, Op, Sort};
-    let rooms = r#"wall {"points": [[5000,0],[5000,6000]], "type": "Interior - 100mm"}
+    let rooms = r#"room_area {"at": "centre"}
+wall {"points": [[5000,0],[5000,6000]], "type": "Interior - 100mm"}
 room {"point": [6500, 3000], "name": "Kitchen"}
 room {"point": [2000, 3000], "name": "Living"}"#;
     let mut h = app_at(&format!("{BOX}\n{rooms}"), 0.05);
@@ -3933,7 +3946,7 @@ room {"point": [2000, 3000], "name": "Living"}"#;
     press(&mut h, "View");
     press(&mut h, "Sheet");
     press(&mut h, "View");
-    press(&mut h, "Place View");
+    press_ribbon(&mut h, "Sheet Composition", "Place View");
     press(&mut h, "Schedule: Room Areas");
     let vp = ids(&h, "viewport")[0];
     let at = field(&h, vp, "at");
@@ -6840,14 +6853,14 @@ fn room_area_computation_is_set_from_manage_and_undone() {
     h.set_size(vec2(1800.0, 900.0));
     h.state_mut().tab = Tab::Manage;
     h.run();
-    assert_eq!(h.state().session.model.room_area, RoomArea::Centre);
+    assert_eq!(h.state().session.model.room_area, RoomArea::Finish);
     press(&mut h, "Room Area Computation");
     assert!(h.query_by_label("At wall centre line").is_some(), "both choices are on screen");
-    press(&mut h, "At wall finish");
-    assert_eq!(h.state().session.model.room_area, RoomArea::Finish);
+    press(&mut h, "At wall centre line");
+    assert_eq!(h.state().session.model.room_area, RoomArea::Centre);
     h.state_mut().run("undo", json!({}));
     h.run();
-    assert_eq!(h.state().session.model.room_area, RoomArea::Centre);
+    assert_eq!(h.state().session.model.room_area, RoomArea::Finish);
 }
 
 mod background_grid;

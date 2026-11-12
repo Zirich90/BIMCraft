@@ -8,11 +8,12 @@
 //! in BIMCraft, and nothing here draws its outline for it. Making the regions of a level is what costs, and a room tries a grid
 //! of points, so a level's faces are made once for all its rooms.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use bimcraft_core::geom::{self, P2};
 use bimcraft_core::ids::Guid;
-use bimcraft_core::model::{Element, Room, TOL};
+use bimcraft_core::model::{Element, Room, RoomArea};
+use bimcraft_core::rooms::Rooms;
 
 use crate::import::{Facts, Import, clip, point};
 use crate::inventory::{Gathered, Wants};
@@ -30,9 +31,9 @@ pub(crate) fn wanted(f: &Facts, out: &mut Wants) {
     out.rooms.extend(f.of_category(OST_ROOMS).map(|r| r.id));
 }
 
-/// A point of `room`'s box in plan that the walls of its level (`all`, the faces they make) enclose in a region as big as the
+/// A point of `room`'s box in plan that the finish faces of its level enclose in a region as big as the
 /// box, the nearest to its middle.
-fn point_in(all: &[Vec<P2>], r: &Record) -> Option<P2> {
+fn point_in(rooms: &Rooms<'_>, level: Guid, r: &Record) -> Option<P2> {
     let (lo, hi) = (point(r.bbox[0], r.bbox[1]), point(r.bbox[3], r.bbox[4]));
     let middle = P2((lo.0 + hi.0) / 2.0, (lo.1 + hi.1) / 2.0);
     let mut candidates: Vec<P2> = (0..GRID * GRID)
@@ -43,7 +44,7 @@ fn point_in(all: &[Vec<P2>], r: &Record) -> Option<P2> {
         .collect();
     candidates.sort_by(|a, b| a.dist(middle).total_cmp(&b.dist(middle)));
     std::iter::once(middle).chain(candidates).find(|p| {
-        let Some(region) = geom::region_in(all, *p, TOL) else { return false };
+        let Some(region) = rooms.region_at_point(level, *p, RoomArea::Finish) else { return false };
         let (mut a, mut b) = (P2(f64::MAX, f64::MAX), P2(f64::MIN, f64::MIN));
         for q in &region.outer {
             (a, b) = (P2(a.0.min(q.0), a.1.min(q.1)), P2(b.0.max(q.0), b.1.max(q.1)));
@@ -57,7 +58,8 @@ pub(crate) fn import(cx: &mut Import, f: &Facts, g: &Gathered) {
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     // The faces of each level's walls, made once for all its rooms: a room tries a grid of points, and the walls of a level do
     // not change as rooms come in.
-    let mut faces: BTreeMap<Guid, Vec<Vec<P2>>> = BTreeMap::new();
+    let rooms = Rooms::new(&cx.model);
+    let mut imported = Vec::new();
     for r in f.of_category(OST_ROOMS) {
         if !seen.insert(r.id) {
             continue;
@@ -65,19 +67,21 @@ pub(crate) fn import(cx: &mut Import, f: &Facts, g: &Gathered) {
         let made = (|| -> Result<Room, String> {
             let (base, _) = constraints(r, &f.elevations);
             let level = base.and_then(|b| cx.levels.get(&b).copied()).ok_or("it stands on no level")?;
-            let all = faces.entry(level).or_insert_with(|| geom::faces(&cx.model.bounding_lines(level), TOL));
-            let point = point_in(all, r)
+            let point = point_in(&rooms, level, r)
                 .ok_or("the walls imported do not enclose its box (curtain walls and room separation lines are not imported)")?;
             let (number, name) = g.rooms.get(&r.id).cloned().unwrap_or_default();
             let name = if name.trim().is_empty() { "Room".to_string() } else { clip(&name) };
             Ok(Room::new(level, point, name, clip(&number)))
         })();
+        imported.push((r.id, made));
+    }
+    for (source, made) in imported {
         match made {
             Ok(room) => {
                 let id = cx.model.insert(Element::Room(room));
-                cx.from.insert(id, format!("Room {}", r.id));
+                cx.from.insert(id, format!("Room {source}"));
             }
-            Err(why) => cx.left_out("room", r.id, &why),
+            Err(why) => cx.left_out("room", source, &why),
         }
     }
 }

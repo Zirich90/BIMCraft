@@ -279,7 +279,7 @@ impl Session {
     }
 
     /// Opaque token for this live snapshot, not stored in project files or undo history.
-    /// Re-entering an older snapshot after an observed edit receives a new token too.
+    /// Every committed edit invalidates the previous token, including Undo and Redo.
     pub fn revision(&mut self) -> crate::ids::Guid {
         let snapshot = Arc::downgrade(&self.model);
         if let Some((previous, token)) = &self.revision_snapshot
@@ -646,6 +646,9 @@ impl Session {
             }
             Ok(v) => {
                 self.verified = Some(Arc::clone(&self.model));
+                if !Arc::ptr_eq(&before, &self.model) {
+                    self.revision_snapshot = None;
+                }
                 if cmd.undoable && !Arc::ptr_eq(&before, &self.model) {
                     let step = Step { checked: verified, ..Step::new(cmd.label, &before, &self.model) };
                     self.undo.push((step, before));
@@ -686,6 +689,9 @@ impl Session {
             }
             Ok(v) => {
                 self.verified = Some(Arc::clone(&self.model));
+                if !Arc::ptr_eq(&before, &self.model) {
+                    self.revision_snapshot = None;
+                }
                 Ok(v)
             }
         }

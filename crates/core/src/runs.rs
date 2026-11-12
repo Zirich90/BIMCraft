@@ -14,6 +14,12 @@ mod device_exit;
 pub(crate) use connections::bend_fits;
 
 impl Model {
+    pub(crate) fn fixed_wire_contact(&self, component: &Component, [x, y, z]: P3) -> P3 {
+        let y = if component.mirrored { -y } else { y };
+        let (sin, cos) = component.angle.to_radians().sin_cos();
+        [component.at.0 + x * cos - y * sin, component.at.1 + x * sin + y * cos, self.elevation(component.level) + component.offset + z]
+    }
+
     /// Local height of the point used when fitting a component to a named face.
     pub fn component_contact_height(&self, component: &Component, face: &str) -> f64 {
         match face {
@@ -411,8 +417,16 @@ impl Model {
         // Deleting equipment disconnects its owned legs. An arbitrary missing reference is still an error.
         let removed: Vec<_> =
             before.elements.iter().filter(|(id, _)| self.elements.get(**id).is_none()).map(|(id, _)| before.guid(*id)).collect();
-        for (_, element) in self.elements.iter_mut() {
-            if let Element::Wire(run) = element {
+        let disconnected: Vec<_> = self
+            .elements
+            .iter()
+            .filter_map(|(&id, element)| match element {
+                Element::Wire(run) if run.connections.iter().any(|c| removed.contains(&c.device)) => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in disconnected {
+            if let Some(Element::Wire(run)) = self.elements.get_mut(id) {
                 run.connections.retain(|c| !removed.contains(&c.device));
             }
         }
@@ -461,16 +475,7 @@ impl Model {
                     }
                     (solved.device, solved.target, solved.elbow, Some(solved.normal))
                 } else {
-                    let [x, mut y, z] = connection.point;
-                    if component.mirrored {
-                        y = -y;
-                    }
-                    let (sin, cos) = component.angle.to_radians().sin_cos();
-                    let device = [
-                        component.at.0 + x * cos - y * sin,
-                        component.at.1 + x * sin + y * cos,
-                        self.elevation(component.level) + component.offset + z,
-                    ];
+                    let device = self.fixed_wire_contact(component, connection.point);
                     let dx = geometry.b[0] - geometry.a[0];
                     let dy = geometry.b[1] - geometry.a[1];
                     let flat = dx * dx + dy * dy;

@@ -119,7 +119,7 @@ pub const MAX_SLOPE: f64 = 75.0;
 /// 2: the library has ids and GUIDs too
 /// (`library`), and what names a library entry holds its GUID. 1: elements have GUIDs, ids six digits, and what points at
 /// an element holds its GUID. None (0): a file from before.
-pub const FORMAT: u32 = 22;
+pub const FORMAT: u32 = 27;
 /// How far past the model a level reaches without an extent of its own, mm.
 pub const LEVEL_PAST: f64 = 1000.0;
 
@@ -1350,6 +1350,52 @@ pub struct Link {
     pub at: P2,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub angle: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) detector_groups: Vec<IfcDetectorGroup>,
+}
+
+pub(crate) const MAX_IFC_DETECTOR_GROUPS: usize = 32;
+pub(crate) const MAX_DETECTORS: usize = 2000;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IfcDetectorGroup {
+    pub room: Guid,
+    pub ids: Vec<Guid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<[IfcSlab; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heat: Option<HeatEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IfcSlab {
+    Local(Guid),
+    Linked(Guid),
+}
+
+impl IfcSlab {
+    pub(crate) fn guid(self) -> Guid {
+        match self {
+            Self::Local(guid) | Self::Linked(guid) => guid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HeatEvidence {
+    pub class: String,
+    pub trip_c: f64,
+    pub normal_c: f64,
+    pub max_c: f64,
+    pub rated_normal_c: Option<f64>,
+    pub rated_max_c: Option<f64>,
 }
 
 /// A schedule view: the elements of category `of` in rows, as the `schedule` command lists them:
@@ -1701,6 +1747,9 @@ pub struct ElectricalLine {
     pub branches: Vec<ElectricalBranch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub segments: Vec<Guid>,
+    /// Confirmed standalone short-circuit isolators, separate from the addressed device order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub isolators: Vec<Guid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub terminals: Vec<Guid>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1880,9 +1929,58 @@ pub struct Component {
     pub provision: Option<Provision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount: Option<RunMount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_space: Option<DetectorSpace>,
     /// Empty means any side; directions belong to the equipment, not the view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_sides: Vec<DeviceSide>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectorSpace {
+    Plenum,
+    Underfloor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FireZoneKind {
+    Detection,
+    Notification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FireZoneUnit {
+    Dwelling,
+    Apartment,
+    HotelRoom,
+}
+
+/// A volume and room overrides for an alarm or notification zone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FireZone {
+    pub name: String,
+    pub kind: FireZoneKind,
+    pub level: Guid,
+    pub boundary: Vec<P2>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base_offset: f64,
+    pub height: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<DetectorSpace>,
+    /// One complete dwelling, apartment or hotel room under SP 484, 6.3.4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<FireZoneUnit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_rooms: Vec<Guid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_rooms: Vec<Guid>,
+    /// Notification zones activated by a fire event in this detection zone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<Guid>,
 }
 
 /// A billable equipment position, including items without a location in the building.
@@ -2325,7 +2423,18 @@ macro_rules! visit_refs {
                     f(g)
                 }
             }
-            Element::Grid(_) | Element::Sheet(_) | Element::Schedule(_) | Element::Link(_) => {}
+            Element::Grid(_) | Element::Sheet(_) | Element::Schedule(_) => {}
+            Element::Link(l) => {
+                for group in & $($m)? l.detector_groups {
+                    f(& $($m)? group.room);
+                    for id in & $($m)? group.ids { f(id); }
+                    if let Some(bounds) = & $($m)? group.space {
+                        for bound in bounds {
+                            if let IfcSlab::Local(id) = bound { f(id); }
+                        }
+                    }
+                }
+            }
             Element::PlanView(v) => {
                 f(& $($m)? v.level);
                 if let Some(g) = & $($m)? v.parent { f(g) }
@@ -2340,6 +2449,12 @@ macro_rules! visit_refs {
             Element::Room(Room { level, top_level, .. }) => {
                 f(level);
                 if let Some(g) = top_level { f(g) }
+            }
+            Element::FireZone(zone) => {
+                f(& $($m)? zone.level);
+                for g in & $($m)? zone.include_rooms { f(g); }
+                for g in & $($m)? zone.exclude_rooms { f(g); }
+                for g in & $($m)? zone.notify { f(g); }
             }
             Element::Shaft(Shaft { level, top_level, .. })
             | Element::Mass(Mass { level, top_level, .. })
@@ -2378,6 +2493,7 @@ macro_rules! visit_refs {
                     for device in & $($m)? branch.devices { f(device); }
                 }
                 for segment in & $($m)? line.segments { f(segment); }
+                for isolator in & $($m)? line.isolators { f(isolator); }
                 for entry in & $($m)? line.locked_marks { f(& $($m)? entry.device); }
             }
             run_arm!(r) => {
@@ -2455,6 +2571,8 @@ pub enum Element {
     Door(Opening),
     Window(Opening),
     Room(Room),
+    #[serde(rename = "fire_zone")]
+    FireZone(FireZone),
     /// A room separation line: it bounds rooms and builds nothing.
     #[serde(rename = "roomseparator")]
     RoomSeparator(RoomSeparator),
@@ -2709,6 +2827,7 @@ impl Element {
             Element::Door(_) => "door",
             Element::Window(_) => "window",
             Element::Room(_) => "room",
+            Element::FireZone(_) => "fire_zone",
             Element::RoomSeparator(_) => "roomseparator",
             Element::Rebar(_) => "rebar",
             Element::Dimension(_) => "dimension",
@@ -3162,6 +3281,8 @@ pub struct Model {
     pub language: Language,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carrier_settings: Option<CarrierSettings>,
+    #[serde(default)]
+    pub fire_standard: crate::standards::FireStandard,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub electrical_mark_templates: BTreeMap<String, String>,
     /// Cancelled catalogue identities awaiting cleanup; these are tombstones, not element references.
@@ -3338,11 +3459,13 @@ impl Model {
             units: Units::default(),
             language,
             carrier_settings: None,
+            fire_standard: crate::standards::FireStandard::default(),
             electrical_mark_templates: BTreeMap::new(),
             catalogue_retired: BTreeSet::new(),
             catalogue_unexported: BTreeSet::new(),
             catalogue_pending_edits: BTreeMap::new(),
-            room_area: RoomArea::default(),
+            // A missing setting in a saved file still means centre lines for compatibility.
+            room_area: RoomArea::Finish,
             next_id: FIRST_ID,
             types: Types::default().into(),
             materials: BTreeMap::new().into(),
@@ -4272,6 +4395,10 @@ impl Model {
         // file of 17 holds no title blocks, its sheets keeping the built-in one, no `join`, which reads as joining, as it always
         // did, and none of its dimensions measures `across`.
         // 22 combines the upstream and low-voltage schemas. Missing fork fields keep their legacy defaults.
+        // 22 to 23: detectors without an explicit space still belong to the main room.
+        // 24 to 25: lines from older files have no recorded standalone short-circuit isolators.
+        // 25 to 26: links from older files have no recorded detector groups.
+        // In format 27 the missing fire zone unit defaults to None, retaining single-level membership.
         self.format = FORMAT;
     }
 
@@ -5028,6 +5155,7 @@ impl Model {
             Element::Shaft(sh) => Some(sh.level),
             Element::Mass(ms) => Some(ms.level),
             Element::Room(r) => Some(r.level),
+            Element::FireZone(zone) => Some(zone.level),
             Element::RoomSeparator(rs) => Some(rs.level),
             Element::Rebar(rb) => Some(rb.level),
             Element::Dimension(d) => Some(d.level),
@@ -7128,6 +7256,16 @@ impl Model {
             if line.order(self).len() != devices.len() {
                 return Err("Electrical line branches must connect to the source without cycles".into());
             }
+            if line.isolators.len() > MAX_POINTS
+                || line
+                    .isolators
+                    .iter()
+                    .any(|&g| !devices.insert(g) || !matches!(self.elements.get(g), Some(Element::Component(c)) if c.is_placed()))
+            {
+                return Err(
+                    "Electrical line standalone isolators must be distinct placed components outside the addressed device order".into()
+                );
+            }
             let mut segments = BTreeSet::new();
             if line.segments.len() > MAX_POINTS
                 || line
@@ -7154,6 +7292,7 @@ impl Model {
                 text("Electrical line", "locked mark", &entry.mark)?;
                 if entry.mark.trim().is_empty()
                     || !devices.contains(&entry.device)
+                    || line.isolators.contains(&entry.device)
                     || !marked_devices.insert(entry.device)
                     || !marks.insert(&entry.mark)
                 {
@@ -7628,6 +7767,48 @@ impl Model {
         phasing::check_order(self, &who, e)?;
         match e {
             Element::ElectricalLine(_) => {}
+            Element::FireZone(zone) => {
+                level_ok(zone.level)?;
+                text(&who, "name", &zone.name)?;
+                if zone.name.trim().is_empty() {
+                    return Err(format!("{who}: name the fire zone"));
+                }
+                coord(&format!("{who} base offset"), zone.base_offset)?;
+                size(&format!("{who} height"), zone.height)?;
+                coord(&format!("{who} top offset"), zone.base_offset + zone.height)?;
+                boundary(&who, &zone.boundary)?;
+                if zone.boundary.len() > 512 {
+                    return Err(format!("{who}: a fire zone boundary has at most 512 points"));
+                }
+                if crate::sketch::solve(&crate::sketch::lines_of(&zone.boundary, &[])).is_err() {
+                    return Err(format!("{who}: give a simple fire zone boundary"));
+                }
+                if zone.unit.is_some() && (zone.kind != FireZoneKind::Detection || zone.space.is_some()) {
+                    return Err(format!("{who}: a whole unit needs a main detection zone"));
+                }
+                let mut rooms = BTreeSet::new();
+                for room in zone.include_rooms.iter().chain(&zone.exclude_rooms) {
+                    if !rooms.insert(room)
+                        || !matches!(self.elements.get(*room), Some(Element::Room(r)) if r.level == zone.level || zone.unit.is_some())
+                    {
+                        return Err(format!("{who}: name each room once, on the zone's level unless it covers one whole unit"));
+                    }
+                }
+                if rooms.len() > 512 || zone.notify.len() > 512 {
+                    return Err(format!("{who}: at most 512 room overrides and 512 notification links"));
+                }
+                if zone.kind == FireZoneKind::Notification && (zone.space.is_some() || !zone.notify.is_empty()) {
+                    return Err(format!("{who}: only detection zones can specify a hidden space or trigger notification"));
+                }
+                let mut targets = BTreeSet::new();
+                for g in &zone.notify {
+                    if !targets.insert(g)
+                        || !matches!(self.elements.get(*g), Some(Element::FireZone(target)) if target.kind == FireZoneKind::Notification)
+                    {
+                        return Err(format!("{who}: fire events must target distinct notification zones"));
+                    }
+                }
+            }
             Element::ElectricalTerminal(t) => {
                 text(&who, "name", &t.name)?;
                 text(&who, "purpose", &t.purpose)?;
@@ -8181,6 +8362,46 @@ impl Model {
                 if !link_names.insert(l.name.as_str()) {
                     return Err(format!("{who}: another link is already named `{}`", l.name));
                 }
+                let mut devices = BTreeSet::new();
+                if l.detector_groups.len() > MAX_IFC_DETECTOR_GROUPS {
+                    return Err(format!("{who}: too many saved IFC detector groups"));
+                }
+                for group in &l.detector_groups {
+                    if group.ids.is_empty()
+                        || !matches!(self.elements.get(group.room), Some(Element::Room(_)))
+                        || group.ids.iter().any(|&id| !devices.insert(id) || !matches!(self.elements.get(id), Some(Element::Component(_))))
+                        || devices.len() > MAX_DETECTORS
+                    {
+                        return Err(format!("{who}: saved IFC detector groups need a room and distinct devices"));
+                    }
+                    if group.radius.is_some_and(|v| !(v > 0.0 && v <= MAX_COORD))
+                        || group.margin.is_some_and(|v| !(0.0..=MAX_COORD).contains(&v))
+                    {
+                        return Err(format!("{who}: invalid saved IFC detector radius or wall clearance"));
+                    }
+                    if let Some(bounds) = group.space {
+                        for bound in bounds {
+                            match bound {
+                                IfcSlab::Local(id) if !matches!(self.elements.get(id), Some(Element::Floor(_) | Element::Ceiling(_))) => {
+                                    return Err(format!("{who}: saved IFC detector space needs a local slab"));
+                                }
+                                IfcSlab::Linked(id) if id.pending().is_some() => {
+                                    return Err(format!("{who}: saved IFC detector space needs a linked slab GUID"));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if let Some(heat) = &group.heat {
+                        text(&who, "saved detector heat class", &heat.class)?;
+                        for t in [Some(heat.trip_c), Some(heat.normal_c), Some(heat.max_c), heat.rated_normal_c, heat.rated_max_c]
+                            .into_iter()
+                            .flatten()
+                        {
+                            coord(&format!("{who} saved detector temperature"), t)?;
+                        }
+                    }
+                }
             }
             Element::View3D(v) => {
                 text(&who, "name", &v.name)?;
@@ -8256,6 +8477,12 @@ impl Model {
                         "{who}: family `{}` is a door's or a window's: it stands in a wall, placed with `door` or `window`",
                         c.family
                     ));
+                }
+                if c.detector_space.is_some()
+                    && (!matches!(f.category, crate::family::Category::SmokeDetector | crate::family::Category::HeatDetector)
+                        || !c.is_placed())
+                {
+                    return Err(format!("{who}: a hidden detector space requires a placed smoke or heat detector"));
                 }
                 level_ok(c.level)?;
                 point(&who, c.at)?;
@@ -8693,6 +8920,7 @@ impl Model {
             units,
             language,
             carrier_settings,
+            fire_standard,
             electrical_mark_templates,
             catalogue_retired,
             catalogue_unexported,
@@ -8740,6 +8968,7 @@ impl Model {
             && *units == o.units
             && *language == o.language
             && *carrier_settings == o.carrier_settings
+            && *fire_standard == o.fire_standard
             && *electrical_mark_templates == o.electrical_mark_templates
             && *catalogue_retired == o.catalogue_retired
             && *catalogue_unexported == o.catalogue_unexported
@@ -9325,7 +9554,7 @@ mod tests {
             number: "1".into(),
             ..Room::new(m.guid(100000), P2(0.0, 0.0), "", "")
         };
-        assert_eq!(m.room_region(&room).map(|r| r.area()), Some(24e6));
+        assert_eq!(m.room_region_at(&room, RoomArea::Centre).map(|r| r.area()), Some(24e6));
         let upstairs = Room { level: m.guid(100001), ..room };
         assert_eq!(m.room_region(&upstairs), None, "Level 2 has no walls");
     }

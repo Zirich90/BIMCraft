@@ -56,11 +56,12 @@ impl BimApp {
                             (Tab::Modify, "Modify"),
                         ] {
                             ui.menu_button(t(label), |ui| {
-                                ui.set_min_width(640.0_f32.min(ui.ctx().content_rect().width() - 200.0));
                                 let previous = self.tab;
                                 let tool = self.tool.clone();
                                 self.tab = tab;
-                                self.ribbon_panels(ui);
+                                ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                                    crate::ribbon::menu_rows(ui, |ui| self.tab_content(ui, tab));
+                                });
                                 if self.tab == tab {
                                     self.tab = previous;
                                 }
@@ -80,7 +81,7 @@ impl BimApp {
                         ui.menu_button(name, |ui| {
                             let previous = self.tab;
                             self.tab = Tab::Context;
-                            self.ribbon_panels(ui);
+                            crate::ribbon::menu_rows(ui, |ui| self.tab_content(ui, Tab::Context));
                             if self.tab == Tab::Context {
                                 self.tab = previous;
                             }

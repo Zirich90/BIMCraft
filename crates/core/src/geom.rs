@@ -558,17 +558,76 @@ impl Region {
             .fold(f64::MAX, f64::min)
     }
 
-    /// Points that reach all of it within `reach`, none nearer an edge than `margin`: a square grid over its bounds, its
-    /// cells' diagonal no more than twice the reach, a point in each cell the region has. The cell's centre when it's in
-    /// and clear of the edges, else the point of the cell nearest the centre that is, sought every tenth of the cell; a
-    /// cell with no such point is left out. A rectangle is covered exactly; a cell cut by an edge is covered from inside it.
+    /// Partition a room along changes of a planar label. Segments between equal labels are
+    /// discarded so adjoining panels at one height are a single coverage area.
+    pub(crate) fn partition_by_height(
+        &self,
+        cuts: &[(P2, P2)],
+        height_at: impl Fn(P2) -> Option<f64>,
+    ) -> Result<Vec<(Option<f64>, Self)>, &'static str> {
+        use std::collections::BTreeMap;
+
+        const SNAP: f64 = 0.001;
+        const PROBE: f64 = 0.01;
+        let mut lines: Vec<_> = std::iter::once(&self.outer).chain(&self.holes).flat_map(|r| ring_edges(r)).collect();
+        if lines.len().saturating_add(cuts.len()) > 512 {
+            return Err("too many ceiling edges to partition the room");
+        }
+        lines.extend_from_slice(cuts);
+        let split_lines = split(&lines, SNAP);
+        if split_lines.len() > 8192 {
+            return Err("too many ceiling intersections to partition the room");
+        }
+        let label = |p| self.contains(p).then(|| height_at(p).map(f64::to_bits));
+        let mut boundaries: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (a, b) in split_lines {
+            let mid = (a + b) * 0.5;
+            let normal = (b - a).unit().perp() * PROBE;
+            let left = label(mid + normal);
+            let right = label(mid - normal);
+            if left == right {
+                continue;
+            }
+            for label in [left, right].into_iter().flatten() {
+                boundaries.entry(label).or_default().push((a, b));
+            }
+        }
+        if let Some((&height, _)) = boundaries.first_key_value().filter(|_| boundaries.len() == 1) {
+            return Ok(vec![(height.map(f64::from_bits), self.clone())]);
+        }
+        let mut out = Vec::new();
+        for (height, edges) in boundaries {
+            let faces = faces_of(edges, SNAP);
+            for face in faces.iter().filter(|face| area(face) > SNAP * SNAP) {
+                let inner = ring_edges(face).find_map(|(a, b)| {
+                    let p = (a + b) * 0.5 + (b - a).unit().perp() * PROBE;
+                    (label(p) == Some(height)).then(|| region_in(&faces, p, SNAP)).flatten().filter(|region| region.outer == *face)
+                });
+                if let Some(inner) = inner {
+                    out.push((height.map(f64::from_bits), inner));
+                }
+            }
+        }
+        let covered = out.iter().map(|(_, region)| region.area()).sum::<f64>();
+        if out.is_empty() || (covered - self.area()).abs() > self.perimeter() * PROBE {
+            return Err("ceiling compartments do not cover the room");
+        }
+        Ok(out)
+    }
+
+    /// Initial detector grid. Its cell centres cover a rectangle. In a cut cell, look for a point with
+    /// wall clearance around the centre, or leave the cell empty for the coverage check.
     pub fn cover(&self, reach: f64, margin: f64) -> Vec<P2> {
+        self.cover_where(reach, |p| self.edge_distance(p) >= margin)
+    }
+
+    pub(crate) fn cover_where(&self, reach: f64, clear: impl Fn(P2) -> bool) -> Vec<P2> {
         let Some((lo, hi)) = bounds(&self.outer) else { return Vec::new() };
         let step = reach * std::f64::consts::SQRT_2;
         let n = |span: f64| (span / step).ceil().max(1.0) as usize;
         let (nx, ny) = (n(hi.0 - lo.0), n(hi.1 - lo.1));
         let (dx, dy) = ((hi.0 - lo.0) / nx as f64, (hi.1 - lo.1) / ny as f64);
-        let clear = |p: P2| self.contains(p) && self.edge_distance(p) >= margin;
+        let clear = |p: P2| self.contains(p) && clear(p);
         let mut out = Vec::new();
         for j in 0..ny {
             for i in 0..nx {
@@ -588,10 +647,114 @@ impl Region {
         }
         out
     }
+
+    /// Fill sampled gaps in the grid. A wall or an island between a detector and a sample blocks its reach.
+    /// Sample the room's edges as well as its interior so that small niches are not skipped by the lattice.
+    pub(crate) fn complete_visible_cover(
+        &self,
+        points: &mut Vec<P2>,
+        reach: f64,
+        rectangle_margin: Option<f64>,
+        max_points: usize,
+        clear: impl Fn(P2) -> bool,
+        world: impl Fn(P2) -> P2,
+    ) -> Result<(), String> {
+        const MAX_SAMPLES: usize = 32_000;
+        const WORK: usize = 24_000_000;
+        const LIMIT: &str = "the room exceeds the coverage sampling limit; divide the area into smaller rooms";
+        let Some((lo, hi)) = bounds(&self.outer) else { return Ok(()) };
+        let size = hi - lo;
+        let step = reach * std::f64::consts::SQRT_2;
+        let cells = |span: f64| (span / step).ceil().max(1.0);
+        let nx = cells(size.0);
+        let ny = cells(size.1);
+        let corners = corners(&self.outer);
+        if self.holes.is_empty()
+            && corners.len() == 4
+            && corners.iter().all(|p| (p.0 == lo.0 || p.0 == hi.0) && (p.1 == lo.1 || p.1 == hi.1))
+            && rectangle_margin.is_some_and(|margin| margin <= (size.0 / nx).min(size.1 / ny) / 2.0)
+            && points.len() == (nx * ny) as usize
+        {
+            return Ok(());
+        }
+        let edges: Vec<_> = std::iter::once(&self.outer).chain(&self.holes).flat_map(|r| ring_edges(r)).collect();
+        let spacing = (reach / 8.0).min(250.0);
+        let count = |span: f64| (span / spacing).ceil().max(1.0) as usize;
+        let (nx, ny) = (count(size.0), count(size.1));
+        let interior = nx.saturating_mul(ny);
+        let perimeter = edges.iter().fold(0usize, |n, (a, b)| n.saturating_add(count(a.dist(*b))));
+        let slots = interior.saturating_add(perimeter);
+        if slots > MAX_SAMPLES || slots.saturating_mul(edges.len()).saturating_mul(2) > WORK {
+            return Err(LIMIT.into());
+        }
+        let remaining = std::cell::Cell::new(WORK - slots * edges.len() * 2);
+        let mut witnesses = Vec::with_capacity(slots);
+        let mut candidates = Vec::new();
+        for j in 0..ny {
+            for i in 0..nx {
+                let p = P2(lo.0 + size.0 * (i as f64 + 0.5) / nx as f64, lo.1 + size.1 * (j as f64 + 0.5) / ny as f64);
+                if self.contains(p) {
+                    witnesses.push(p);
+                    if clear(p) {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        for &(a, b) in &edges {
+            let n = count(a.dist(b));
+            witnesses.extend((0..n).map(|i| a + (b - a) * (i as f64 / n as f64)));
+        }
+
+        let spend = |cost: usize| -> Result<(), String> {
+            remaining.set(remaining.get().checked_sub(cost).ok_or(LIMIT)?);
+            Ok(())
+        };
+        let visible = |a: P2, b: P2, distance: f64| -> Result<bool, String> {
+            spend(edges.len())?;
+            Ok(ray_hit(a, b - a, edges.iter().copied()).is_none_or(|hit| a.dist(hit) >= distance - 1e-6))
+        };
+        for target in witnesses {
+            spend(points.len())?;
+            let mut covered = false;
+            for &at in points.iter() {
+                let distance = at.dist(target);
+                if distance <= reach + 1e-6 && visible(at, target, distance)? {
+                    covered = true;
+                    break;
+                }
+            }
+            if covered {
+                continue;
+            }
+            spend(candidates.len())?;
+            let mut best = None;
+            let mut distance = reach + 1e-6;
+            for &at in &candidates {
+                let d = at.dist(target);
+                if d < distance && visible(at, target, d)? {
+                    best = Some(at);
+                    distance = d;
+                }
+            }
+            let Some(at) = best else {
+                let target = world(target);
+                return Err(format!(
+                    "no visible detector position reaches ({:.0}, {:.0}) with the requested clearances",
+                    target.0, target.1
+                ));
+            };
+            if points.len() >= max_points {
+                return Err(format!("visibility coverage needs more than {max_points} detector positions"));
+            }
+            points.push(at);
+        }
+        Ok(())
+    }
 }
 
 /// The lower-left and upper-right corners of the box round `ring`; `None` when it has no points.
-fn bounds(ring: &[P2]) -> Option<(P2, P2)> {
+pub(crate) fn bounds(ring: &[P2]) -> Option<(P2, P2)> {
     let first = *ring.first()?;
     Some(ring.iter().fold((first, first), |(lo, hi), p| (P2(lo.0.min(p.0), lo.1.min(p.1)), P2(hi.0.max(p.0), hi.1.max(p.1)))))
 }

@@ -11,6 +11,7 @@ fn run(s: &mut Session, c: &str, p: Value) -> Value {
 
 /// A 4000 x 3000 box of walls on Level 1 (at 0), and a room in it; Level 2 at 3000.
 fn box_with_room(s: &mut Session, room: Value) -> u64 {
+    run(s, "room_area", json!({"at": "centre"}));
     run(s, "wall", json!({"points": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true}));
     let mut p = json!({"point": [2000, 1500]});
     if let (Some(p), Some(r)) = (p.as_object_mut(), room.as_object()) {

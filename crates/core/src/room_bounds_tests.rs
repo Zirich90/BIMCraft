@@ -26,6 +26,7 @@ fn area(s: &mut Session, id: u64) -> f64 {
 
 /// A 6000 x 4000 box of walls on their centre lines, on Level 1.
 fn box_of_walls(s: &mut Session) {
+    run(s, "room_area", json!({"at": "centre"}));
     run(s, "wall", json!({"points": [[0, 0], [6000, 0], [6000, 4000], [0, 4000]], "closed": true}));
 }
 

@@ -110,6 +110,7 @@ fn element_lines(m: &Model, e: &Element) -> Vec<Line> {
         | Element::View3D(_)
         | Element::PlanView(_)
         | Element::ElectricalLine(_)
+        | Element::FireZone(_)
         | Element::ElectricalTerminal(_) => Vec::new(),
         Element::Room(_) | Element::Spot(_) | Element::Tag(_) | Element::Rebar(_) => Vec::new(),
     }

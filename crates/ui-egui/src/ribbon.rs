@@ -77,15 +77,20 @@ pub(crate) fn in_palette() -> bool {
 /// Draws a tab's panels, `add` drawing them, as rows down `ui`, each panel's under its name: BIMCraft's Tools palette, which
 /// shows as rows what the ribbon lays out as buttons. (After PR 194's tool palette, by PolyglotOpenstreetmap.)
 pub(crate) fn rows(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    LISTING.with(|l| l.set(true));
     IN_PALETTE.with(|p| p.set(true));
+    menu_rows(ui, add);
+    IN_PALETTE.with(|p| p.set(false));
+}
+
+/// Draw tools as rows in a menu, where a tool's choices open as a submenu.
+pub(crate) fn menu_rows(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    LISTING.with(|l| l.set(true));
     IN_TOOLS.with(|i| i.set(true));
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         add(ui);
     });
     IN_TOOLS.with(|i| i.set(false));
-    IN_PALETTE.with(|p| p.set(false));
     LISTING.with(|l| l.set(false));
 }
 

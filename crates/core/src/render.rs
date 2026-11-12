@@ -720,7 +720,14 @@ fn plan_candidates<'a>(
     out.extend(tags_of_level(m, &lookup, level));
     out.extend(lookup.rare("column"));
     out.extend(lookup.rare("structuralcolumn"));
+    out.extend(additional_fire_zones(m, level));
     out
+}
+
+fn additional_fire_zones(m: &Model, level: Guid) -> impl Iterator<Item = Id> + '_ {
+    m.rare("fire_zone").into_iter().filter(
+        move |&id| matches!(m.elements.get(id), Some(Element::FireZone(zone)) if crate::fire_zones::on_additional_level(m, zone, level)),
+    )
 }
 
 /// The tags that may be in plan `key` of `level` with no view of their own, by id: those of what is of the level
@@ -763,6 +770,7 @@ fn plan_filter<'a>(
                 bottom < r.cut && top > r.depth || c.level == level && m.families.get(&c.family).is_some_and(|f| !f.symbols.is_empty())
             }
             Element::Room(x) => x.level == level,
+            Element::FireZone(zone) => zone.level == level || crate::fire_zones::on_additional_level(m, zone, level),
             Element::RoomSeparator(x) => x.level == level,
             Element::Rebar(_) => m.level_of(e) == Some(level),
             Element::Ceiling(_) => false,
@@ -818,6 +826,7 @@ fn annotates(m: &Model, owner: Option<Id>) -> bool {
                 | Element::Grid(_)
                 | Element::Level(_)
                 | Element::Room(_)
+                | Element::FireZone(_)
                 | Element::Section(_)
                 | Element::Elevation(_)
         )
@@ -1093,6 +1102,7 @@ fn plan_shows_among(m: &Model, key: Guid, among: bool) -> Vec<P2> {
     let level = m.plan_level(key).map_or(key, |l| m.guid(l));
     let r = m.shown_range(key);
     let look = Look::of(m, key);
+    let engineering = engineering_of(m, key);
     let index = match m.derived.made(&m.elements) {
         Some(_) if among => None,
         _ => Some(walls::Index::new(m)),
@@ -1109,6 +1119,7 @@ fn plan_shows_among(m: &Model, key: Guid, among: bool) -> Vec<P2> {
         let mut ids: std::collections::BTreeSet<Id> = lookup.other().collect();
         ids.extend(lookup.referrers(&level));
         ids.extend(tags_of_level(m, &lookup, level));
+        ids.extend(additional_fire_zones(m, level));
         ids.extend(lookup.referrers(&key));
         if let Some(Element::PlanView(crate::model::PlanView { parent: Some(p), .. })) = m.elements.get(key) {
             ids.extend(lookup.referrers(p));
@@ -1117,6 +1128,7 @@ fn plan_shows_among(m: &Model, key: Guid, among: bool) -> Vec<P2> {
     } else {
         m.elements.iter().map(|(id, e)| (*id, e)).collect()
     };
+    let rooms = engineering.then(|| crate::rooms::Rooms::new(m));
     for (id, e) in rest.iter().filter(|(id, _)| look.shows(*id)) {
         match e {
             Element::CadImport(ci) if ci.level == level && ci.view.is_none_or(|v| v == key) => {
@@ -1130,6 +1142,14 @@ fn plan_shows_among(m: &Model, key: Guid, among: bool) -> Vec<P2> {
                 extent.extend(boundary)
             }
             Element::Room(r) if r.level == level => extent.push(r.point),
+            Element::FireZone(zone) if engineering && zone.level == level => extent.extend(&zone.boundary),
+            Element::FireZone(zone) if crate::fire_zones::on_additional_level(m, zone, level) => {
+                if let Some(rooms) = &rooms {
+                    extent.extend(
+                        crate::fire_zones::additional_plan_regions(m, rooms, zone, level).into_iter().flat_map(|region| region.outer),
+                    );
+                }
+            }
             Element::Mass(ms) if m.mass_cut_by(ms, r.cut) => extent.extend(m.mass_outline(ms, r.cut)),
             Element::Component(c) if c.level == level => {
                 extent.extend(components.outlines(c));
@@ -2884,6 +2904,35 @@ fn draw_plan_among(m: &Model, key: Guid, view: View, up: bool, k: f32, n: f64, t
             Element::Grid(g) => {
                 if let Some((a, b)) = crop.map_or(Some((g.start, g.end)), |[lo, hi]| clip(g.start, g.end, lo, hi)) {
                     grid(&mut d, a, b, &g.name);
+                }
+            }
+            Element::FireZone(zone) if eng_mode && (zone.level == level || crate::fire_zones::on_additional_level(m, zone, level)) => {
+                let color = match zone.kind {
+                    crate::model::FireZoneKind::Detection => Rgb(180, 65, 50),
+                    crate::model::FireZoneKind::Notification => Rgb(75, 112, 175),
+                };
+                let extra =
+                    if zone.level == level { Vec::new() } else { crate::fire_zones::additional_plan_regions(m, &rooms, zone, level) };
+                let mut rings = (zone.level == level).then_some(zone.boundary.as_slice()).into_iter().chain(
+                    extra.iter().flat_map(|region| std::iter::once(region.outer.as_slice()).chain(region.holes.iter().map(Vec::as_slice))),
+                );
+                let Some(first) = rings.next() else { continue };
+                for ring in std::iter::once(first).chain(rings) {
+                    d.dashed(ring, Pen::PROJECTION, color, true);
+                }
+                let center = geom::centroid(first);
+                // Leave the center free for room annotations and devices.
+                let label = geom::bounds(first).and_then(|(lo, hi)| {
+                    [0.75, 0.25, 0.5]
+                        .into_iter()
+                        .map(|fraction| P2(center.0, lo.1 + (hi.1 - lo.1) * fraction))
+                        .find(|&at| inside(at) && geom::contains(first, at) && extra.first().is_none_or(|region| region.contains(at)))
+                });
+                if let Some(at) = label.or_else(|| first.first().copied().filter(|&at| inside(at))) {
+                    let at = d.view.px(at);
+                    let from = d.prims.len();
+                    d.text(&zone.name, at, 13.0, color);
+                    d.grow(from, at);
                 }
             }
             Element::Room(r) if r.level == level && inside(r.point) && !up => {
@@ -5111,6 +5160,46 @@ mod tests {
 
     fn png_of(d: &Drawing) -> Vec<u8> {
         png(d).unwrap()
+    }
+
+    #[test]
+    fn fire_zones_are_pickable_on_engineering_plans_of_their_level() {
+        let mut s = Session::new();
+        let level = s.model.levels()[0].0;
+        let zone = s
+            .execute(
+                "fire_zone",
+                &serde_json::json!({"zone":{"name":"Detection A","kind":"detection","level":level,"height":3000,
+                    "boundary":[[3000,3000],[8000,3000],[8000,7000],[3000,7000]]}}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert!(!plan(&s.model, level, 800, 600).owners.contains(&Some(zone)));
+        s.execute("modify", &serde_json::json!({"id":level,"graphics":{"engineering":true}})).unwrap();
+        let drawing = plan(&s.model, level, 800, 600);
+        let edge = drawing.view.px(P2(5000.0, 3000.0));
+        assert!(edge.0 > 0.0 && edge.0 < 800.0 && edge.1 > 0.0 && edge.1 < 600.0);
+        assert_eq!(drawing.pick(edge, 3.0), Some(zone));
+        assert!(drawing.prims.iter().zip(&drawing.owners).any(|(primitive, owner)| {
+            *owner == Some(zone) && matches!(primitive, Prim::Line { color, dash: Some(_), closed: true, .. } if *color != BACKDROP)
+        }));
+        let center = drawing.view.px(P2(5500.0, 5000.0));
+        let label: Vec<_> = drawing
+            .prims
+            .iter()
+            .zip(&drawing.owners)
+            .filter_map(|(primitive, owner)| match primitive {
+                Prim::Line { pts, dash: None, .. } if *owner == Some(zone) => Some(pts.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(!label.is_empty());
+        assert!(label.iter().all(|point| point.1 < center.1 - 10.0));
+        if let Some(path) = std::env::var_os("DUMP_FIRE_ZONE_PLAN") {
+            std::fs::write(path, png_of(&drawing)).unwrap();
+        }
     }
 
     #[test]

@@ -29,10 +29,11 @@ Moved from the root `CLAUDE.md`, word for word: the root keeps the rules and the
   roof, first, middle or last; a curve's record reads as both a line and an arc, and the box it carries says which it is);
   a roof by footprint comes in level (one that rises is a stand-in, its slopes unread), one by extrusion only where its box
   confirms it, and a wall that names a flat roof or one by extrusion has its top cut by it. A room tries the
-  middle of its box and then a grid of points over it, and making the arrangement of a level's walls is what costs (`geom::faces`
-  splits and matches every segment), so the faces of a level are made once and every point of every room of that level is asked of
-  them (`geom::region_in`): the Snowdon sample's import went from 133 s to 2.4 s in a release build when the rooms stopped remaking
-  their level's plan for each point. The notes are part of the product: a change that leaves something out says so.
+  middle of its box and then a grid of points over it. `Rooms::region_at_point` tests each candidate against the finish faces,
+  rejecting points inside wall material, including the walls of a free-standing core. The room's finish-face region must still
+  match the record's box within the import tolerance. The importer shares the cached arrangement of each level's wall faces
+  across all candidates and rooms. In an earlier release benchmark, sharing the level plan reduced the Snowdon sample's import
+  time from 133 s to 2.4 s. The notes are part of the product: a change that leaves something out says so.
 
   A workshared (central) file up to 2023 differs in two ways the survey allows for. A record's header tag is followed by a counted
   list of 14-byte items, empty in a file that is not workshared, so `records::id_before` finds a record's id back from its category

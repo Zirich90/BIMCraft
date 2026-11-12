@@ -12,6 +12,7 @@ fn run(s: &mut Session, c: &str, p: Value) -> Value {
 /// A 4000 x 3000 box of walls on their centre lines, with two rooms parted by a separation line: west of x = 2000, a frozen
 /// one, east of it, one that follows the walls. Returns the walls' ids, the frozen room and the other.
 fn two_rooms(s: &mut Session) -> (Vec<u64>, u64, u64) {
+    run(s, "room_area", json!({"at": "centre"}));
     let walls = run(s, "wall", json!({"points": [[0, 0], [4000, 0], [4000, 3000], [0, 3000]], "closed": true}));
     let walls = walls["ids"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
     run(s, "room_separator", json!({"points": [[2000, 0], [2000, 3000]]}));

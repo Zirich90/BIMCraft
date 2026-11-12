@@ -20,6 +20,422 @@ fn fails(s: &mut Session, id: &str, p: Value) -> String {
     e
 }
 
+#[test]
+fn fire_battery_capacity_checks_both_operating_modes() {
+    let mut s = Session::new();
+    let mut params = json!({
+        "standby_a": 0.25, "fire_a": 1.5, "source_a": 0.25,
+        "end_capacity_percent": 80, "load_factor": 1.2, "installed_ah": 20
+    });
+    let result = run(&mut s, "fire_battery", params.clone());
+    assert!((result["required_ah"].as_f64().unwrap() - 20.625).abs() < 1e-9);
+    assert_eq!(result["status"], "insufficient_capacity");
+    params["installed_ah"] = json!(21);
+    let result = run(&mut s, "fire_battery", params.clone());
+    assert_eq!(result["status"], "sufficient_capacity");
+    params.as_object_mut().unwrap().remove("load_factor");
+    let result = run(&mut s, "fire_battery", params.clone());
+    assert_eq!(result["missing"], json!(["load_factor"]));
+    assert!(result["required_ah"].is_null());
+    params["end_capacity_percent"] = json!(0);
+    assert!(fails(&mut s, "fire_battery", params).contains("end_capacity_percent"));
+}
+
+#[test]
+fn fire_battery_uses_mode_specific_factors_and_reports_fire_runtime() {
+    let mut s = Session::new();
+    let mut params = json!({
+        "standby_a": 0.25, "fire_a": 1.5, "source_a": 0.25,
+        "end_capacity_percent": 80, "standby_load_factor": 1.0,
+        "fire_load_factor": 2.0, "installed_ah": 30
+    });
+    let report = run(&mut s, "fire_battery", params.clone());
+    assert_eq!(report["standard"], "SP 6.13130.2025 Appendix B, B.2");
+    assert_eq!(report["required_ah"], 19.375);
+    assert_eq!(report["fire_runtime_h"], 16.0);
+    assert_eq!(report["status"], "sufficient_capacity");
+
+    params["fire_load_factor"] = Value::Null;
+    let report = run(&mut s, "fire_battery", params.clone());
+    assert_eq!(report["missing"], json!(["fire_load_factor"]));
+    assert!(report["required_ah"].is_null());
+    assert_eq!(report["fire_runtime_h"], 16.0);
+
+    params["load_factor"] = json!(1.2);
+    assert!(fails(&mut s, "fire_battery", params.clone()).contains("load_factor"));
+    params.as_object_mut().unwrap().remove("load_factor");
+    params["fire_load_factor"] = json!(2.0);
+    params["fire_a"] = json!(0.0);
+    assert!(run(&mut s, "fire_battery", params)["fire_runtime_h"].is_null());
+}
+
+#[test]
+fn stage7_soue_and_okl_reports_distinguish_failures_and_missing_data() {
+    let mut s = Session::new();
+    let amp = run(&mut s, "soue_amplifier_load", json!({"rated_w":50,"reserve_percent":20,"taps_w":[25,20,null]}));
+    assert_eq!(amp["allowed_w"], 40.0);
+    assert_eq!(amp["status"], "overload");
+    assert_eq!(amp["missing_taps"], json!([3]));
+    let sound = run(
+        &mut s,
+        "soue_sound_check",
+        json!({"room":"other","points":[{"noise_dba":60,"signal_dba":75},{"noise_dba":86,"signal_dba":103,"supplementary_alarm":false},{}]}),
+    );
+    assert_eq!(sound["points"][0]["violations"], json!([]));
+    assert_eq!(sound["points"][1]["violations"], json!(["supplementary_alarm_required", "below_minimum"]));
+    assert_eq!(sound["points"][2]["missing"], json!(["noise_dba", "signal_dba"]));
+    let installed = json!({"cable":"A","carrier":"B","fastener":"C","mounting":"concrete ceiling","pitch_mm":300});
+    let mut tested = installed.clone();
+    tested["document"] = json!("test report 01");
+    tested["duration_min"] = json!(60);
+    let mut params = json!({"required_min":60,"installed":installed,"tested":tested});
+    assert_eq!(run(&mut s, "fire_okl_check", params.clone())["status"], "matches_declared_evidence");
+    params["installed"]["fastener"] = json!("D");
+    params["tested"]["duration_min"] = json!(45);
+    let report = run(&mut s, "fire_okl_check", params);
+    assert_eq!(report["mismatches"], json!(["fastener"]));
+    assert_eq!(report["insufficient_duration"], true);
+    assert_eq!(run(&mut s, "fire_okl_check", json!({"required_min":60}))["status"], "missing_evidence");
+}
+
+#[test]
+fn stage7_parts_estimate_counts_end_supports_and_section_joints() {
+    let mut s = Session::new();
+    let report = run(
+        &mut s,
+        "fire_carrier_parts",
+        json!({"runs":[{"length_m":6,"support_pitch_m":1.5,"section_m":2},{"length_m":2.5,"support_pitch_m":1}],
+            "bends":1,"tees":2,"unlicensed_workstations":1}),
+    );
+    assert_eq!(report, json!({"supports":9,"connectors":2,"bends":1,"tees":2,"software_licenses":1}));
+}
+
+#[test]
+fn stage7_radial_voltage_uses_downstream_current_and_both_conductors() {
+    let mut s = Session::new();
+    let mut params = json!({"source_v":24,"segments":[
+        {"length_m":100,"ohm_per_km":10,"load_ma":100,"min_v":23},
+        {"length_m":150,"ohm_per_km":10,"load_ma":200,"min_v":23}
+    ]});
+    let report = run(&mut s, "fire_voltage_drop", params.clone());
+    let points = &report["segments"];
+    assert!((points[0]["voltage_v"].as_f64().unwrap() - 23.4).abs() < 1e-9);
+    assert!((points[1]["voltage_v"].as_f64().unwrap() - 22.8).abs() < 1e-9);
+    assert_eq!(points[0]["below_minimum"], false);
+    assert_eq!(points[1]["below_minimum"], true);
+    params["segments"][1].as_object_mut().unwrap().remove("load_ma");
+    let report = run(&mut s, "fire_voltage_drop", params);
+    assert_eq!(report["missing"], json!([{"segment":2,"fields":["load_ma"]}]));
+    assert!(report["segments"].is_null());
+}
+
+#[test]
+fn stage7_line_load_reports_each_mode_and_missing_device_data() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let b = run(&mut s, "component", json!({"family":"Smoke Detector","at":[2000,0]}))["id"].clone();
+    let line = run(&mut s, "electrical_line", json!({"source":panel,"devices":[a,b]}))["id"].clone();
+    let mut params = json!({
+        "id":line, "limit_ma":100, "reserve_percent":20,
+        "loads":[{"id":a,"standby_ma":10,"fire_ma":35},{"id":b,"standby_ma":15,"fire_ma":50}]
+    });
+    let report = run(&mut s, "fire_line_load", params.clone());
+    assert_eq!(report["allowed_ma"], 80.0);
+    assert_eq!(report["standby"]["total_ma"], 25.0);
+    assert_eq!(report["standby"]["over_limit"], false);
+    assert_eq!(report["fire"]["total_ma"], 85.0);
+    assert_eq!(report["fire"]["over_limit"], true);
+    params["loads"][1].as_object_mut().unwrap().remove("fire_ma");
+    let report = run(&mut s, "fire_line_load", params.clone());
+    assert_eq!(report["fire"]["missing_ids"], json!([b]));
+    assert!(report["fire"]["over_limit"].is_null());
+    params["loads"][1]["id"] = panel;
+    assert!(fails(&mut s, "fire_line_load", params).contains("line load"));
+}
+
+#[test]
+fn fire_line_searches_three_isolators_across_four_detection_zones() {
+    assert_fire_line_isolator_set(3);
+}
+
+#[test]
+fn fire_line_searches_four_isolators_across_five_detection_zones() {
+    assert_fire_line_isolator_set(4);
+}
+
+fn assert_fire_line_isolator_set(required: usize) {
+    let mut s = Session::new();
+    let positions = &[[0, 0], [4000, 0], [8000, 0], [8000, 4000], [4000, 4000], [0, 4000]][..required + 2];
+    let ids: Vec<_> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, at)| {
+            run(&mut s, "component", json!({"family":if i == 0 {"Fire Alarm Panel"} else {"Smoke Detector"},"at":at}))["id"].clone()
+        })
+        .collect();
+    let terminals: Vec<_> = ["Outgoing", "Return"]
+        .into_iter()
+        .map(|name| run(&mut s, "electrical_terminal", json!({"device":ids[0],"name":name}))["id"].clone())
+        .collect();
+    let level = s.model.levels()[0].0;
+    for (i, &[x, y]) in positions.iter().enumerate().skip(1) {
+        let boundary = [[x - 500, y - 500], [x + 500, y - 500], [x + 500, y + 500], [x - 500, y + 500]];
+        run(
+            &mut s,
+            "fire_zone",
+            json!({"zone":{"name":format!("Zone {i}"),"kind":"detection","level":level,"height":3500,"boundary":boundary}}),
+        );
+    }
+    let mut wires = Vec::new();
+    for i in 0..positions.len() {
+        let next = (i + 1) % positions.len();
+        let wire = run(&mut s, "wire", json!({"points":[positions[i],positions[next]],"offset":1000}))["ids"][0].clone();
+        for (end, device) in [i, next].into_iter().enumerate() {
+            let mut params = json!({"wire":wire,"device":ids[device],"point":[0,0,1000],"end":end});
+            if device == 0 {
+                params["terminal"] = terminals[end].clone();
+            }
+            run(&mut s, "wire_connect", params);
+        }
+        wires.push(wire);
+    }
+    let line =
+        run(&mut s, "electrical_line", json!({"source":ids[0],"devices":ids[1..],"segments":wires,"terminals":terminals}))["id"].clone();
+    let before = s.model.clone();
+    let smaller =
+        run(&mut s, "fire_line_faults", json!({"id":line,"propose":true,"max_isolators":required-1,"source_isolates_ports":true}));
+    let status_key = if required == 3 { "pair_status_after" } else { "set_status_after" };
+    assert_eq!(smaller[status_key], "fail", "{smaller}");
+    let report = run(&mut s, "fire_line_faults", json!({"id":line,"propose":true,"max_isolators":required,"source_isolates_ports":true}));
+    assert_eq!(report["placement_status"], "proposed_set", "{report}");
+    assert_eq!(report["set_status_after"], "pass", "{report}");
+    let placements = report["placements"].as_array().unwrap();
+    assert_eq!(placements.len(), required);
+    assert_eq!(s.model, before);
+    let script = placements
+        .iter()
+        .map(|place| {
+            format!(
+                "fire_isolator {}",
+                json!({
+                    "id":line,"wire":place["wire"],"fraction":place["fraction"],"family":"Sounder","apply":true
+                })
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    s.script_atomic(&script).unwrap();
+    let applied = run(&mut s, "fire_line_faults", json!({"id":line,"source_isolates_ports":true}));
+    assert_eq!(applied["status"], "pass", "{applied}");
+    run(&mut s, "undo", json!({}));
+    assert_eq!(s.model, before);
+}
+
+#[test]
+fn fire_line_faults_follow_wired_loop_and_transit_isolator() {
+    let mut s = Session::new();
+    let positions = [[0, 0], [4000, 0], [4000, 4000], [0, 4000]];
+    let ids: Vec<_> = ["Fire Alarm Panel", "Smoke Detector", "Sounder", "Manual Call Point"]
+        .into_iter()
+        .zip(positions)
+        .map(|(family, at)| run(&mut s, "component", json!({"family":family,"at":at}))["id"].clone())
+        .collect();
+    let first = run(&mut s, "electrical_terminal", json!({"device":ids[0],"name":"Outgoing"}))["id"].clone();
+    let last = run(&mut s, "electrical_terminal", json!({"device":ids[0],"name":"Return"}))["id"].clone();
+    let mut wires = Vec::new();
+    for i in 0..positions.len() {
+        let next = (i + 1) % positions.len();
+        let wire = run(&mut s, "wire", json!({"points":[positions[i],positions[next]],"offset":1000}))["ids"][0].clone();
+        for (end, at) in [i, next].into_iter().enumerate() {
+            let mut p = json!({"wire":wire,"device":ids[at],"point":[0,0,1000],"end":if i == 1 { 0 } else { end }});
+            if at == 0 {
+                p["terminal"] = if end == 0 { first.clone() } else { last.clone() };
+            }
+            run(&mut s, "wire_connect", p);
+        }
+        wires.push(wire);
+    }
+    let level = s.model.levels()[0].0;
+    let zone = run(
+        &mut s,
+        "fire_zone",
+        json!({"zone":{"name":"Detection","kind":"detection","level":level,"height":3500,
+        "boundary":[[3000,-1000],[5000,-1000],[5000,1000],[3000,1000]]}}),
+    )["id"]
+        .clone();
+    let line =
+        run(&mut s, "electrical_line", json!({"source":ids[0],"devices":ids[1..],"segments":wires,"terminals":[first,last]}))["id"].clone();
+    let before = s.model.clone();
+    let unprotected = run(&mut s, "fire_line_faults", json!({"id":line}));
+    assert_eq!(unprotected["status"], "fail");
+    let short = &unprotected["faults"][1];
+    assert_eq!(short["kind"], "short");
+    assert_eq!(short["automatic_lost"], 1);
+    assert_eq!(short["manual_lost"], 1);
+    let protected = run(&mut s, "fire_line_faults", json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true}));
+    assert_eq!(protected["status"], "pass", "{protected}");
+    assert_eq!(protected["faults"][0]["automatic_lost"], 0, "the return port feeds an open loop");
+    assert_eq!(protected["faults"][1]["automatic_lost"], 1);
+    assert_eq!(protected["faults"][1]["manual_lost"], 0);
+    assert_eq!(s.model, before);
+    let already_protected =
+        run(&mut s, "fire_line_faults", json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true,"propose":true}));
+    assert_eq!(already_protected["placement_status"], "already_passes");
+    let common_port = run(&mut s, "fire_line_faults", json!({"id":line,"propose":true}));
+    assert_eq!(common_port["placement_status"], "no_improving_placement");
+    let paired = run(&mut s, "fire_line_faults", json!({"id":line,"propose":true,"allow_pair":true}));
+    assert_eq!(paired["placement_status"], "proposed_pair", "{paired}");
+    assert_eq!(paired["pair_status_after"], "fail", "the short at the shared source remains: {paired}");
+    let placements = paired["placements"].as_array().unwrap();
+    assert_eq!(placements.len(), 2);
+    assert_ne!(placements[0]["wire"], placements[1]["wire"]);
+    let script = placements
+        .iter()
+        .map(|place| {
+            format!(
+                "fire_isolator {}",
+                json!({"id":line,"wire":place["wire"],"fraction":place["fraction"],"family":"Sounder","apply":true})
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    s.script_atomic(&script).unwrap();
+    let after = run(&mut s, "fire_line_faults", json!({"id":line}));
+    let failed = |result: &Value| result["faults"].as_array().unwrap().iter().filter(|fault| fault["status"] == "fail").count();
+    assert_eq!(paired["pair_failing_faults_after"], failed(&after));
+    assert!(failed(&after) < failed(&common_port));
+    run(&mut s, "undo", json!({}));
+    assert_eq!(s.model, before);
+    let recommendation = run(&mut s, "fire_line_faults", json!({"id":line,"source_isolates_ports":true,"propose":true}));
+    assert_eq!(recommendation["status"], "fail");
+    let placement = &recommendation["placement"];
+    assert!(wires[1..3].contains(&placement["wire"]), "{recommendation}");
+    assert_eq!(placement["status_after"], "pass");
+    assert_eq!(s.model, before);
+    run(
+        &mut s,
+        "fire_isolator",
+        json!({
+            "id":line,"wire":placement["wire"],"fraction":placement["fraction"],"family":"Sounder","apply":true
+        }),
+    );
+    assert_eq!(run(&mut s, "fire_line_faults", json!({"id":line,"source_isolates_ports":true}))["status"], "pass");
+    run(&mut s, "undo", json!({}));
+    assert_eq!(s.model, before);
+    let supply = run(&mut s, "component", json!({"family":"Distribution Board","at":[-4000,0]}))["id"].clone();
+    let supply_wire = run(&mut s, "wire", json!({"points":[[-4000,0],[0,0]],"offset":1000}))["ids"][0].clone();
+    for (end, device) in [&supply, &ids[0]].into_iter().enumerate() {
+        run(&mut s, "wire_connect", json!({"wire":supply_wire,"device":device,"point":[0,0,1000],"end":end}));
+    }
+    let power = run(&mut s, "electrical_line", json!({"source":supply,"devices":[ids[0]],"segments":[supply_wire]}))["id"].clone();
+    let with_power = s.model.clone();
+    let mut params = json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true,"power":{"id":power}});
+    let incomplete = run(&mut s, "fire_line_faults", params.clone());
+    assert_eq!(incomplete["status"], "insufficient_data");
+    assert_eq!(incomplete["communication_status"], "pass");
+    params["power"]["independent"] = json!(ids[1..]);
+    let assessed = run(&mut s, "fire_line_faults", params);
+    assert_eq!(assessed["scope"], "communication_and_power");
+    assert_eq!(assessed["status"], "fail");
+    assert_eq!(assessed["communication_status"], "pass");
+    assert_eq!(assessed["power"]["status"], "fail");
+    let power_faults = assessed["power"]["faults"].as_array().unwrap();
+    assert_eq!(power_faults.len(), 2);
+    for fault in power_faults {
+        assert_eq!(fault["wire"], supply_wire);
+        assert_eq!(fault["automatic_lost"], 1);
+        assert_eq!(fault["manual_lost"], 1);
+    }
+    assert_eq!(s.model, with_power);
+    let relay_wire = run(&mut s, "wire", json!({"points":[[-4000,0],[4000,4000]],"offset":1000}))["ids"][0].clone();
+    for (end, device) in [&supply, &ids[2]].into_iter().enumerate() {
+        run(&mut s, "wire_connect", json!({"wire":relay_wire,"device":device,"point":[0,0,1000],"end":end}));
+    }
+    let relay_power = run(&mut s, "electrical_line", json!({"source":supply,"devices":[ids[2]],"segments":[relay_wire]}))["id"].clone();
+    let both = run(
+        &mut s,
+        "fire_line_faults",
+        json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true,
+            "power":{"lines":[{"id":power},{"id":relay_power}],"independent":[ids[1],ids[3]]}}),
+    );
+    assert_eq!(both["communication_status"], "pass");
+    assert_eq!(both["power"]["status"], "fail");
+    let faults = both["power"]["faults"].as_array().unwrap();
+    assert_eq!(faults.len(), 4);
+    assert!(faults.iter().any(|fault| fault["wire"] == supply_wire && fault["automatic_lost"] == 1));
+    assert!(faults.iter().any(|fault| fault["wire"] == relay_wire && fault["automatic_lost"] == 0));
+    let dependent_wire = run(&mut s, "wire", json!({"points":[[4000,4000],[4000,0]],"offset":1000}))["ids"][0].clone();
+    for (end, device) in [&ids[2], &ids[1]].into_iter().enumerate() {
+        run(&mut s, "wire_connect", json!({"wire":dependent_wire,"device":device,"point":[0,0,1000],"end":end}));
+    }
+    let dependent = run(&mut s, "electrical_line", json!({"source":ids[2],"devices":[ids[1]],"segments":[dependent_wire]}))["id"].clone();
+    let cascade = run(
+        &mut s,
+        "fire_line_faults",
+        json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true,
+            "power":{"lines":[{"id":dependent},{"id":relay_power}],"independent":[ids[0],ids[3]]}}),
+    );
+    let cascade_faults = cascade["power"]["faults"].as_array().unwrap();
+    assert_eq!(cascade_faults.iter().filter(|fault| fault["wire"] == relay_wire && fault["automatic_lost"] == 1).count(), 2);
+    let relay_only = run(
+        &mut s,
+        "fire_line_faults",
+        json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true,
+            "power":{"id":relay_power,"independent":[ids[0],ids[1],ids[3]]}}),
+    );
+    assert_eq!(relay_only["status"], "pass", "{relay_only}");
+    assert_eq!(relay_only["power"]["faults"][0]["automatic_lost"], 0);
+    assert_eq!(relay_only["power"]["faults"][0]["manual_lost"], 0);
+    run(&mut s, "delete", json!({"ids":[zone]}));
+    let no_zone = run(&mut s, "fire_line_faults", json!({"id":line,"isolators":[ids[2]],"source_isolates_ports":true}));
+    assert_eq!(no_zone["status"], "insufficient_data");
+}
+
+#[test]
+fn fire_isolator_splits_a_wired_segment_in_one_undo() {
+    use crate::model::{Element, Id, Model};
+
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let detector = run(&mut s, "component", json!({"family":"Smoke Detector","at":[4000,0]}))["id"].clone();
+    let wire = run(&mut s, "wire", json!({"points":[[0,0],[4000,0]],"offset":1000}))["ids"][0].clone();
+    // Connect in reverse order and use the same legacy end index on different devices.
+    for device in [&detector, &panel] {
+        run(&mut s, "wire_connect", json!({"wire":wire,"device":device,"point":[0,0,1000],"end":0}));
+    }
+    let line = run(&mut s, "electrical_line", json!({"source":panel,"devices":[detector],"segments":[wire]}))["id"].clone();
+    let ids = |value: &Value| serde_json::from_value::<Id>(value.clone()).unwrap();
+    let original_guid = s.model.guid(ids(&wire));
+    let before = s.model.clone();
+    let mut params = json!({"id":line,"wire":wire,"family":"Sounder","fraction":0.25});
+    let preview = run(&mut s, "fire_isolator", params.clone());
+    assert_eq!(preview["at"], json!([1000.0, 0.0, 1000.0]));
+    assert_eq!(s.model, before);
+    fails(&mut s, "fire_isolator", json!({"id":line,"wire":wire,"family":"Sounder","fraction":1,"apply":true}));
+    params["apply"] = json!(true);
+    let result = run(&mut s, "fire_isolator", params);
+    let device = s.model.guid(ids(&result["device"]));
+    let second = s.model.guid(ids(&result["segments"][1]));
+    assert_eq!(s.model.guid(ids(&wire)), original_guid);
+    let Some(Element::ElectricalLine(circuit)) = s.model.elements.get(ids(&line)) else { panic!("missing line") };
+    assert_eq!(circuit.segments, [original_guid, second]);
+    assert_eq!(circuit.devices, [s.model.guid(ids(&detector))]);
+    assert_eq!(circuit.isolators, [device]);
+    for (segment, endpoint) in [(original_guid, &panel), (second, &detector)] {
+        let Some(Element::Wire(run)) = s.model.elements.get(segment) else { panic!("missing cable") };
+        assert_eq!(run.connections.len(), 2);
+        assert!(run.connections.iter().any(|end| end.device == s.model.guid(ids(endpoint))));
+        assert!(run.connections.iter().any(|end| end.device == device));
+    }
+    assert_eq!(run(&mut s, "fire_line_faults", json!({"id":line}))["faults"].as_array().unwrap().len(), 4);
+    let (loaded, left_out) = Model::read(&s.model.to_json().unwrap()).unwrap();
+    assert!(left_out.is_empty(), "{left_out:?}");
+    assert_eq!(loaded.elements.get(ids(&line)), s.model.elements.get(ids(&line)));
+    run(&mut s, "undo", json!({}));
+    assert_eq!(s.model, before);
+}
+
 /// The `name` entry of `kind` is in the library, with an id and a GUID.
 fn in_library(s: &Session, kind: Kind, name: &str) -> bool {
     s.model.library.entries().any(|(_, e)| e.kind == kind && e.name == name)

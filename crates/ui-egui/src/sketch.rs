@@ -33,6 +33,8 @@ pub enum Of {
     Roof(Id),
     /// A new shaft opening from the level.
     Shaft(Id),
+    /// A new detection or notification zone on the level.
+    FireZone(Id, bimcraft_core::model::FireZoneKind),
     /// A new filled region in the view (a plan's key), or a masking region: any number of outlines.
     Region { view: Id, masking: bool },
     /// The element's outline and holes, redrawn.
@@ -86,6 +88,7 @@ impl Sketch {
             Of::Ceiling(_) => msg!("Create Ceiling Boundary"),
             Of::Roof(_) => "Create Roof Footprint",
             Of::Shaft(_) => msg!("Create Shaft Opening Sketch"),
+            Of::FireZone(..) => msg!("Create Fire Zone Boundary"),
             Of::Region { masking: false, .. } => msg!("Create Filled Region Boundary"),
             Of::Region { masking: true, .. } => msg!("Create Masking Region Boundary"),
             Of::Edit(_) => "Edit Boundary",
@@ -362,7 +365,7 @@ impl BimApp {
     pub(crate) fn boundary_selected(&self) -> bool {
         match self.selection.as_slice() {
             [id] => match self.session.model.elements.get(*id) {
-                Some(Element::Floor(_) | Element::Ceiling(_) | Element::Shaft(_) | Element::FilledRegion(_)) => true,
+                Some(Element::Floor(_) | Element::Ceiling(_) | Element::Shaft(_) | Element::FilledRegion(_) | Element::FireZone(_)) => true,
                 Some(Element::Roof(r)) => r.extrusion.is_none(),
                 _ => false,
             },
@@ -380,12 +383,15 @@ impl BimApp {
             Of::Edit(id) => matches!(self.session.model.elements.get(id), Some(Element::FilledRegion(_))),
             _ => false,
         };
-        let solved = if many { solver::solve(&sk.lines).map(|_| ()) } else { solver::solve_one(&sk.lines).map(|_| ()) };
-        if let Err(problems) = solved {
-            sk.wrong = problems.iter().flat_map(Problem::lines).collect();
-            self.status = Status { text: friendly(&problems, &sk.lines, self.session.model.units), error: true };
-            return;
-        }
+        let solved = if many { solver::solve(&sk.lines).map(|_| None) } else { solver::solve_one(&sk.lines).map(Some) };
+        let region = match solved {
+            Ok(region) => region,
+            Err(problems) => {
+                sk.wrong = problems.iter().flat_map(Problem::lines).collect();
+                self.status = Status { text: friendly(&problems, &sk.lines, self.session.model.units), error: true };
+                return;
+            }
+        };
         let lines = json!(sk.lines.iter().map(sent).collect::<Vec<_>>());
         let m = &self.session.model;
         // Begun on the 3D view's (level) work plane: it stands on the level below the plane, as high above it as the plane is.
@@ -429,6 +435,22 @@ impl BimApp {
                 ("roof", self.typed("roof", json!({"level": on, "slope": slope, "sketch": lines})))
             }
             Of::Shaft(level) => ("shaft", json!({"level": level, "sketch": lines})),
+            Of::FireZone(level, kind) => {
+                let Some(region) = region else { return };
+                if !region.holes.is_empty() {
+                    self.status =
+                        Status { text: t(msg!("A fire zone needs one outline. Use room exclusions for holes.")).to_string(), error: true };
+                    return;
+                }
+                let label = match kind {
+                    bimcraft_core::model::FireZoneKind::Detection => msg!("Detection Zone"),
+                    bimcraft_core::model::FireZoneKind::Notification => msg!("Notification Zone"),
+                };
+                let height =
+                    m.level_above(level).map_or(bimcraft_core::model::DEFAULT_HEIGHT, |above| m.elevation(above) - m.elevation(level));
+                let name = format!("{} {}", t(label), m.rare("fire_zone").len() + 1);
+                ("fire_zone", json!({"zone":{"name":name,"kind":kind,"level":level,"height":height,"boundary":region.outer}}))
+            }
             Of::Region { view, .. } => {
                 ("filled_region", json!({"view": view, "sketch": lines, "type": sk.region.0, "line_style": sk.region.1}))
             }

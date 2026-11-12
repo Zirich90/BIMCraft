@@ -7,12 +7,12 @@
 //! view and snapping all find a link's elements the way they find the project's own. Each link's level at an elevation this
 //! project has a level at stands on that level; the others come in as levels of their own, named after the link.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::commands::{Motion, transformed};
 use crate::geom::P2;
-use crate::ids::{Id, LINKED};
+use crate::ids::{Guid, Id, LINKED};
 use crate::model::{Element, Model};
 
 /// How close two levels' elevations must be, mm, for a link's level to stand on this project's.
@@ -34,6 +34,7 @@ fn built(e: &Element) -> bool {
         e,
         Element::Grid(_)
             | Element::Room(_)
+            | Element::FireZone(_)
             | Element::Dimension(_)
             | Element::Tag(_)
             | Element::Section(_)
@@ -76,8 +77,166 @@ pub fn seen(m: &Arc<Model>) -> Arc<Model> {
     Arc::new(out)
 }
 
+/// Overlay one selected architecture link for engineering calculations.
+pub(crate) fn with_architecture(m: &Model, id: Id) -> Result<Model, String> {
+    let Some(Element::Link(link)) = m.elements.get(id) else { return Err(format!("{id} isn't an architecture link")) };
+    let source = m.loaded.get(&link.path).ok_or_else(|| format!("architecture link {} is unloaded; reload it first", link.name))?;
+    let mut out = m.clone();
+    let inserted = bring(&mut out, link, source)?;
+    for id in inserted.copies {
+        if matches!(
+            out.elements.get(id),
+            Some(
+                Element::Wall(_)
+                    | Element::Floor(_)
+                    | Element::Ceiling(_)
+                    | Element::Shaft(_)
+                    | Element::Column(_)
+                    | Element::StructuralColumn(_)
+                    | Element::Beam(_)
+            )
+        ) {
+            return Err(format!("architecture link {} duplicates a local geometry GUID; resolve the overlapping models", link.name));
+        }
+    }
+    for (source_id, id) in inserted.ids {
+        let Some((from, to)) = source.elements.get(source_id).zip(out.elements.get_mut(id)) else { continue };
+        match (from, to) {
+            (Element::Wall(a), Element::Wall(b)) => {
+                architecture_type(&source.types.wall, &mut out.types.wall, &a.type_name, &mut b.type_name)
+            }
+            (Element::Floor(a), Element::Floor(b)) => {
+                architecture_type(&source.types.floor, &mut out.types.floor, &a.type_name, &mut b.type_name)
+            }
+            (Element::Ceiling(a), Element::Ceiling(b)) => {
+                architecture_type(&source.types.ceiling, &mut out.types.ceiling, &a.type_name, &mut b.type_name);
+            }
+            (Element::Column(a), Element::Column(b)) => {
+                architecture_type(&source.types.column, &mut out.types.column, &a.type_name, &mut b.type_name);
+            }
+            (Element::StructuralColumn(a), Element::StructuralColumn(b)) => {
+                architecture_type(&source.types.structural_column, &mut out.types.structural_column, &a.type_name, &mut b.type_name);
+            }
+            (Element::Beam(a), Element::Beam(b)) => {
+                if let Some((from, to)) = source.types.runs.get("beam").zip(out.types.runs.get_mut("beam")) {
+                    architecture_type(from, to, &a.type_name, &mut b.type_name);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RouteClash {
+    wire: Id,
+    segment: Id,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    carrier: bool,
+    obstacle: Guid,
+    point: crate::view3d::P3,
+}
+
+/// Check connected cables and their carriers against solids in the selected architecture link.
+pub(crate) fn route_clashes(architecture: &Model, id: Id, m: &Model, devices: &BTreeSet<Guid>) -> Result<Vec<RouteClash>, String> {
+    let Some(Element::Link(link)) = architecture.elements.get(id) else { return Err(format!("{id} isn't an architecture link")) };
+    let source = architecture.loaded.get(&link.path).ok_or_else(|| format!("architecture link {} is unloaded", link.name))?;
+    let mut mains = BTreeSet::new();
+    for (&id, element) in m.elements.iter() {
+        match element {
+            Element::Wire(run)
+                if run.feeder.is_none()
+                    && (run.connections.iter().any(|c| devices.contains(&c.device)) || run.devices.iter().any(|d| devices.contains(d))) =>
+            {
+                mains.insert(m.guid(id));
+            }
+            Element::ElectricalLine(line)
+                if line.devices.iter().chain(line.branches.iter().flat_map(|branch| &branch.devices)).any(|d| devices.contains(d)) =>
+            {
+                mains.extend(line.segments.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    if mains.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut routes = BTreeMap::new();
+    let mut carriers = BTreeMap::new();
+    for (&segment, element) in m.elements.iter() {
+        let Element::Wire(run) = element else { continue };
+        let main = run.feeder.as_ref().map_or_else(|| m.guid(segment), |f| f.wire);
+        if !mains.contains(&main) {
+            continue;
+        }
+        let Some(wire) = m.elements.id(main) else { continue };
+        routes.insert(segment, (wire, element, false));
+        for host in run.carrier.into_iter().chain(run.connections.iter().filter_map(|connection| connection.carrier)) {
+            let Some((id, carrier @ Element::CableCarrier(_))) = m.elements.id(host).zip(m.elements.get(host)) else { continue };
+            // A shared carrier is checked once. Report the lowest connected wire ID for stable previews.
+            let entry = carriers.entry(id).or_insert((wire, carrier, true));
+            entry.0 = entry.0.min(wire);
+        }
+    }
+    routes.extend(carriers);
+    if routes.len().saturating_mul(source.elements.len()) > 10_000_000 {
+        return Err("route clash check exceeds its work limit; select fewer connected lines".into());
+    }
+    let scene = crate::view3d::Scene::new(source);
+    let solid = |id| {
+        matches!(
+            source.elements.get(id),
+            Some(
+                Element::Wall(_)
+                    | Element::Floor(_)
+                    | Element::Roof(_)
+                    | Element::Ceiling(_)
+                    | Element::Column(_)
+                    | Element::StructuralColumn(_)
+                    | Element::Beam(_)
+            )
+        )
+    };
+    let (sin, cos) = link.angle.to_radians().sin_cos();
+    let local = |[x, y, z]: crate::view3d::P3| {
+        let P2(x, y) = P2(x, y) - link.at;
+        [x * cos + y * sin, -x * sin + y * cos, z]
+    };
+    let world = |[x, y, z]: crate::view3d::P3| [x * cos - y * sin + link.at.0, x * sin + y * cos + link.at.1, z];
+    let local_direction = |[x, y, z]: crate::view3d::P3| [x * cos + y * sin, -x * sin + y * cos, z];
+    let mut clashes = Vec::new();
+    for (segment, (wire, element, carrier)) in routes {
+        let Some(geom) = m.run_geom(element) else { continue };
+        let (_, x, y) = geom.frame();
+        let in_link = crate::runs::Geom { a: local(geom.a), b: local(geom.b), ..geom };
+        for (obstacle, point) in scene.run_clashes(in_link, local_direction(x), local_direction(y), solid) {
+            clashes.push(RouteClash { wire, segment, carrier, obstacle: source.guid(obstacle), point: world(point) });
+            if clashes.len() > 1000 {
+                return Err("route clash check found over 1000 crossings; select fewer connected lines".into());
+            }
+        }
+    }
+    Ok(clashes)
+}
+
+// The ordinary overlay merges same-name types. Engineering geometry must use the linked
+// thickness or section even when the local project has a type with that name.
+fn architecture_type<T: Clone + PartialEq>(source: &BTreeMap<String, T>, out: &mut BTreeMap<String, T>, name: &str, linked: &mut String) {
+    let Some(definition) = source.get(name) else { return };
+    if out.get(linked.as_str()) == Some(definition) {
+        return;
+    }
+    let mut alias = format!("Architecture: {name}");
+    while out.get(&alias).is_some_and(|local| local != definition) {
+        alias.push('_');
+    }
+    out.entry(alias.clone()).or_insert_with(|| definition.clone());
+    *linked = alias;
+}
+
 /// What link `l` builds, in `to`: turned and moved as the link says, on `to`'s levels where they stand at the same height.
-fn bring(to: &mut Model, l: &crate::model::Link, from: &Model) -> Result<(), String> {
+fn bring(to: &mut Model, l: &crate::model::Link, from: &Model) -> Result<crate::insert::Inserted, String> {
     let mut other = from.clone();
     other.elements.retain(|_, e| matches!(e, Element::Level(_)) || built(e));
     let all: BTreeSet<Id> = other.elements.keys().copied().collect();
@@ -107,9 +266,9 @@ fn bring(to: &mut Model, l: &crate::model::Link, from: &Model) -> Result<(), Str
     }
     let ask: Vec<Id> = all.difference(&matched).copied().collect();
     if ask.is_empty() {
-        return Ok(());
+        return Ok(crate::insert::Inserted::default());
     }
-    crate::insert::insert_as(to, &other, &ask, true).map(|_| ())
+    crate::insert::insert_as(to, &other, &ask, true)
 }
 
 #[cfg(test)]

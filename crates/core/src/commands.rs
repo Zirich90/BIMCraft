@@ -4,6 +4,8 @@
 
 use bimcraft_i18n::{msg, ui_msg};
 
+mod fire_design;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,13 +24,14 @@ use crate::library::Kind as LibKind;
 use crate::lines::{DetailLine, LineStyle};
 use crate::massing;
 use crate::model::{
-    CEILING_HEIGHT, CadImport, Ceiling, CeilingType, Column, ColumnType, Component, DEFAULT_HEIGHT, DimKind, Dimension, Dimension3D,
-    Element, End, Extrusion, Face, Facing, Floor, FloorType, Grid, Guid, Id, Key, Landing, Layer, Level, Line, Location, MAX_COORD,
-    MAX_POINTS, MAX_SLOPE, MAX_TEXT, Mass, Model, Note, Opening, OpeningType, Orient, PARAMETER_CATEGORIES, ParameterKind, Pattern,
-    Perspective, PlanView, PointCloud, ProjectParameter, RAMP_SLOPE, RAMP_WIDTH, RISER, Railing, RailingType, Ramp, Rebar, Ref3, Reference,
-    Roof, RoofType, Room, RoomArea, RoomSeparator, STAIR_WIDTH, Schedule, Section, SectionBox, Shaft, Sheet, Side, Spot, Stair, TOL, TREAD,
-    Tag, Unbound, View3D, Viewport, Wall, WallType, heading, paper,
+    CEILING_HEIGHT, CadImport, Ceiling, CeilingType, Column, ColumnType, Component, DEFAULT_HEIGHT, DetectorSpace, DimKind, Dimension,
+    Dimension3D, Element, End, Extrusion, Face, Facing, Floor, FloorType, Grid, Guid, Id, Key, Landing, Layer, Level, Line, Location,
+    MAX_COORD, MAX_POINTS, MAX_SLOPE, MAX_TEXT, Mass, Model, Note, Opening, OpeningType, Orient, PARAMETER_CATEGORIES, ParameterKind,
+    Pattern, Perspective, PlanView, PointCloud, ProjectParameter, RAMP_SLOPE, RAMP_WIDTH, RISER, Railing, RailingType, Ramp, Rebar, Ref3,
+    Reference, Roof, RoofType, Room, RoomArea, RoomSeparator, STAIR_WIDTH, Schedule, Section, SectionBox, Shaft, Sheet, Side, Spot, Stair,
+    TOL, TREAD, Tag, Unbound, View3D, Viewport, Wall, WallType, heading, paper,
 };
+use crate::model::{HeatEvidence, IfcDetectorGroup, IfcSlab, MAX_DETECTORS, MAX_IFC_DETECTOR_GROUPS};
 use crate::paint;
 use crate::phasing;
 use crate::rebar;
@@ -300,9 +303,18 @@ other_files(
     other_files(
         "reload",
         "Reload Links",
-        "{id?} read the file of the link `id`, or of every link, again: for a project that changed on disk. Returns `reloaded` \
-         (the names) and `failed` ({name, error})",
+        "{id?, review?:bool} read the file of the link `id`, or of every link, again: for a project that changed on disk. Returns `reloaded` \
+         (the names), `failed` ({name, error}) and `adaptations` for links with saved detector groups. With review, defer \
+         updating links with saved detector groups until adapt_ifc applies them",
         reload,
+        Files::Read,
+    ),
+    edit_files(
+        "adapt_ifc",
+        "Adapt to Updated IFC",
+        &[],
+        "{id:IFC link id|GUID, groups?:[{room,ids:[id|GUID],kind?,radius?,margin?,space?,heat?},…], append?:bool, apply?:bool, expected?:preview object, penetration_reference?:text} preview updated IFC, detector positions, feeder routes and route clashes. Apply commits the link and saves the groups in one undo step. If expected differs from the new preview, return review_required with the new preview. Omit groups to reuse them, use append to add to them, or apply an empty list to clear them. Unresolved groups prevent application. Crossings require a penetration reference and an exact matching expected preview for the current IFC revision",
+        adapt_ifc,
         Files::Read,
     ),
     other_files(
@@ -473,7 +485,7 @@ other_files(
          holes (a floor's or a ceiling's openings, a roof's courtyards; a shaft has none) as a sketch, all at once (see \
          `sketch`); a roof's gable edges stay gables where the new footprint has the same edge. Without `sketch`, gives the \
          outline and holes it has now, as the lines to edit. The outline must be simple, as `floor` says; a line that \
-         crosses itself is found as two that cross are",
+         crosses itself is found as two that cross are. A fire zone accepts one outline without holes",
         edit_boundary,
     ),
     edit(
@@ -768,7 +780,8 @@ other_files(
          (КНС) for each segment of the points, as `pipe` lays them: round types write as an IFC conduit segment, rectangular \
          types as an IFC cable tray segment; `system` names the cable group it carries. Alternatively \
          {from_wire: id|GUID, type?, placement?: centre|top|bottom, local_offset?: mm} creates a carrier around the wire's \
-         physical axis and links that wire in one undo step, preserving the wire's heights and slope. Placement and lateral \
+         physical axis and links that wire in one undo step, preserving the wire's heights and slope. A mounted wire transfers \
+         its support to the carrier and requires centre placement and zero lateral offset. Placement and lateral \
          offset must fit the section; already linked wires and owned equipment feeders are refused. Use mount: {host: id|GUID, face} with points to create a supported contact line. {from_wires: {level?: name|id|GUID}, type?: carrier type name} applies centre placement to all uncarried main wires on the given level, or throughout the project if level is omitted",
         cable_carrier,
     ),
@@ -810,6 +823,13 @@ other_files(
         wire,
     ),
     edit(
+        "fire_zone",
+        "Fire Zone",
+        &[],
+        "{id?:id|GUID, zone?:{name, kind:detection|notification, level:id|GUID, boundary:[[x,y],…], base_offset?, height, space?:plenum|underfloor, unit?:dwelling|apartment|hotel_room, include_rooms?:[id|GUID,…], exclude_rooms?:[id|GUID,…], notify?:[id|GUID,…]}, remote_indicators?:[{detector:id|GUID, connected?:bool, visible?:bool},…], room_group?:{same_floor?, same_fire_compartment?, isolated_rooms?:[id|GUID,…], common_exit?, max_exit_gap?, total_exit_gap?, vestibules?:[{room:id|GUID,depth,narrowest_door},…]}, dedicated_rooms?:[room id|GUID,…]} create or replace a fire zone; omit zone to inspect its equipment and detection checks or list zones. For inspection, remote_indicators supplies field evidence for 6.2.13 in hidden zones; room_group supplies general 6.3.4 evidence for main zones, with exit gaps and vestibule measurements in mm. Use dedicated_rooms to compare the projection with a designer-confirmed group requiring its own zone under 6.3.3. Set unit only for all rooms of one confirmed unit. Include its other levels explicitly by room; base_offset and height apply relative to each level",
+        fire_zone,
+    ),
+    edit(
         "electrical_terminal",
         "Electrical Terminal",
         &[],
@@ -835,6 +855,61 @@ other_files(
         "Inspect Electrical Line",
         "{id:id|GUID} read the line, ordered devices and their marks",
         electrical_line_inspect,
+    ),
+    other(
+        "soue_amplifier_load",
+        "Voice Alarm Amplifier Load",
+        "{rated_w:number, reserve_percent?:number, taps_w:[number|null,:]} check one constant-voltage output. Use tap ratings at its output voltage and include all simultaneous loads; null identifies a missing rating",
+        fire_design::amplifier,
+    ),
+    other(
+        "soue_sound_check",
+        "Voice Alarm Sound Check",
+        "{room:apartment|other|sleeping, class_f11?:bool, design_max_dba?:number, points:[{noise_dba?:number, signal_dba?:number, supplementary_alarm?:bool},:]} check supplied A-weighted levels with doors closed at 1.5 m above the floor, or at each sleeper's head. Supply effective noise during alarm",
+        fire_design::sound,
+    ),
+    other(
+        "fire_carrier_parts",
+        "Carrier Parts Estimate",
+        "{runs:[{length_m:number, support_pitch_m:number, section_m?:number},:], bends?:integer, tees?:integer, unlicensed_workstations?:integer} estimate supports including both ends, section connectors, bends, tees and software licences",
+        fire_design::parts,
+    ),
+    other(
+        "fire_okl_check",
+        "Fire-Resistant Wiring Evidence",
+        "{required_min:number, installed?:{cable:string, carrier:string, fastener:string, mounting:string, pitch_mm:number}, tested?:{cable:string, carrier:string, fastener:string, mounting:string, pitch_mm:number, duration_min:number, document:string}} compare one installed assembly with the declared documented test configuration. Use the design-required duration and report missing evidence",
+        fire_design::okl,
+    ),
+    other(
+        "fire_voltage_drop",
+        "Fire Voltage Drop",
+        "{source_v:number, segments:[{length_m?:number, ohm_per_km?:number, load_ma?:number, min_v?:number},:]} calculate a two-conductor radial DC line from source to end for one operating mode. Give installed one-way length, resistance per conductor at design temperature, local load and minimum device voltage",
+        fire_voltage_drop,
+    ),
+    other(
+        "fire_line_load",
+        "Fire Line Load",
+        "{id:line id|GUID, loads?:[{id:device id|GUID, standby_ma?:number, fire_ma?:number},:], limit_ma?:number, reserve_percent?:number} sum device and isolator currents per mode. Use a documented common line limit and an explicit reserve (default zero). Missing currents are reported by device",
+        fire_line_load,
+    ),
+    other(
+        "fire_battery",
+        "Fire Battery Capacity",
+        "{standby_a?:number, fire_a?:number, source_a?:number, end_capacity_percent?:number, load_factor?:number, standby_load_factor?:number, fire_load_factor?:number, installed_ah?:number} size one backup battery bank under SP 6.13130.2025 Appendix B. Give equipment currents referred to the battery, excluding the source's own current. Use either one documented load factor (B.1) or both mode-specific factors (B.2). With installed capacity and positive fire current, report fire-only runtime (B.4). Missing capacity inputs are reported",
+        fire_battery,
+    ),
+    other(
+        "fire_line_faults",
+        "Fire Line Faults",
+        "{id:line id|GUID, isolators?:[device id|GUID,…], source_isolates_ports?:bool, propose?:bool, allow_pair?:bool, max_isolators?:1..4, power?:{id?:separate power line id|GUID, lines?:[{id,source_isolates_ports?},…], independent?:[device id|GUID,…], source_isolates_ports?:bool}} simulate open and short faults under SP 484 Amendment 1, 6.3.5. Supply either one power id or lines. Lines can feed other lines through their sources. Use independent only for confirmed separately powered communication devices. With propose, test locations for one communication isolator; allow_pair also tests two distinct cable splits if one does not pass, up to 24 candidate cables. max_isolators enables sets of three or four distinct cable splits with up to 16 candidates. Set source_isolates_ports only for independently protected and feeding source terminals",
+        fire_line_faults,
+    ),
+    edit(
+        "fire_isolator",
+        "Place Fire Line Isolator",
+        &[],
+        "{id:line id|GUID, wire:main wire id|GUID, family:string, type?:string, fraction?:number, apply?:bool} preview a standalone short-circuit isolator (default midway between connections). Apply only for a verified bidirectional isolator family and type",
+        fire_isolator,
     ),
     other(
         "cable_journal",
@@ -898,15 +973,51 @@ other_files(
         cabling,
     ),
     edit(
+        "fire_standard",
+        "Fire Standard",
+        &[],
+        "{set?} reads the project's fire rules edition or explicitly selects a supported edition. Supported: ru_sp484_2020_a1_sp486_2020_a1",
+        fire_standard,
+    ),
+    other(
+        "detector_ceiling_check",
+        "Check Perforated Ceiling",
+        "{open_percent?, min_opening?, thickness?} checks SP 484 Amendment 1, 6.6.7 for one point detector above a suspended ceiling. +         Give the percentage of its projected coverage area open through the perforations, the smallest opening dimension in any +         section, and the perforation thickness (both mm). Returns the three checks and whether below-ceiling coverage may use this +         detector. Missing measurements are reported. Changes no elements",
+        detector_ceiling_check,
+    ),
+    other(
+        "hidden_fire_protection",
+        "Check Hidden Space Fire Protection",
+        "{space:plenum|underfloor, cable_load?:litres per metre, pipe_insulation?:none|ng|g1|g2|g3|g4, plenum_aup_scope?:bool, g2_cables_qualify?:bool, f5_off_egress?:bool} checks SP 486 Amendment 1, Table 2 item 10. Enter the cable load after excluding verified note 2 exemptions. Use the highest installed pipe insulation group. Confirm whether note 4 puts the plenum within AUP scope. For G2, confirm that cables are absent or all comply with note 2(a). Confirm F5 outside evacuation routes to show the UPA and SPS alternative. Changes no elements",
+        hidden_fire_protection,
+    ),
+    edit(
         "detectors",
         ui_msg!("Lay Detectors"),
         &[],
         "{room, kind?: smoke|heat, family?, type?, radius?, margin?} lays point fire detectors over a room (SP 484): a square \
-         grid that brings every point of it within `radius` mm of one (by default a smoke detector's 6400, a heat \
-         detector's 3500, and a reach that closes in proportion when the room's ceiling, to the level above, stands \
-         higher than the detector's mounting height); none nearer a wall than `margin` (500). `family` is by default the \
-         project's first of the `kind`'s (smoke), `type` its first; they stand on the room's level. Returns the new ids",
+         grid with reach `radius` mm (maximum and default 6400 for smoke, 3500 for heat). SP 484 Amendment 1 limits room heights to \
+         12000 for smoke and 9000 for heat. `margin` defaults to 500 mm from walls. `family` is by default the \
+         project's first of the `kind`'s (smoke), `type` its first. Fits the detectors to the modeled ceiling underside; \
+         without one, uses the next level or the default height to check the height limit. Covers each ceiling height \
+         compartment separately. Above 6000 mm, heat detectors require `heat: {class, trip_c, normal_c, max_c, rated_normal_c?, rated_max_c?}` \
+         (SP 484 Amendment 1, 6.2.3). `architecture?: id|GUID` adds the geometry of the selected loaded link. \
+         Optional `space: {above: id|GUID, below: id|GUID}` uses the void above a ceiling or floor \
+         and below a flat floor, clipped to the room in plan. Returns the new ids",
         detectors,
+    ),
+    edit(
+        "resat",
+        ui_msg!("Adapt Devices"),
+        &[],
+        "{room, ids?: [id|GUID], kind?: smoke|heat, radius?, margin?} repositions existing point detectors on the room's level \
+         on the current coverage grid. Without ids, takes detectors inside the room (optionally filtered by kind). Requires \
+         unmounted detectors of one kind and one per grid position. In each ceiling compartment, fits each detector to the \
+         underside; without a ceiling, keeps its offset. For a hidden `space: {above, below}` or a selected \
+         `architecture: id|GUID` link, supply the detector ids explicitly. For high heat layouts supply the same `heat` data as \
+         `detectors` for a single detector family/type. `preview: true` returns candidate points and whether \
+         their count matches the selection, with no changes. Applying keeps ids, GUIDs and connections. Returns {ids, changed}",
+        resat,
     ),
     edit(
         "stair",
@@ -1849,8 +1960,8 @@ other_files(
         "Area and Volume Computations",
         &[],
         "{at?: centre|finish} where the project measures its rooms' areas, perimeters and IFC spaces, as Revit's Area and \
-         Volume Computations: at the walls' centre lines (`centre`, as a project starts) or at their finish faces \
-         (`finish`, the floor inside the walls: the área útil Brazilian codes ask for). Rooms keep their points; only their \
+         Volume Computations: at the walls' centre lines (`centre`) or at their finish faces \
+         (`finish`, the floor inside the walls and the default for new projects). Rooms keep their points; only their \
          measured outline changes. IFC spaces carry both areas in Qto_SpaceBaseQuantities whichever is chosen",
         room_area,
     )
@@ -3469,7 +3580,12 @@ pub fn element_json_with(m: &Model, id: Id, rooms: &crate::rooms::Rooms) -> Valu
         Element::Dimension3D(d) => {
             extra.insert("length".into(), json!(hundredth(crate::dims3d::length(d))));
         }
-        Element::Grid(_) | Element::Schedule(_) | Element::View3D(_) | Element::PlanView(_) | Element::ElectricalLine(_) => {}
+        Element::Grid(_)
+        | Element::Schedule(_)
+        | Element::View3D(_)
+        | Element::PlanView(_)
+        | Element::ElectricalLine(_)
+        | Element::FireZone(_) => {}
         Element::ElectricalTerminal(t) => {
             extra.insert("name".into(), json!(t.name));
             extra.insert("purpose".into(), json!(t.purpose));
@@ -3573,9 +3689,13 @@ fn with_links(s: &mut Session, mut reply: Value) -> Value {
 
 /// `open`, but for what its links read.
 fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: bool) -> R {
+    open_file_with_revision(s, path, project, read_only, false)
+}
+
+fn open_file_with_revision(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: bool, revision: bool) -> R {
     let c = "open";
-    let size = std::fs::metadata(&path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
-    let most = max_file(&ext(&path));
+    let size = std::fs::metadata(path).map_err(|e| bad(c, format!("{}: {e}", path.display())))?.len();
+    let most = max_file(&ext(path));
     if size >= most {
         return Err(bad(c, format!("{} is too large ({size} bytes; `open` takes one under {most})", path.display())));
     }
@@ -3585,6 +3705,7 @@ fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: 
         let stem = path.file_stem().map_or_else(|| "Project".into(), |s| s.to_string_lossy().into_owned());
         let file = crate::step::parse(&bytes).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
         let seed = crate::import::seed(&bytes);
+        let digest = revision.then(|| ring::digest::digest(&ring::digest::SHA256, &bytes));
         // The text is freed before the model is built from it, so the two are not both held at the peak.
         drop(bytes);
         let i = crate::import::from_step(file, &stem, seed).map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
@@ -3599,8 +3720,12 @@ fn open_file(s: &mut Session, path: &Path, project: Option<PathBuf>, read_only: 
             .values()
             .filter(|e| matches!(e, Element::Component(c) if i.model.families.get(&c.family).is_some_and(|f| f.remembered().is_some())))
             .count();
-        let reply = json!({"path": path, "name": i.model.name, "format": i.schema, "elements": counts, "generic": generic,
+        let mut reply = json!({"path": path, "name": i.model.name, "format": i.schema, "elements": counts, "generic": generic,
             "skipped": i.skipped, "moved": i.moved});
+        if let Some(digest) = digest {
+            let hex: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+            reply["ifc_revision"] = json!(hex);
+        }
         s.reset(i.model, None);
         s.catalogue_read_only = read_only;
         return Ok(reply);
@@ -3776,10 +3901,15 @@ fn insert_from(s: &mut Session, p: &Value) -> R {
 
 /// The project a link's `path` names, read as `open` reads it: its own links are not followed.
 fn read_link(s: &Session, path: &str) -> Result<Arc<Model>, String> {
+    read_link_revision(s, path, false).map(|(model, _)| model)
+}
+
+fn read_link_revision(s: &Session, path: &str, revision: bool) -> Result<(Arc<Model>, Value), String> {
     let full = beside(s, path);
     let mut other = Session::new();
-    open_file(&mut other, &full, None, true).map_err(|e| e.trim_start_matches("open: ").to_string())?;
-    Ok(other.model)
+    let mut result =
+        open_file_with_revision(&mut other, &full, None, true, revision).map_err(|e| e.trim_start_matches("open: ").to_string())?;
+    Ok((other.model, result["ifc_revision"].take()))
 }
 
 /// What every link of the project reads, again; the links that couldn't be read, as `{name, error}`.
@@ -3820,40 +3950,276 @@ fn link_model(s: &mut Session, p: &Value) -> R {
     let angle = num(c, p, "angle")?.unwrap_or(0.0);
     let elements = other.elements.len();
     let m = s.model_mut();
-    let id = m.insert(Element::Link(crate::model::Link { name: name.clone(), path: path.clone(), at, angle }));
+    let id = m.insert(Element::Link(crate::model::Link { name: name.clone(), path: path.clone(), at, angle, detector_groups: Vec::new() }));
     m.loaded.insert(path, other);
     Ok(json!({"id": id, "name": name, "elements": elements}))
 }
 
 fn reload(s: &mut Session, p: &Value) -> R {
     let c = "reload";
+    let review = flag(c, p, "review")?;
     let only = id_opt(c, p, "id")?;
     if let Some(id) = only
         && !matches!(s.model.elements.get(id), Some(Element::Link(_)))
     {
         return Err(bad(c, format!("element {id} is not a link")));
     }
-    let want: Vec<(String, String)> = s
+    let want: Vec<_> = s
         .model
         .elements
         .iter()
         .filter(|(id, _)| only.is_none_or(|o| s.model.same(**id, o)))
-        .filter_map(|(_, e)| match e {
-            Element::Link(l) => Some((l.name.clone(), l.path.clone())),
+        .filter_map(|(&id, e)| match e {
+            Element::Link(l) => Some((id, l.name.clone(), l.path.clone(), l.detector_groups.clone())),
             _ => None,
         })
         .collect();
-    let (mut reloaded, mut failed) = (Vec::new(), Vec::new());
-    for (name, path) in want {
-        match read_link(s, &path) {
-            Ok(m) => {
+    let (mut reloaded, mut failed, mut adaptations) = (Vec::new(), Vec::new(), Vec::new());
+    for (id, name, path, groups) in want {
+        match read_link_revision(s, &path, !groups.is_empty()) {
+            Ok((m, revision)) => {
+                let before = (review && !groups.is_empty()).then(|| s.model.clone());
                 Arc::make_mut(&mut s.model).loaded.insert(path, m);
+                if !groups.is_empty() {
+                    let refreshed = s.model.clone();
+                    let params: Vec<_> = groups.iter().map(ifc_group_params).collect();
+                    let mut report = assess_ifc_groups(s, id, &params, before.as_deref().unwrap_or(&refreshed));
+                    report["ifc_revision"] = revision;
+                    s.model = before.unwrap_or(refreshed);
+                    report["link"] = json!(id);
+                    adaptations.push(report);
+                    if review {
+                        continue;
+                    }
+                }
                 reloaded.push(name);
             }
             Err(error) => failed.push(json!({"name": name, "error": error})),
         }
     }
-    Ok(json!({"reloaded": reloaded, "failed": failed}))
+    let mut result = json!({"reloaded": reloaded, "failed": failed});
+    if !adaptations.is_empty() {
+        result["adaptations"] = json!(adaptations);
+    }
+    Ok(result)
+}
+
+fn adapt_ifc(s: &mut Session, p: &Value) -> R {
+    let c = "adapt_ifc";
+    only(c, p, &["id", "groups", "append", "apply", "expected", "penetration_reference"])?;
+    let apply = flag(c, p, "apply")?;
+    let append = flag(c, p, "append")?;
+    let penetration = string(c, p, "penetration_reference")?;
+    if penetration.as_ref().is_some_and(|reference| reference.trim().is_empty() || !apply || !p["expected"].is_object()) {
+        return Err(bad(c, "a penetration reference needs nonblank text, apply and the expected preview"));
+    }
+    let id = element_id(c, &s.model, &p["id"])?;
+    let Some(Element::Link(link)) = s.model.elements.get(id) else { return Err(bad(c, "select an IFC link")) };
+    if !Path::new(&link.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("ifc")) {
+        return Err(bad(c, "select an IFC link"));
+    }
+    if append && p.get("groups").and_then(Value::as_array).is_none_or(Vec::is_empty) {
+        return Err(bad(c, "give groups to append"));
+    }
+    let (groups, saved) = if let Some(groups) = p.get("groups") {
+        let groups = groups
+            .as_array()
+            .filter(|groups| groups.len() <= MAX_IFC_DETECTOR_GROUPS)
+            .ok_or_else(|| bad(c, format!("give up to {MAX_IFC_DETECTOR_GROUPS} detector groups")))?;
+        if groups.is_empty() && apply {
+            if penetration.is_some() {
+                return Err(bad(c, "a penetration reference cannot clear detector groups"));
+            }
+            set_ifc_groups(s, id, Vec::new())?;
+            return Ok(json!({"status":"cleared"}));
+        }
+        if append {
+            if groups.len() + link.detector_groups.len() > MAX_IFC_DETECTOR_GROUPS {
+                return Err(bad(c, format!("give up to {MAX_IFC_DETECTOR_GROUPS} detector groups in total")));
+            }
+            let combined: Vec<_> = link.detector_groups.iter().map(ifc_group_params).chain(groups.iter().cloned()).collect();
+            ifc_groups(&s.model, &combined)?
+        } else {
+            ifc_groups(&s.model, groups)?
+        }
+    } else {
+        (link.detector_groups.iter().map(ifc_group_params).collect(), link.detector_groups.clone())
+    };
+    if groups.is_empty() {
+        return Err(bad(c, "give detector groups or save them by applying an adaptation first"));
+    }
+    let path = link.path.clone();
+    let (incoming, revision) = read_link_revision(s, &path, true).map_err(|e| bad(c, e))?;
+    let before = s.model.clone();
+    s.model_mut().loaded.insert(path, incoming);
+    let mut result = assess_ifc_groups(s, id, &groups, &before);
+    result["ifc_revision"] = revision;
+    if apply && (result["status"] == "ready" || penetration.is_some()) {
+        if p.get("expected").is_some_and(|preview| preview != &result) {
+            s.model = before;
+            return Ok(json!({"status":"review_required","preview":result}));
+        }
+        if (result["status"] == "ready" && penetration.is_none()) || (result["can_approve_crossings"] == true && penetration.is_some()) {
+            set_ifc_groups(s, id, saved)?;
+            result["status"] = json!("applied");
+            if let Some(reference) = penetration {
+                result["penetration_reference"] = json!(reference.trim());
+            }
+            return Ok(result);
+        }
+    }
+    s.model = before;
+    Ok(result)
+}
+
+fn set_ifc_groups(s: &mut Session, id: Id, groups: Vec<IfcDetectorGroup>) -> Result<(), String> {
+    let Some(Element::Link(link)) = s.model_mut().elements.get_mut(id) else { return Err(bad("adapt_ifc", "the link no longer exists")) };
+    link.detector_groups = groups;
+    Ok(())
+}
+
+fn ifc_groups(m: &Model, groups: &[Value]) -> Result<(Vec<Value>, Vec<IfcDetectorGroup>), String> {
+    let c = "adapt_ifc";
+    let mut selected = BTreeSet::new();
+    let mut params = Vec::with_capacity(groups.len());
+    let mut saved = Vec::with_capacity(groups.len());
+    for group in groups {
+        only(c, group, &["room", "ids", "kind", "radius", "margin", "space", "heat"])?;
+        if group.get("ids").and_then(Value::as_array).is_none_or(Vec::is_empty) {
+            return Err(bad(c, "each group needs explicit detector ids"));
+        }
+        let ids = ids_param(c, m, group)?;
+        for &id in &ids {
+            if !selected.insert(id) {
+                return Err(bad(c, format!("detector {id} is selected in more than one group")));
+            }
+        }
+        if selected.len() > MAX_DETECTORS {
+            return Err(bad(c, format!("select no more than {MAX_DETECTORS} detectors")));
+        }
+        let slab = |space: &Value, key: &str| {
+            let guid: Guid =
+                serde_json::from_value(space[key].clone()).map_err(|_| bad(c, "give a local slab id or a linked slab GUID"))?;
+            if let Some(id) = m.elements.id(guid) {
+                Ok(IfcSlab::Local(m.guid(id)))
+            } else if guid.pending().is_none() {
+                Ok(IfcSlab::Linked(guid))
+            } else {
+                Err(bad(c, "give a local slab id or a linked slab GUID"))
+            }
+        };
+        let space = if let Some(space) = group.get("space").filter(|v| !v.is_null()) {
+            only(c, space, &["above", "below"])?;
+            Some([slab(space, "above")?, slab(space, "below")?])
+        } else {
+            None
+        };
+        let heat = group
+            .get("heat")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|error| bad(c, format!("invalid heat evidence: {error}")))?;
+        let stored = IfcDetectorGroup {
+            room: m.guid(element_id(c, m, &group["room"])?),
+            ids: ids.into_iter().map(|id| m.guid(id)).collect(),
+            radius: num(c, group, "radius")?,
+            margin: num(c, group, "margin")?.map(|margin| margin.max(0.0)),
+            space,
+            heat,
+        };
+        let mut normalized = ifc_group_params(&stored);
+        if let Some(kind) = group.get("kind") {
+            normalized["kind"] = kind.clone();
+        }
+        params.push(normalized);
+        saved.push(stored);
+    }
+    Ok((params, saved))
+}
+
+fn ifc_group_params(group: &IfcDetectorGroup) -> Value {
+    let space = group.space.map(|[above, below]| json!({"above":above.guid(),"below":below.guid()}));
+    json!({"room":group.room,"ids":group.ids,"radius":group.radius,"margin":group.margin,"space":space,"heat":group.heat})
+}
+
+fn assess_ifc_groups(s: &mut Session, id: Id, groups: &[Value], before: &Model) -> Value {
+    let mut ready = true;
+    let mut outcomes = Vec::new();
+    let mut changed = BTreeSet::new();
+    for group in groups {
+        let mut params = group.clone();
+        params["architecture"] = json!(id);
+        let mut outcome = match resat_impl(s, &params, true) {
+            Ok(outcome) => outcome,
+            Err(error) => json!({"status":"unresolved","error":error}),
+        };
+        ready &= outcome["status"] == "ready";
+        changed.extend(outcome["changed"].as_array().into_iter().flatten().filter_map(Value::as_u64));
+        outcome["room"] = group["room"].clone();
+        outcomes.push(outcome);
+    }
+    let route_error = if ready { s.model_mut().refresh_wire_connections(before).err() } else { None };
+    ready &= route_error.is_none();
+    let selected = groups
+        .iter()
+        .flat_map(|group| group["ids"].as_array().into_iter().flatten())
+        .filter_map(|id| serde_json::from_value::<Guid>(id.clone()).ok())
+        .collect();
+    let route_model = if ready { &s.model } else { before };
+    let clashes = crate::link::route_clashes(&s.model, id, route_model, &selected);
+    let can_approve = ready && clashes.as_ref().is_ok_and(|items| !items.is_empty());
+    let mut result = if ready && clashes.is_ok() {
+        let devices = changed.iter().map(|&id| s.model.guid(id)).collect();
+        let routes = adapted_feeders(before, &s.model, &devices);
+        json!({"status":if can_approve { "blocked" } else { "ready" },"groups":outcomes,"changed":changed,"routes":routes})
+    } else {
+        json!({"status":"blocked","groups":outcomes,"changed":[],"routes":[]})
+    };
+    result["package"] = json!(s.model.fire_standard);
+    if can_approve {
+        result["can_approve_crossings"] = json!(true);
+    }
+    if let Some(error) = route_error {
+        result["route_error"] = json!(error);
+    }
+    match clashes {
+        Ok(clashes) if !clashes.is_empty() => result["route_clashes"] = json!(clashes),
+        Err(error) => result["route_clash_error"] = json!(error),
+        _ => {}
+    }
+    result
+}
+
+fn adapted_feeders(before: &Model, after: &Model, devices: &BTreeSet<Guid>) -> Vec<Value> {
+    let feeders = |model: &Model| {
+        model
+            .elements
+            .iter()
+            .filter_map(|(&id, element)| {
+                let feeder = element.run()?.feeder.as_ref()?;
+                if !devices.contains(&feeder.device) {
+                    return None;
+                }
+                let geom = model.run_geom(element)?;
+                Some((id, (model.elements.id(feeder.wire)?, [geom.a, geom.b])))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let old = feeders(before);
+    let new = feeders(after);
+    let ids: BTreeSet<_> = old.keys().chain(new.keys()).copied().collect();
+    ids.into_iter()
+        .filter_map(|id| {
+            let from = old.get(&id);
+            let to = new.get(&id);
+            if from == to {
+                return None;
+            }
+            let wire = to.or(from)?.0;
+            Some(json!({"id":id,"wire":wire,"before":from.map(|entry|entry.1),"after":to.map(|entry|entry.1)}))
+        })
+        .collect()
 }
 
 fn save(s: &mut Session, p: &Value) -> R {
@@ -8982,14 +9348,136 @@ fn tag(s: &mut Session, p: &Value) -> R {
     Ok(json!({"ids": ids}))
 }
 
+fn fire_standard(s: &mut Session, p: &Value) -> R {
+    let c = "fire_standard";
+    only(c, p, &["set"])?;
+    if let Some(value) = p.get("set") {
+        let package = serde_json::from_value(value.clone()).map_err(|e| bad(c, format!("unsupported fire standard: {e}")))?;
+        if s.model.fire_standard != package {
+            s.model_mut().fire_standard = package;
+        }
+    }
+    let package = s.model.fire_standard;
+    Ok(json!({"package":package,"detector_rules":package.detector_rules(),"hidden_space_rules":package.hidden_space_rules()}))
+}
+
+fn hidden_fire_protection(s: &mut Session, p: &Value) -> R {
+    let c = "hidden_fire_protection";
+    only(c, p, &["space", "cable_load", "pipe_insulation", "plenum_aup_scope", "g2_cables_qualify", "f5_off_egress"])?;
+    let plenum = match string(c, p, "space")?.as_deref() {
+        Some("plenum") => true,
+        Some("underfloor") => false,
+        _ => return Err(bad(c, "choose space: plenum or underfloor")),
+    };
+    let cable = p
+        .get("cable_load")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or_else(|| bad(c, "cable_load must be nonnegative litres per metre"))
+        })
+        .transpose()?;
+    let pipe = match string(c, p, "pipe_insulation")?.as_deref() {
+        None => None,
+        Some("none" | "ng" | "g1") => Some(1),
+        Some("g2") => Some(2),
+        Some("g3" | "g4") => Some(3),
+        _ => return Err(bad(c, "choose pipe_insulation: none, ng, g1, g2, g3 or g4")),
+    };
+    let confirmed = |key| flag(c, p, key).map(|value| (!absent(p.get(key))).then_some(value));
+    let scope = confirmed("plenum_aup_scope")?;
+    let g2 = confirmed("g2_cables_qualify")?;
+    let alternative = flag(c, p, "f5_off_egress")?;
+    let mut result = json!({"package":s.model.fire_standard,"standard":s.model.fire_standard.hidden_space_rules(),"table":2,"item":"10","status":"insufficient_data"});
+    let (Some(cable), Some(pipe)) = (cable, pipe) else {
+        result["missing"] = json!(
+            [cable.is_none().then_some("cable_load"), pipe.is_none().then_some("pipe_insulation")]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        );
+        return Ok(result);
+    };
+    let status = if cable >= 7.0 || pipe >= 2 {
+        match (plenum, scope, cable, pipe, g2) {
+            (true, None, ..) => {
+                result["missing"] = json!(["plenum_aup_scope"]);
+                "insufficient_data"
+            }
+            (true, Some(false), ..) if (1.5..7.0).contains(&cable) => "sps_required",
+            (true, Some(false), ..) => "outside_aup_scope",
+            (_, _, 0.0, 2, None) => {
+                result["missing"] = json!(["g2_cables_qualify"]);
+                "insufficient_data"
+            }
+            (_, _, 0.0, 2, Some(true)) => "aup_exception_allowed",
+            _ => "aup_required",
+        }
+    } else if cable >= 1.5 {
+        "sps_required"
+    } else {
+        "no_table_2_item_10_trigger"
+    };
+    result["status"] = json!(status);
+    if status == "aup_required" && alternative {
+        result["alternative"] = json!("upa_and_sps");
+    }
+    Ok(result)
+}
+
+fn detector_ceiling_check(s: &mut Session, p: &Value) -> R {
+    let c = "detector_ceiling_check";
+    only(c, p, &["open_percent", "min_opening", "thickness"])?;
+    let open = p
+        .get("open_percent")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_f64().filter(|value| (0.0..=100.0).contains(value)).ok_or_else(|| bad(c, "`open_percent` must be between 0 and 100"))
+        })
+        .transpose()?;
+    let opening = num(c, p, "min_opening")?;
+    if opening.is_some_and(|value| value <= 0.0) {
+        return Err(bad(c, "`min_opening` must be positive"));
+    }
+    let thickness = num(c, p, "thickness")?;
+    if thickness.is_some_and(|value| value <= 0.0) {
+        return Err(bad(c, "`thickness` must be positive"));
+    }
+    let open_ok = open.map(|value| value >= 40.0);
+    let opening_ok = opening.map(|value| value > 10.0);
+    let thickness_ok = thickness.zip(opening).map(|(thickness, opening)| thickness <= 3.0 * opening);
+    let checks = [open_ok, opening_ok, thickness_ok];
+    let status = if checks.contains(&Some(false)) {
+        "needs_below_ceiling_detector"
+    } else if checks.contains(&None) {
+        "insufficient_data"
+    } else {
+        "eligible"
+    };
+    let outcome = |check| match check {
+        Some(true) => "pass",
+        Some(false) => "fail",
+        None => "insufficient_data",
+    };
+    Ok(json!({
+        "package":s.model.fire_standard,
+        "standard":s.model.fire_standard.detector_rules(),
+        "clause":"6.6.7",
+        "status":status,
+        "checks":{"open_percent":outcome(open_ok), "min_opening":outcome(opening_ok), "thickness":outcome(thickness_ok)}
+    }))
+}
+
 fn detectors(s: &mut Session, p: &Value) -> R {
     let c = "detectors";
+    only(c, p, &["room", "kind", "family", "type", "radius", "margin", "space", "architecture", "heat"])?;
     let m = &s.model;
     let room = element_id(c, m, p.get("room").ok_or_else(|| bad(c, "`room` (the room's id) is required"))?)?;
-    let Some(Element::Room(r)) = m.elements.get(room) else {
-        return Err(bad(c, format!("{room} isn't a room")));
-    };
-    let region = m.room_region(r).ok_or_else(|| bad(c, format!("room {} isn't bound by walls any more", r.number)))?;
+    let architecture = detector_architecture(c, p, m)?;
+    let geometry = architecture.as_ref().unwrap_or(m);
+    let (r, region) = detector_room(c, geometry, room)?;
     let kind = match string(c, p, "kind")?.as_deref() {
         None | Some("smoke") => crate::family::Category::SmokeDetector,
         Some("heat") => crate::family::Category::HeatDetector,
@@ -9005,70 +9493,614 @@ fn detectors(s: &mut Session, p: &Value) -> R {
             .ok_or_else(|| bad(c, "the project has no family of that kind of detector: give `family`"))?,
     };
     let f = m.families.get(&family).ok_or_else(|| bad(c, format!("family `{family}` doesn't exist")))?;
-    let base = match f.category {
-        crate::family::Category::SmokeDetector => 6400.0,
-        crate::family::Category::HeatDetector => 3500.0,
-        _ => return Err(bad(c, format!("`{family}` isn't a smoke or heat detector"))),
+    let Some(limits) = detector_limits(f.category) else {
+        return Err(bad(c, format!("`{family}` isn't a smoke or heat detector")));
     };
     let type_name = match string(c, p, "type")? {
         Some(t) if f.types.contains_key(&t) => t,
         Some(t) => return Err(bad(c, format!("family `{family}` has no type `{t}`"))),
         None => f.types.keys().next().cloned().ok_or_else(|| bad(c, format!("family `{family}` has no type")))?,
     };
-    // SP 484 lets a point detector sense within its reach only up to the height its type is made for:
-    // over a room whose ceiling stands higher, the plume is thinner and the reach closes in
-    // proportion. The ceiling is the room's level to the one above, or the height of a room without
-    // a level above; the height made for is the family's mounting height, its type's over it.
-    const MAX_DETECTORS: usize = 2000;
-    let mounting = m.language.word("Mounting Height");
-    let design = f
-        .types
-        .get(&type_name)
-        .and_then(|t| t.get(mounting).and_then(Value::as_f64))
-        .or_else(|| f.parameters.iter().find(|q| q.name == mounting).and_then(|q| q.value.as_f64()))
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .unwrap_or(crate::model::DEFAULT_HEIGHT);
-    let ceiling = m.level_above(r.level).map_or(crate::model::DEFAULT_HEIGHT, |up| m.elevation(up) - m.elevation(r.level));
-    let reach = match num(c, p, "radius")? {
-        Some(r) => r,
-        None => base * (design / ceiling.max(1.0)).min(1.0),
+    let space = hidden_detector_space(c, p, geometry)?;
+    let points = detector_grid(c, p, geometry, r, &region, limits, space.as_ref())?;
+    let device = Component {
+        family,
+        type_name,
+        level: r.level,
+        at: r.point,
+        angle: 0.0,
+        offset: 0.0,
+        mirrored: false,
+        params: BTreeMap::new(),
+        provision: None,
+        mount: None,
+        detector_space: space.as_ref().map(|space| space.kind),
+        connection_sides: Vec::new(),
     };
-    if reach <= 0.0 {
-        return Err(bad(c, "`radius` is more than 0"));
+    let contact = m.component_contact_height(&device, "bottom");
+    if let Some(space) = &space {
+        space.check_fit(c, m, &device)?;
     }
-    let margin = num(c, p, "margin")?.unwrap_or(500.0).max(0.0);
-    // No grid tinier than what one command may lay in detectors.
-    let (x0, x1, y0, y1) = region
-        .outer
-        .iter()
-        .fold((f64::MAX, f64::MIN, f64::MAX, f64::MIN), |(x0, x1, y0, y1), q| (x0.min(q.0), x1.max(q.0), y0.min(q.1), y1.max(q.1)));
-    let step = reach * std::f64::consts::SQRT_2;
-    let cells = |span: f64| (span / step).ceil().max(1.0);
-    if cells(x1 - x0) * cells(y1 - y0) > MAX_DETECTORS as f64 {
-        return Err(bad(c, format!("this `radius` would need over {MAX_DETECTORS} detectors over the room: ask for a bigger one")));
-    }
-    let level = r.level;
-    let points = region.cover(reach, margin);
     let model = s.model_mut();
     let ids: Vec<Id> = points
         .into_iter()
-        .map(|at| {
-            model.insert(Element::Component(Component {
-                family: family.clone(),
-                type_name: type_name.clone(),
-                level,
-                at,
-                angle: 0.0,
-                offset: 0.0,
-                mirrored: false,
-                params: BTreeMap::new(),
-                provision: None,
-                mount: None,
-                connection_sides: Vec::new(),
-            }))
+        .map(|(at, ceiling)| {
+            let offset = ceiling.map_or(device.offset, |height| height - contact);
+            model.insert(Element::Component(Component { at, offset, ..device.clone() }))
         })
         .collect();
-    Ok(json!({"ids": ids}))
+    Ok(json!({"ids": ids, "package": model.fire_standard}))
+}
+
+fn fire_zone(s: &mut Session, p: &Value) -> R {
+    let c = "fire_zone";
+    only(c, p, &["id", "zone", "remote_indicators", "room_group", "dedicated_rooms"])?;
+    let m = &s.model;
+    let id = p.get("id").filter(|v| !v.is_null()).map(|v| element_id(c, m, v)).transpose()?;
+    if let Some(id) = id
+        && !matches!(m.elements.get(id), Some(Element::FireZone(_)))
+    {
+        return Err(bad(c, format!("{id} isn't a fire zone")));
+    }
+    if let Some(value) = p.get("zone").filter(|v| !v.is_null()) {
+        if p.get("dedicated_rooms").is_some() {
+            return Err(bad(c, "inspect an existing detection zone to assess dedicated rooms"));
+        }
+        if p.get("room_group").is_some() {
+            return Err(bad(c, "inspect an existing main detection zone to assess a room group"));
+        }
+        if p.get("remote_indicators").is_some() {
+            return Err(bad(c, "inspect an existing hidden detection zone to assess remote indicators"));
+        }
+        let mut zone: crate::model::FireZone = serde_json::from_value(value.clone()).map_err(|e| bad(c, e))?;
+        zone.boundary = ring(zone.boundary);
+        let m = s.model_mut();
+        let id = match id {
+            Some(id) => {
+                m.elements.insert(id, Element::FireZone(zone));
+                id
+            }
+            None => m.insert(Element::FireZone(zone)),
+        };
+        return Ok(json!({"id": id, "guid": m.guid(id)}));
+    }
+    let Some(id) = id else {
+        if p.get("dedicated_rooms").is_some() {
+            return Err(bad(c, "select a detection zone to assess dedicated rooms"));
+        }
+        if p.get("room_group").is_some() {
+            return Err(bad(c, "select a main detection zone to assess a room group"));
+        }
+        if p.get("remote_indicators").is_some() {
+            return Err(bad(c, "select a hidden detection zone to assess remote indicators"));
+        }
+        return Ok(json!({"ids": m.rare("fire_zone")}));
+    };
+    let Some(Element::FireZone(zone)) = m.elements.get(id) else { return Err(bad(c, "select a fire zone")) };
+    let confirmed = if let Some(value) = p.get("remote_indicators") {
+        if zone.space.is_none() || zone.kind != crate::model::FireZoneKind::Detection {
+            return Err(bad(c, "select a hidden detection zone to assess remote indicators"));
+        }
+        let evidence = value
+            .as_array()
+            .filter(|entries| entries.len() <= MAX_POINTS)
+            .ok_or_else(|| bad(c, format!("`remote_indicators` must be an array of up to {MAX_POINTS} records")))?;
+        let mut confirmed = BTreeMap::new();
+        for item in evidence {
+            only(c, item, &["detector", "connected", "visible"])?;
+            let detector = element_id(c, m, &item["detector"])?;
+            let fact = |key| match item.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Bool(value)) => Ok(Some(*value)),
+                Some(_) => Err(bad(c, format!("`{key}` must be true or false"))),
+            };
+            let facts = [fact("connected")?, fact("visible")?];
+            let state = if facts.contains(&Some(false)) {
+                "fail"
+            } else if facts.contains(&None) {
+                "insufficient_data"
+            } else {
+                "pass"
+            };
+            if confirmed.insert(detector, state).is_some() {
+                return Err(bad(c, format!("give only one remote indicator record for detector {detector}")));
+            }
+        }
+        Some(confirmed)
+    } else {
+        None
+    };
+    let group = p
+        .get("room_group")
+        .map(|value| {
+            if zone.space.is_some() || zone.kind != crate::model::FireZoneKind::Detection {
+                return Err(bad(c, "select a main detection zone to assess a room group"));
+            }
+            if zone.unit.is_some() {
+                return Err(bad(c, "a whole-unit zone uses the unit exception instead of ordinary room grouping"));
+            }
+            if value["isolated_rooms"].as_array().is_some_and(|rooms| rooms.len() > MAX_POINTS) {
+                return Err(bad(c, format!("give up to {MAX_POINTS} isolated rooms")));
+            }
+            if value["vestibules"].as_array().is_some_and(|rooms| rooms.len() > 256) {
+                return Err(bad(c, "give up to 256 vestibules"));
+            }
+            serde_json::from_value(value.clone()).map_err(|error| bad(c, format!("`room_group`: {error}")))
+        })
+        .transpose()?;
+    let mut report = crate::fire_zones::report(m, id, zone, confirmed, group).map_err(|error| bad(c, error))?;
+    report["package"] = json!(m.fire_standard);
+    if let Some(value) = p.get("dedicated_rooms") {
+        if zone.space.is_some() || zone.kind != crate::model::FireZoneKind::Detection {
+            return Err(bad(c, "select a main detection zone to assess dedicated rooms"));
+        }
+        if !value.as_array().is_some_and(|rooms| (1..=32).contains(&rooms.len())) {
+            return Err(bad(c, "give between 1 and 32 dedicated rooms"));
+        }
+        let dedicated = guids_param(c, m, value, "dedicated_rooms")?;
+        report["assessment"]["dedicated_projection"] =
+            crate::fire_zones::dedicated_projection(m, id, zone, &dedicated).map_err(|error| bad(c, error))?;
+    }
+    Ok(report)
+}
+
+fn detector_architecture(c: &str, p: &Value, m: &Model) -> Result<Option<Model>, String> {
+    p.get("architecture")
+        .filter(|v| !v.is_null())
+        .map(|v| crate::link::with_architecture(m, element_id(c, m, v)?).map_err(|e| bad(c, e)))
+        .transpose()
+}
+
+fn detector_room<'a>(c: &str, m: &'a Model, id: Id) -> Result<(&'a Room, geom::Region), String> {
+    let Some(Element::Room(room)) = m.elements.get(id) else { return Err(bad(c, format!("{id} isn't a room"))) };
+    let region = m.room_bound(room, m.room_area).map_err(|reason| match reason {
+        Unbound::NotEnclosed => bad(c, format!("room {} isn't bound by walls any more", room.number)),
+        Unbound::Shared(other) => {
+            bad(c, format!("room {} shares its boundary with {}; resolve the room anchors", room.number, m.shown(other)))
+        }
+    })?;
+    Ok((room, region))
+}
+
+struct HiddenDetectorSpace<'a> {
+    kind: DetectorSpace,
+    lower: SlabPlan<'a>,
+    upper: SlabPlan<'a>,
+    bottom: f64,
+    top: f64,
+}
+
+impl HiddenDetectorSpace<'_> {
+    fn check_fit(&self, c: &str, m: &Model, device: &Component) -> Result<(), String> {
+        let depth = m.component_contact_height(device, "bottom") - m.component_contact_height(device, "top");
+        if depth > self.top - self.bottom + TOL {
+            return Err(bad(c, "the detector does not fit between the hidden space surfaces"));
+        }
+        Ok(())
+    }
+}
+
+struct SlabPlan<'a> {
+    outer: &'a [P2],
+    holes: &'a [Vec<P2>],
+}
+
+impl SlabPlan<'_> {
+    fn contains(&self, at: P2) -> bool {
+        geom::contains(self.outer, at) && !self.holes.iter().any(|hole| geom::contains(hole, at))
+    }
+}
+
+fn hidden_detector_space<'a>(c: &str, p: &Value, m: &'a Model) -> Result<Option<HiddenDetectorSpace<'a>>, String> {
+    let Some(space) = p.get("space").filter(|v| !v.is_null()) else { return Ok(None) };
+    only(c, space, &["above", "below"])?;
+    let bound = |name| {
+        let id = element_id(c, m, space.get(name).ok_or_else(|| bad(c, format!("`space.{name}` is required")))?)?;
+        m.elements.get(id).ok_or_else(|| bad(c, format!("{id} doesn't exist")))
+    };
+    let floor = |f: &'a Floor| {
+        if f.slope != 0.0 || !f.shape.is_empty() {
+            return Err(bad(c, "hidden detector space needs flat, unshaped floor slabs"));
+        }
+        Ok((SlabPlan { outer: &f.boundary, holes: &f.openings }, m.elevation(f.level) + f.offset))
+    };
+    let (kind, lower, bottom) = match bound("above")? {
+        Element::Ceiling(v) => (
+            DetectorSpace::Plenum,
+            SlabPlan { outer: &v.boundary, holes: &v.openings },
+            m.elevation(v.level) + v.offset + m.types.ceiling.get(&v.type_name).map_or(0.0, |t| t.thickness),
+        ),
+        Element::Floor(f) => {
+            let (plan, top) = floor(f)?;
+            (DetectorSpace::Underfloor, plan, top)
+        }
+        _ => return Err(bad(c, "`space.above` must name a ceiling or flat floor")),
+    };
+    let Element::Floor(f) = bound("below")? else { return Err(bad(c, "`space.below` must name a flat floor")) };
+    let (upper, top) = floor(f)?;
+    let top = top - m.floor_depth(f);
+    if top <= bottom + TOL {
+        return Err(bad(c, "hidden detector space must have a positive clear height between slab faces"));
+    }
+    Ok(Some(HiddenDetectorSpace { kind, lower, upper, bottom, top }))
+}
+
+struct DetectorLimits {
+    radius: f64,
+    height: f64,
+    clause: &'static str,
+    heat: bool,
+}
+
+impl HeatEvidence {
+    /// SP 484 Amendment 1, 6.2.3; A1 / A1R temperatures in GOST 34698-2020, table 5.1.
+    fn check(&self) -> Result<(), &'static str> {
+        let allowed = |temperature| (-273.15..=1000.0).contains(&temperature);
+        if ![self.trip_c, self.normal_c, self.max_c].into_iter().all(allowed) || self.normal_c > self.max_c {
+            return Err("supply ordered and finite ambient temperatures in degrees Celsius");
+        }
+        let (rated_normal, rated_max) = match self.class.as_str() {
+            "A1" | "A1R" if (54.0..=65.0).contains(&self.trip_c) => (25.0, 50.0),
+            "PR" if self.trip_c >= 54.0 => match (self.rated_normal_c, self.rated_max_c) {
+                (Some(normal), Some(max)) if allowed(normal) && allowed(max) && normal <= max && max < self.trip_c => (normal, max),
+                _ => {
+                    return Err(
+                        "insufficient PR temperature evidence; supply valid rated_normal_c and rated_max_c from the device documentation",
+                    );
+                }
+            },
+            _ => return Err("above 6000 mm use A1, A1R or PR with a compatible trip temperature of at least 54 °C"),
+        };
+        if self.normal_c > rated_normal || self.max_c > rated_max {
+            return Err("ambient temperatures exceed the detector's normal or maximum normal rating");
+        }
+        Ok(())
+    }
+}
+
+/// SP 484.1311500.2020 Amendment 1, approved by MChS order 252 of 2025-03-27.
+fn detector_limits(category: crate::family::Category) -> Option<DetectorLimits> {
+    use crate::family::Category::{HeatDetector, SmokeDetector};
+
+    match category {
+        HeatDetector => Some(DetectorLimits { radius: 3500.0, height: 9000.0, clause: "6.6.15", heat: true }),
+        SmokeDetector => Some(DetectorLimits { radius: 6400.0, height: 12000.0, clause: "6.6.16", heat: false }),
+        _ => None,
+    }
+}
+
+fn detector_grid(
+    c: &str,
+    p: &Value,
+    m: &Model,
+    room: &Room,
+    region: &geom::Region,
+    limits: DetectorLimits,
+    space: Option<&HiddenDetectorSpace<'_>>,
+) -> Result<Vec<(P2, Option<f64>)>, String> {
+    let reach = num(c, p, "radius")?.unwrap_or(limits.radius);
+    if reach <= 0.0 {
+        return Err(bad(c, "`radius` is more than 0"));
+    }
+    let (max_reach, clause) = if !limits.heat && space.is_some_and(|space| space.top - space.bottom < 1700.0) {
+        (limits.radius * 1.5, "6.6.41")
+    } else {
+        (limits.radius, limits.clause)
+    };
+    if reach > max_reach {
+        return Err(bad(c, format!("`radius` exceeds {max_reach} mm for this detector (SP 484 Amendment 1, {clause})")));
+    }
+    let margin = num(c, p, "margin")?.unwrap_or(500.0).max(0.0);
+    let heat: Option<HeatEvidence> = p
+        .get("heat")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()).map_err(|e| bad(c, format!("`heat`: {e}"))))
+        .transpose()?;
+    if heat.is_some() && !limits.heat {
+        return Err(bad(c, "`heat` applies only to heat detectors"));
+    }
+    let height_ok = |height| {
+        if height <= 0.0 {
+            return Err(bad(c, "the room must have a positive height above its base"));
+        }
+        if height > limits.height {
+            return Err(bad(
+                c,
+                format!("room height {height} mm exceeds {} mm for this detector (SP 484 Amendment 1, {})", limits.height, limits.clause),
+            ));
+        }
+        if limits.heat && height > 6000.0 {
+            heat.as_ref()
+                .ok_or("insufficient heat detector class and temperature evidence; supply `heat`")
+                .and_then(HeatEvidence::check)
+                .map_err(|e| bad(c, format!("SP 484 Amendment 1, 6.2.3: {e}")))?;
+        }
+        Ok(())
+    };
+    let Some((lo, hi)) = geom::bounds(&region.outer) else { return Err(bad(c, "the room has no boundary")) };
+    let grid = |region: &geom::Region, elevations, remaining| {
+        detector_ceiling_grid(c, m, (region, room.level), elevations, reach, margin, limits.heat, remaining)
+    };
+    if let Some(space) = space {
+        height_ok(space.top - space.bottom)?;
+        let shafts = m.shaft_table();
+        let shafts: Vec<_> = shafts
+            .iter()
+            .filter(|s| {
+                s.bottom < space.top && s.top > space.bottom && s.plan[0] < hi.0 && s.plan[1] < hi.1 && s.plan[2] > lo.0 && s.plan[3] > lo.1
+            })
+            .take(513)
+            .collect();
+        let cut_rings = [&space.lower, &space.upper]
+            .into_iter()
+            .flat_map(|plan| std::iter::once(plan.outer).chain(plan.holes.iter().map(Vec::as_slice)))
+            .chain(shafts.iter().map(|s| s.boundary.as_slice()));
+        let cuts: Vec<_> = cut_rings.flat_map(geom::ring_edges).take(513).collect();
+        let top = space.top - m.elevation(room.level);
+        let height_at = |at| {
+            (space.lower.contains(at) && space.upper.contains(at) && !shafts.iter().any(|s| geom::contains(&s.boundary, at))).then_some(top)
+        };
+        let compartments = region.partition_by_height(&cuts, height_at).map_err(|e| bad(c, e))?;
+        let mut out = Vec::new();
+        for (ceiling, region) in compartments.into_iter().filter(|(ceiling, _)| ceiling.is_some()) {
+            out.extend(
+                grid(&region, (space.bottom, space.top), MAX_DETECTORS - out.len())?
+                    .into_iter()
+                    .map(|(at, depth)| (at, depth.map(|depth| top - depth).or(ceiling))),
+            );
+        }
+        if out.is_empty() {
+            return Err(bad(c, "the two space bounds don't enclose any area in the room"));
+        }
+        return Ok(out);
+    }
+    let ceilings: Vec<_> = m
+        .elements
+        .values()
+        .filter_map(|e| match e {
+            Element::Ceiling(v)
+                if v.level == room.level
+                    && v.offset > room.base_offset
+                    && geom::bounds(&v.boundary).is_some_and(|(a, b)| a.0 < hi.0 && a.1 < hi.1 && b.0 > lo.0 && b.1 > lo.1) =>
+            {
+                Some(v)
+            }
+            _ => None,
+        })
+        .take(513)
+        .collect();
+    let ceiling_at = |at| {
+        ceilings
+            .iter()
+            .filter(|v| geom::contains(&v.boundary, at) && !v.openings.iter().any(|hole| geom::contains(hole, at)))
+            .map(|v| v.offset)
+            .min_by(f64::total_cmp)
+    };
+    let cuts: Vec<_> = ceilings
+        .iter()
+        .flat_map(|v| std::iter::once(&v.boundary).chain(&v.openings))
+        .flat_map(|ring| geom::ring_edges(ring))
+        .take(513)
+        .collect();
+    let compartments = if cuts.is_empty() {
+        vec![(None, region.clone())]
+    } else {
+        region.partition_by_height(&cuts, ceiling_at).map_err(|e| bad(c, e))?
+    };
+    let level_z = m.elevation(room.level);
+    let fallback = m.level_above(room.level).map_or(crate::model::DEFAULT_HEIGHT, |up| m.elevation(up) - level_z);
+    let mut out = Vec::new();
+    for (ceiling, region) in compartments {
+        let top = ceiling.unwrap_or(fallback);
+        height_ok(top - room.base_offset)?;
+        let remaining = MAX_DETECTORS - out.len();
+        out.extend(
+            grid(&region, (level_z + room.base_offset, level_z + top), remaining)?
+                .into_iter()
+                .map(|(at, depth)| (at, depth.map(|depth| top - depth).or(ceiling))),
+        );
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detector_ceiling_grid(
+    c: &str,
+    m: &Model,
+    (region, level): (&geom::Region, Guid),
+    elevations: (f64, f64),
+    reach: f64,
+    margin: f64,
+    heat: bool,
+    remaining: usize,
+) -> Result<Vec<(P2, Option<f64>)>, String> {
+    let walls = std::cell::OnceCell::new();
+    let wall_face = |a, b| {
+        walls
+            .get_or_init(|| m.face_lines(level))
+            .iter()
+            .any(|&(start, end)| geom::dist_to_segment(a, start, end) < 0.001 && geom::dist_to_segment(b, start, end) < 0.001)
+    };
+    let Some(layout) = crate::detector_beams::layout(m, region, elevations, reach, heat).map_err(|e| bad(c, e))? else {
+        let centered = crate::detector_beams::wall_bay(region, reach, margin, remaining, wall_face).map_err(|e| bad(c, e))?;
+        let points = match centered {
+            Some(points) => points,
+            None => detector_compartment_grid(c, region, reach, Some(margin), remaining, |at| region.edge_distance(at) >= margin, |at| at)?,
+        };
+        return Ok(points.into_iter().map(|at| (at, None)).collect());
+    };
+    let mut out: Vec<(P2, Option<f64>)> = Vec::new();
+    for bay in &layout.bays {
+        let remaining = remaining - out.len();
+        if let Some((points, depth)) = layout.on_beam(bay, margin.max(500.0), remaining).map_err(|e| bad(c, e))? {
+            for at in points {
+                if !out.iter().any(|(point, other)| *other == Some(depth) && point.dist(at) < 1e-6) {
+                    out.push((at, Some(depth)));
+                }
+            }
+            continue;
+        }
+        if let Some(points) = layout.centered(bay, reach, margin, remaining, wall_face).map_err(|e| bad(c, e))? {
+            out.extend(points.into_iter().map(|at| (at, None)));
+            continue;
+        }
+        let clear = |at| {
+            let at = layout.to_world(at);
+            layout.clear(at) && region.edge_distance(at) >= margin
+        };
+        let points = detector_compartment_grid(c, bay, layout.reach, None, remaining, clear, |at| layout.to_world(at))?;
+        out.extend(points.into_iter().map(|at| (layout.to_world(at), None)));
+    }
+    Ok(out)
+}
+
+fn detector_compartment_grid(
+    c: &str,
+    region: &geom::Region,
+    reach: f64,
+    rectangle_margin: Option<f64>,
+    remaining: usize,
+    clear: impl Fn(P2) -> bool,
+    world: impl Fn(P2) -> P2,
+) -> Result<Vec<P2>, String> {
+    let Some((lo, hi)) = geom::bounds(&region.outer) else { return Err(bad(c, "the ceiling compartment has no boundary")) };
+    let step = reach * std::f64::consts::SQRT_2;
+    let cells = |span: f64| (span / step).ceil().max(1.0);
+    let cell_count = cells(hi.0 - lo.0) * cells(hi.1 - lo.1);
+    if cell_count > remaining as f64 {
+        return Err(bad(c, format!("this `radius` would need over {MAX_DETECTORS} positions over the room: ask for a bigger one")));
+    }
+    let edge_count = region.holes.iter().fold(region.outer.len(), |n, hole| n.saturating_add(hole.len()));
+    if (cell_count as usize).saturating_mul(edge_count) > 100_000 {
+        return Err(bad(c, "the room exceeds the coverage grid limit; divide the area into smaller rooms"));
+    }
+    let mut points = region.cover_where(reach, &clear);
+    if points.is_empty() {
+        let message = if rectangle_margin.is_some() {
+            "the grid found no detector position meeting the wall clearance"
+        } else {
+            "the grid found no detector position meeting wall and beam clearances"
+        };
+        return Err(bad(c, message));
+    }
+    region.complete_visible_cover(&mut points, reach, rectangle_margin, remaining, clear, world).map_err(|e| bad(c, e))?;
+    Ok(points)
+}
+
+fn resat(s: &mut Session, p: &Value) -> R {
+    resat_impl(s, p, false)
+}
+
+fn resat_impl(s: &mut Session, p: &Value, adapting_link: bool) -> R {
+    use crate::family::Category::{HeatDetector, SmokeDetector};
+
+    let c = "resat";
+    only(c, p, &["room", "ids", "id", "kind", "radius", "margin", "space", "architecture", "preview", "heat"])?;
+    let preview = flag(c, p, "preview")?;
+    let m = &s.model;
+    let room = element_id(c, m, p.get("room").ok_or_else(|| bad(c, "`room` is required"))?)?;
+    let architecture = detector_architecture(c, p, m)?;
+    let geometry = architecture.as_ref().unwrap_or(m);
+    let (r, region) = detector_room(c, geometry, room)?;
+    let space = hidden_detector_space(c, p, geometry)?;
+    let kind = match string(c, p, "kind")?.as_deref() {
+        None => None,
+        Some("smoke") => Some(SmokeDetector),
+        Some("heat") => Some(HeatDetector),
+        Some(k) => return Err(bad(c, format!("`kind` is smoke or heat, not `{k}`"))),
+    };
+    let category = |component: &Component| m.families.get(&component.family).map(|f| f.category);
+    let ids = if p.get("ids").is_some() || p.get("id").is_some() {
+        ids_param(c, m, p)?
+    } else {
+        if space.is_some() || architecture.is_some() {
+            return Err(bad(c, "give the detector ids for the selected hidden space or linked architecture"));
+        }
+        m.elements
+            .iter()
+            .filter_map(|(id, e)| {
+                let Element::Component(device) = e else { return None };
+                (device.level == r.level
+                    && device.is_placed()
+                    && device.detector_space.is_none()
+                    && region.contains(device.at)
+                    && category(device).is_some_and(|k| matches!(k, SmokeDetector | HeatDetector) && kind.is_none_or(|want| want == k)))
+                .then_some(*id)
+            })
+            .take(MAX_DETECTORS + 1)
+            .collect()
+    };
+    if ids.len() > MAX_DETECTORS {
+        return Err(bad(c, format!("select no more than {MAX_DETECTORS} detectors")));
+    }
+    let mut selected = Vec::with_capacity(ids.len());
+    let mut kind = kind;
+    for &id in &ids {
+        let Some(Element::Component(device)) = m.elements.get(id) else { return Err(bad(c, format!("{id} isn't a detector"))) };
+        let family = m.families.get(&device.family).ok_or_else(|| bad(c, format!("{id} has no family")))?;
+        if !matches!(family.category, SmokeDetector | HeatDetector) {
+            return Err(bad(c, format!("{id} isn't a smoke or heat detector")));
+        }
+        if device.level != r.level || !device.is_placed() || device.mount.is_some() {
+            return Err(bad(c, format!("{id} must be a placed, unmounted detector on the room's level")));
+        }
+        if device.detector_space != space.as_ref().map(|space| space.kind) {
+            return Err(bad(c, format!("{id} belongs to a different detector space")));
+        }
+        if let Some(space) = &space {
+            space.check_fit(c, m, device)?;
+        }
+        if *kind.get_or_insert(family.category) != family.category {
+            return Err(bad(c, "select detectors of the same kind"));
+        }
+        selected.push((id, device));
+    }
+    if ids.is_empty() && !preview {
+        if num(c, p, "radius")?.is_some_and(|radius| radius <= 0.0) {
+            return Err(bad(c, "`radius` is more than 0"));
+        }
+        num(c, p, "margin")?;
+        return Ok(json!({"ids": [], "changed": [], "package": m.fire_standard}));
+    }
+    if !absent(p.get("heat"))
+        && selected.windows(2).any(|pair| pair[0].1.family != pair[1].1.family || pair[0].1.type_name != pair[1].1.type_name)
+    {
+        return Err(bad(c, "apply the heat evidence to detectors of a single family and type"));
+    }
+    let limits = kind.and_then(detector_limits).ok_or_else(|| bad(c, "select smoke or heat detectors"))?;
+    let mut points = detector_grid(c, p, geometry, r, &region, limits, space.as_ref())?;
+    let proposal = if preview || adapting_link {
+        let status = if points.len() == ids.len() { "ready" } else { "count_mismatch" };
+        let targets: Vec<_> = points.iter().map(|(at, contact_offset)| json!({"at": at, "contact_offset": contact_offset})).collect();
+        let report = json!({"ids": ids, "status": status, "targets": targets, "package": m.fire_standard});
+        if preview || status != "ready" {
+            return Ok(report);
+        }
+        Some(report)
+    } else {
+        None
+    };
+    if points.len() != ids.len() {
+        return Err(bad(c, format!("the room's grid needs {} positions but {} detectors were selected", points.len(), ids.len())));
+    }
+    let order = |a: P2, b: P2| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1));
+    selected.sort_by(|(a_id, a), (b_id, b)| order(a.at, b.at).then(a_id.cmp(b_id)));
+    points.sort_by(|a, b| order(a.0, b.0));
+    let changes: Vec<_> = selected
+        .into_iter()
+        .zip(points)
+        .filter_map(|((id, device), (at, ceiling))| {
+            let offset = ceiling.map_or(device.offset, |height| height - m.component_contact_height(device, "bottom"));
+            (device.at != at || device.offset != offset).then(|| (id, Component { at, offset, ..device.clone() }))
+        })
+        .collect();
+    let changed: Vec<_> = changes.iter().map(|(id, _)| *id).collect();
+    for (id, device) in changes {
+        s.model_mut().elements.insert(id, Element::Component(device));
+    }
+    let mut result = proposal.unwrap_or_else(|| json!({"ids": ids, "package": s.model.fire_standard}));
+    result["changed"] = json!(changed);
+    Ok(result)
 }
 
 fn text_note(s: &mut Session, p: &Value) -> R {
@@ -9549,6 +10581,9 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
             .ok_or_else(|| bad(c, "select an existing cable carrier type"))?;
         let placement = string(c, p, "placement")?.unwrap_or_else(|| "centre".into());
         let local_offset = num(c, p, "local_offset")?.unwrap_or(0.0);
+        if wire.mount.is_some() && (placement != "centre" || local_offset != 0.0) {
+            return Err(bad(c, "a mounted wire requires centre placement and zero lateral offset to keep its support"));
+        }
         let depth = if section.round { section.width } else { section.depth };
         if geometry.width > section.width + TOL
             || geometry.depth > depth + TOL
@@ -9581,13 +10616,15 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         let a = view3d::sub(geometry.a, shift);
         let b = view3d::sub(geometry.b, shift);
         let mut carrier = wire.clone();
-        carrier.mount = None;
+        if carrier.mount.is_none() {
+            let base = m.elevation(wire.level);
+            carrier.start = P2(a[0], a[1]);
+            carrier.end = P2(b[0], b[1]);
+            carrier.offset = a[2] - base;
+            carrier.end_offset = Some(b[2] - base);
+        }
         carrier.square_ends = geometry.square_ends;
         carrier.type_name = type_name;
-        carrier.start = P2(a[0], a[1]);
-        carrier.end = P2(b[0], b[1]);
-        carrier.offset = a[2] - m.elevation(wire.level);
-        carrier.end_offset = Some(b[2] - m.elevation(wire.level));
         carrier.justify = crate::model::Justify::Centre;
         carrier.source = None;
         carrier.devices.clear();
@@ -9607,6 +10644,11 @@ fn cable_carrier(s: &mut Session, p: &Value) -> R {
         set_wire_axis(&mut wire, geometry, base);
         let m = s.model_mut();
         let id = m.insert(Element::CableCarrier(carrier));
+        if m.elements.get(id).and_then(Element::run).is_some_and(|run| run.mount.is_some())
+            && !m.carrier_wire_candidates(id)?.contains(&wire_id)
+        {
+            return Err(bad(c, "the supported carrier does not contain the wire's physical section"));
+        }
         wire.carrier = Some(m.guid(id));
         wire.local_offset = local_offset;
         m.elements.insert(wire_id, Element::Wire(wire));
@@ -9657,6 +10699,7 @@ fn share_carrier(m: &mut Model, id: Id, chosen: Option<&str>) -> bool {
         .filter_map(|(id, element)| {
             matches!(element, Element::CableCarrier(run)
             if run.level == original.level && run.system == original.system && run.compartments.is_empty()
+                && (original.mount.is_none() || run.mount == original.mount)
                 && chosen.is_none_or(|name| run.type_name == name))
             .then_some(*id)
         })
@@ -9775,8 +10818,17 @@ fn electrical_line(s: &mut Session, p: &Value) -> R {
     let terminals = p.get("terminals").map(|v| guids_param(c, &s.model, v, "terminals")).transpose()?.unwrap_or_default();
     let branches = p.get("branches").map(|v| electrical_branches(c, &s.model, v)).transpose()?.unwrap_or_default();
     let system = string(c, p, "system")?.unwrap_or_default();
-    let line =
-        crate::model::ElectricalLine { source, system, devices, branches, segments, terminals, mark_prefix, locked_marks: Vec::new() };
+    let line = crate::model::ElectricalLine {
+        source,
+        system,
+        devices,
+        branches,
+        segments,
+        terminals,
+        mark_prefix,
+        locked_marks: Vec::new(),
+        isolators: Vec::new(),
+    };
     let id = s.model_mut().insert(Element::ElectricalLine(line));
     Ok(json!({"id":id}))
 }
@@ -9830,8 +10882,344 @@ fn electrical_line_inspect(s: &mut Session, p: &Value) -> R {
         })
         .collect();
     Ok(
-        json!({"id":id,"ordered_devices":ordered_devices,"system":line.system,"branches":line.branches,"source":line.source,"devices":line.devices,"segments":line.segments,"terminals":line.terminals,"terminal_checks":terminal_checks,"marks":line.marks(&s.model),"locked_marks":line.locked_marks}),
+        json!({"id":id,"ordered_devices":ordered_devices,"system":line.system,"branches":line.branches,"source":line.source,"devices":line.devices,"segments":line.segments,"isolators":line.isolators,"terminals":line.terminals,"terminal_checks":terminal_checks,"marks":line.marks(&s.model),"locked_marks":line.locked_marks}),
     )
+}
+
+fn fire_voltage_drop(_: &mut Session, p: &Value) -> R {
+    const C: &str = "fire_voltage_drop";
+    const FIELDS: [&str; 4] = ["length_m", "ohm_per_km", "load_ma", "min_v"];
+    only(C, p, &["source_v", "segments"])?;
+    let source = num(C, p, "source_v")?
+        .filter(|value| *value > 0.0 && *value <= crate::electrical::MAX_VOLTS)
+        .ok_or_else(|| bad(C, "give a positive source_v within the voltage limit"))?;
+    let segments = p["segments"]
+        .as_array()
+        .filter(|rows| (1..=MAX_POINTS).contains(&rows.len()))
+        .ok_or_else(|| bad(C, format!("give 1 to {MAX_POINTS} segments in source order")))?;
+    let mut missing = Vec::new();
+    let mut electrical = Vec::with_capacity(segments.len());
+    let mut minima = Vec::with_capacity(segments.len());
+    for (i, row) in segments.iter().enumerate() {
+        only(C, row, &FIELDS)?;
+        let mut absent = Vec::new();
+        let mut values = [0.0; FIELDS.len()];
+        for (index, field) in FIELDS.into_iter().enumerate() {
+            match num(C, row, field)? {
+                Some(value) if value >= 0.0 => values[index] = value,
+                Some(_) => return Err(bad(C, format!("segment {}: {field} must be nonnegative", i + 1))),
+                None => absent.push(field),
+            }
+        }
+        if !absent.is_empty() {
+            missing.push(json!({"segment":i + 1,"fields":absent}));
+        }
+        let [length, resistance, current, minimum] = values;
+        electrical.push((2.0 * length / 1000.0 * resistance, current / 1000.0));
+        minima.push(minimum);
+    }
+    if !missing.is_empty() {
+        return Ok(json!({"source_v":source,"segments":null,"missing":missing}));
+    }
+    let points: Vec<_> = crate::fire_line::radial_voltage(source, &electrical)
+        .into_iter()
+        .zip(minima)
+        .enumerate()
+        .map(|(i, (voltage, minimum))| {
+            json!({"segment":i + 1,"voltage_v":voltage,"drop_v":source - voltage,"min_v":minimum,"below_minimum":minimum - voltage > 1e-9})
+        })
+        .collect();
+    Ok(json!({"source_v":source,"segments":points,"missing":missing}))
+}
+
+fn fire_line_load(s: &mut Session, p: &Value) -> R {
+    const C: &str = "fire_line_load";
+    only(C, p, &["id", "loads", "limit_ma", "reserve_percent"])?;
+    let m = &s.model;
+    let id = element_id(C, m, &p["id"])?;
+    let Some(Element::ElectricalLine(line)) = m.elements.get(id) else { return Err(bad(C, "select an electrical line")) };
+    let devices: BTreeSet<Id> = line
+        .members()
+        .chain(line.isolators.iter().copied())
+        .filter(|guid| *guid != line.source)
+        .filter_map(|guid| m.elements.id(guid))
+        .collect();
+    let current = |entry: &Value, key: &str| {
+        let value = num(C, entry, key)?;
+        if value.is_some_and(|ma| ma < 0.0) {
+            return Err(bad(C, format!("{key} must be nonnegative")));
+        }
+        Ok(value)
+    };
+    let limit = current(p, "limit_ma")?;
+    let reserve = num(C, p, "reserve_percent")?.unwrap_or_default();
+    if !(0.0..=100.0).contains(&reserve) {
+        return Err(bad(C, "reserve_percent must be between 0 and 100"));
+    }
+    let allowed = limit.map(|ma| ma * (1.0 - reserve / 100.0));
+    let mut loads = BTreeMap::new();
+    if let Some(entries) = p.get("loads") {
+        let entries = entries
+            .as_array()
+            .filter(|entries| entries.len() <= MAX_POINTS)
+            .ok_or_else(|| bad(C, format!("loads must be an array of at most {MAX_POINTS} entries")))?;
+        for entry in entries {
+            only(C, entry, &["id", "standby_ma", "fire_ma"])?;
+            let device = element_id(C, m, &entry["id"])?;
+            if !devices.contains(&device) {
+                return Err(bad(C, format!("{device} is not a line load device")));
+            }
+            let values = [current(entry, "standby_ma")?, current(entry, "fire_ma")?];
+            if loads.insert(device, values).is_some() {
+                return Err(bad(C, format!("duplicate load for device {device}")));
+            }
+        }
+    }
+    let mode = |index: usize| {
+        let mut known_ma = 0.0;
+        let mut missing_ids = Vec::new();
+        for device in &devices {
+            if let Some(ma) = loads.get(device).and_then(|values| values[index]) {
+                known_ma += ma;
+            } else {
+                missing_ids.push(device);
+            }
+        }
+        let total = missing_ids.is_empty().then_some(known_ma);
+        let over_limit = allowed.and_then(|ma| {
+            let exceeds = known_ma - ma > 1e-9;
+            if exceeds { Some(true) } else { total.map(|_| false) }
+        });
+        json!({"known_ma":known_ma,"total_ma":total,"missing_ids":missing_ids,"over_limit":over_limit})
+    };
+    Ok(json!({"id":id,"limit_ma":limit,"reserve_percent":reserve,"allowed_ma":allowed,"standby":mode(0),"fire":mode(1)}))
+}
+
+fn fire_battery(_: &mut Session, p: &Value) -> R {
+    const C: &str = "fire_battery";
+    const INPUTS: [&str; 8] = [
+        "standby_a",
+        "fire_a",
+        "source_a",
+        "end_capacity_percent",
+        "load_factor",
+        "installed_ah",
+        "standby_load_factor",
+        "fire_load_factor",
+    ];
+    const STANDBY_H: f64 = 24.0;
+    const FIRE_H: f64 = 1.0;
+    only(C, p, &INPUTS)?;
+    let mut missing = Vec::new();
+    let mut values = [None; INPUTS.len()];
+    for (i, key) in INPUTS.into_iter().enumerate() {
+        let value = num(C, p, key)?;
+        if let Some(value) = value {
+            let valid = match key {
+                "end_capacity_percent" => value > 0.0 && value <= 100.0,
+                "load_factor" | "installed_ah" | "standby_load_factor" | "fire_load_factor" => value > 0.0,
+                _ => value >= 0.0,
+            };
+            if !valid {
+                return Err(bad(C, format!("invalid {key}: {value}")));
+            }
+        } else if i < 4 {
+            missing.push(key);
+        }
+        values[i] = value;
+    }
+    let [standby, fire, source, remaining, load, installed, standby_load, fire_load] = values;
+    let separate = standby_load.is_some() || fire_load.is_some();
+    let (standby_factor, fire_factor) = if separate {
+        if load.is_some() {
+            return Err(bad(C, "use load_factor or the two mode-specific load factors"));
+        }
+        if standby_load.is_none() {
+            missing.push("standby_load_factor");
+        }
+        if fire_load.is_none() {
+            missing.push("fire_load_factor");
+        }
+        (standby_load, fire_load)
+    } else {
+        if load.is_none() {
+            missing.push("load_factor");
+        }
+        (load, load)
+    };
+    let aging_factor = remaining.map(|percent| 100.0 / percent);
+    let runtime = match (installed, fire, remaining) {
+        (Some(capacity), Some(current), Some(percent)) if current > 0.0 => Some(capacity * (percent / 100.0) / current),
+        _ => None,
+    };
+    if aging_factor.is_some_and(|factor| !factor.is_finite()) || runtime.is_some_and(|hours| !hours.is_finite()) {
+        return Err(bad(C, "battery inputs must produce finite results"));
+    }
+    let mut report = json!({
+        "standard": if separate { "SP 6.13130.2025 Appendix B, B.2" } else { "SP 6.13130.2025 Appendix B, B.1" },
+        "standby_h": STANDBY_H, "fire_h": FIRE_H,
+        "installed_ah": installed, "required_ah": null, "fire_runtime_h": runtime,
+        "status": "missing_data", "missing": missing,
+    });
+    if let (Some(standby), Some(fire), Some(source), Some(aging_factor), Some(standby_factor), Some(fire_factor)) =
+        (standby, fire, source, aging_factor, standby_factor, fire_factor)
+    {
+        let standby_ah = (standby + source) * STANDBY_H;
+        let fire_ah = (fire + source) * FIRE_H;
+        let required_ah = if let Some(load) = load {
+            (standby_ah + fire_ah) * load * aging_factor
+        } else {
+            (standby_ah * standby_factor + fire_ah * fire_factor) * aging_factor
+        };
+        if !required_ah.is_finite() {
+            return Err(bad(C, "end_capacity_percent is too small for a finite calculation"));
+        }
+        report["standby_ah"] = json!(standby_ah);
+        report["fire_ah"] = json!(fire_ah);
+        report["aging_factor"] = json!(aging_factor);
+        if separate {
+            report["standby_load_factor"] = json!(standby_factor);
+            report["fire_load_factor"] = json!(fire_factor);
+        } else {
+            report["load_factor"] = json!(load);
+        }
+        report["required_ah"] = json!(required_ah);
+        report["status"] = json!(match installed {
+            Some(capacity) if capacity < required_ah => "insufficient_capacity",
+            Some(_) => "sufficient_capacity",
+            None => "calculated",
+        });
+    }
+    Ok(report)
+}
+
+fn fire_line_faults(s: &mut Session, p: &Value) -> R {
+    let c = "fire_line_faults";
+    only(c, p, &["id", "isolators", "source_isolates_ports", "propose", "allow_pair", "max_isolators", "power"])?;
+    let m = &s.model;
+    let id = element_id(c, m, &p["id"])?;
+    let Some(Element::ElectricalLine(line)) = m.elements.get(id) else { return Err(bad(c, "select an electrical line")) };
+    let extra = p.get("isolators").map(|v| guids_param(c, m, v, "isolators")).transpose()?.unwrap_or_default();
+    let isolators = line.isolators.iter().copied().chain(extra).collect();
+    let power = if let Some(power) = p.get("power") {
+        only(c, power, &["id", "independent", "source_isolates_ports", "lines"])?;
+        let parse_line = |entry: &Value| {
+            let id = element_id(c, m, &entry["id"])?;
+            let Some(Element::ElectricalLine(line)) = m.elements.get(id) else { return Err(bad(c, "select an electrical line for power")) };
+            Ok((line, flag(c, entry, "source_isolates_ports")?))
+        };
+        let lines = if let Some(value) = power.get("lines") {
+            if power.get("id").is_some() || power.get("source_isolates_ports").is_some() {
+                return Err(bad(c, "use either power.id or power.lines with per-line source_isolates_ports"));
+            }
+            value
+                .as_array()
+                .filter(|lines| (1..=16).contains(&lines.len()))
+                .ok_or_else(|| bad(c, "give between 1 and 16 power lines"))?
+                .iter()
+                .map(|entry| {
+                    only(c, entry, &["id", "source_isolates_ports"])?;
+                    parse_line(entry)
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            vec![parse_line(power)?]
+        };
+        let independent = power.get("independent").map(|v| guids_param(c, m, v, "independent")).transpose()?.unwrap_or_default();
+        Some(crate::fire_line::PowerScope { lines, independent: independent.into_iter().collect() })
+    } else {
+        None
+    };
+    let candidates = flag(c, p, "propose")?.then(|| {
+        if line.segments.len() > crate::fire_line::MAX_PLACEMENT_CABLES {
+            return BTreeMap::new();
+        }
+        line.segments
+            .iter()
+            .filter_map(|&guid| {
+                let wire_id = m.elements.id(guid)?;
+                let (fraction, at) = fire_isolator_point(m, id, line, wire_id, None).ok()?;
+                Some((wire_id, (fraction, at)))
+            })
+            .collect()
+    });
+    let max_isolators = count_opt(c, p, "max_isolators", if flag(c, p, "allow_pair")? { 2 } else { 1 })?;
+    if !(1..=4).contains(&max_isolators) {
+        return Err(bad(c, "give a max_isolators between 1 and 4"));
+    }
+    let mut report =
+        crate::fire_line::report(m, line, &isolators, flag(c, p, "source_isolates_ports")?, candidates.as_ref(), max_isolators, power);
+    report["package"] = json!(m.fire_standard);
+    Ok(report)
+}
+
+fn fire_isolator(s: &mut Session, p: &Value) -> R {
+    let c = "fire_isolator";
+    only(c, p, &["id", "wire", "family", "type", "fraction", "apply"])?;
+    let m = &s.model;
+    let id = element_id(c, m, &p["id"])?;
+    let wire_id = element_id(c, m, &p["wire"])?;
+    let Some(Element::ElectricalLine(line)) = m.elements.get(id) else { return Err(bad(c, "select an electrical line")) };
+    let (fraction, at) = fire_isolator_point(m, id, line, wire_id, num(c, p, "fraction")?).map_err(|reason| bad(c, reason))?;
+    let family = string(c, p, "family")?.ok_or_else(|| bad(c, "family is required"))?;
+    let types = &m.families.get(&family).ok_or_else(|| bad(c, "choose an existing isolator family"))?.types;
+    let type_name = string(c, p, "type")?
+        .or_else(|| types.keys().next().cloned())
+        .filter(|name| types.contains_key(name))
+        .ok_or_else(|| bad(c, "choose an existing isolator type"))?;
+    if !flag(c, p, "apply")? {
+        return Ok(json!({"at":at,"family":family,"type":type_name,"wire":wire_id,"fraction":fraction}));
+    }
+    let Some(Element::Wire(wire)) = m.elements.get(wire_id) else { return Err(bad(c, "select a main wire")) };
+    let level = wire.level;
+    let offset = at[2] - m.elevation(level);
+    let device = component(s, &json!({"family":family,"type":type_name,"level":level,"at":[at[0],at[1]],"offset":offset}))?["id"].clone();
+    let segments = split(s, &json!({"id":wire_id,"fraction":fraction}))?["ids"].clone();
+    for (i, end) in [1, 0].into_iter().enumerate() {
+        wire_connect(s, &json!({"wire":segments[i],"device":device,"end":end,"point":[0,0,0]}))?;
+    }
+    let device_guid = s.model.guid(element_id(c, &s.model, &device)?);
+    let Some(Element::ElectricalLine(line)) = s.model_mut().elements.get_mut(id) else { return Err(bad(c, "the line is missing")) };
+    line.isolators.push(device_guid);
+    Ok(json!({"device":device,"segments":segments,"at":at}))
+}
+
+fn fire_isolator_point(
+    m: &Model,
+    id: Id,
+    line: &crate::model::ElectricalLine,
+    wire_id: Id,
+    fraction: Option<f64>,
+) -> Result<(f64, [f64; 3]), &'static str> {
+    use crate::view3d::{add, dot, mul, sub};
+    let wire_guid = m.guid(wire_id);
+    if !line.segments.contains(&wire_guid)
+        || m.elements.iter().any(|(&other, e)| other != id && matches!(e, Element::ElectricalLine(l) if l.segments.contains(&wire_guid)))
+    {
+        return Err("the main wire must belong only to the selected line");
+    }
+    let Some(element @ Element::Wire(wire)) = m.elements.get(wire_id) else { return Err("select a main wire") };
+    if wire.feeder.is_some() || wire.source.is_some() || !wire.devices.is_empty() || wire.mount.is_some() || wire.carrier.is_some() {
+        return Err("select an unmounted main wire without a carrier or legacy device links");
+    }
+    let [a, b] = wire.connections.as_slice() else { return Err("the cable needs two explicit device connections") };
+    let geom = m.run_geom(element).ok_or("the cable has no physical axis")?;
+    let direction = sub(geom.b, geom.a);
+    let length = geom.length();
+    if length <= TOL {
+        return Err("the cable has no physical axis");
+    }
+    let projected = |end| {
+        wire_landing(m, wire_guid, end)
+            .map(|at| (dot(sub(at, geom.a), direction) / dot(direction, direction)).clamp(0.0, 1.0))
+            .ok_or("the cable connections must have resolved landings")
+    };
+    let (a, b) = (projected(a)?, projected(b)?);
+    let fraction = fraction.unwrap_or(f64::midpoint(a, b));
+    if (fraction - a.min(b)) * length <= TOL || (a.max(b) - fraction) * length <= TOL {
+        return Err("place the isolator between the two cable connection landings");
+    }
+    Ok((fraction, add(geom.a, mul(direction, fraction))))
 }
 
 fn cable_journal(s: &mut Session, p: &Value) -> R {
@@ -10603,6 +11991,7 @@ fn boundary_now(e: &Element) -> Option<Vec<SketchLine>> {
         Element::Ceiling(x) => (x.boundary.clone(), x.openings.clone()),
         Element::Roof(r) if r.extrusion.is_none() => (r.boundary.clone(), r.courtyards.clone()),
         Element::Shaft(sh) => (sh.boundary.clone(), Vec::new()),
+        Element::FireZone(zone) => (zone.boundary.clone(), Vec::new()),
         _ => return None,
     };
     let kept = e.sketch().filter(|ls| sketch::draws(ls, &outline, &holes)).cloned();
@@ -10630,7 +12019,7 @@ fn boundary_now(e: &Element) -> Option<Vec<SketchLine>> {
 fn edit_boundary(s: &mut Session, p: &Value) -> R {
     let c = "edit_boundary";
     let m = &s.model;
-    let id = id_opt(c, p, "id")?.ok_or_else(|| bad(c, "`id`, the floor, ceiling, roof or shaft to edit, is required"))?;
+    let id = id_opt(c, p, "id")?.ok_or_else(|| bad(c, "`id` of the element whose boundary to edit is required"))?;
     let e = m.elements.get(id).cloned().ok_or_else(|| bad(c, format!("no element {id}")))?;
     if let Element::Roof(Roof { extrusion: Some(_), .. }) = e {
         return Err(bad(c, format!("{id} is an extrusion roof: change its profile, `modify` its `extrusion`")));
@@ -10644,8 +12033,7 @@ fn edit_boundary(s: &mut Session, p: &Value) -> R {
         s.model_mut().elements.insert(id, Element::FilledRegion(FilledRegion { sketch: lines, ..r }));
         return Ok(json!({"id": id, "area_m2": m2(profile.area())}));
     }
-    let now =
-        boundary_now(&e).ok_or_else(|| bad(c, format!("{id} isn't a floor, a ceiling, a roof's footprint, a shaft or a filled region")))?;
+    let now = boundary_now(&e).ok_or_else(|| bad(c, format!("{id} doesn't have an editable boundary")))?;
     let Some((r, lines)) = sketched(c, p, "", &now)? else {
         return Ok(json!({"id": id, "sketch": now}));
     };
@@ -10660,6 +12048,8 @@ fn edit_boundary(s: &mut Session, p: &Value) -> R {
         Element::Ceiling(x) => Element::Ceiling(Ceiling { boundary: r.outer, openings: r.holes, sketch: lines, ..x }),
         Element::Shaft(_) if !r.holes.is_empty() => return Err(bad(c, "a shaft is one outline with no holes in it")),
         Element::Shaft(sh) => Element::Shaft(Shaft { boundary: r.outer, sketch: lines, ..sh }),
+        Element::FireZone(_) if !r.holes.is_empty() => return Err(bad(c, "a fire zone has one outline; use room exclusions for holes")),
+        Element::FireZone(zone) => Element::FireZone(crate::model::FireZone { boundary: r.outer, ..zone }),
         Element::Roof(old) => {
             let mut new = Roof { boundary: r.outer, courtyards: r.holes, gables: Vec::new(), sketch: unslope(&lines), ..old.clone() };
             // A slope stays with its edge too, where the edge stays or is cut in two; the lines may say it instead.
@@ -12374,6 +13764,7 @@ fn component(s: &mut Session, p: &Value) -> R {
         params,
         provision,
         mount: p.get("mount").map(|v| serde_json::from_value(v.clone()).map_err(|e| bad(c, e))).transpose()?,
+        detector_space: None,
         connection_sides: p
             .get("connection_sides")
             .map(|v| serde_json::from_value(v.clone()).map_err(|e| bad(c, e)))
@@ -13046,6 +14437,9 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
         lines.iter_mut().for_each(|l| *l = l.map(f));
     }
     match &mut e {
+        Element::FireZone(zone) => {
+            zone.boundary.iter_mut().for_each(|point| *point = f(*point));
+        }
         Element::ElectricalLine(_) | Element::ElectricalTerminal(_) => {
             return Err(bad(c, format!("electrical line {id} has no geometry; move its devices or wires")));
         }
@@ -14372,7 +15766,20 @@ fn split_wire_connections(
     let direction = sub(geometry.b, geometry.a);
     let boundary = dot(direction, direction) * fraction;
     first.connections.retain(|connection| {
-        let landing = connection.landing.or_else(|| {
+        let landing = wire_landing(m, guid, connection);
+        let move_to_second = landing.is_some_and(|point| dot(sub(point, geometry.a), direction) > boundary);
+        if move_to_second {
+            second.connections.push(connection.clone());
+        }
+        !move_to_second
+    });
+    second.connections.iter().map(|connection| (connection.device, connection.end)).collect()
+}
+
+fn wire_landing(m: &Model, guid: Guid, connection: &crate::model::WireConnection) -> Option<[f64; 3]> {
+    connection
+        .landing
+        .or_else(|| {
             m.elements
                 .values()
                 .filter_map(|element| {
@@ -14383,14 +15790,12 @@ fn split_wire_connections(
                 })
                 .max_by_key(|(leg, _)| *leg)
                 .map(|(_, point)| point)
-        });
-        let move_to_second = landing.is_some_and(|point| dot(sub(point, geometry.a), direction) > boundary);
-        if move_to_second {
-            second.connections.push(connection.clone());
-        }
-        !move_to_second
-    });
-    second.connections.iter().map(|connection| (connection.device, connection.end)).collect()
+        })
+        .or_else(|| {
+            // A fixed connection sitting on the axis produces no feeder legs.
+            let Element::Component(component) = m.elements.get(connection.device)? else { return None };
+            connection.surface.is_none().then(|| m.fixed_wire_contact(component, connection.point))
+        })
 }
 
 fn transfer_feeders(m: &mut Model, from: Guid, to: Guid, connections: &BTreeSet<(Guid, u8)>) {
@@ -14931,6 +16336,10 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
             }
             let hosted = match m.elements.get(id) {
                 Some(Element::Door(o) | Element::Window(o)) => gone.contains(&o.host),
+                Some(Element::ElectricalLine(line)) => gone.contains(&line.source),
+                Some(Element::ElectricalTerminal(t)) => gone.contains(&t.device),
+                Some(Element::FireZone(zone)) => gone.contains(&zone.level),
+                Some(Element::Wire(w)) => wire_loses_all_devices(w, &gone),
                 Some(Element::Railing(r)) => r.host.is_some_and(|h| gone.contains(&h)),
                 Some(Element::Rebar(rb)) => rb.host.is_some_and(|h| gone.contains(&h)),
                 Some(Element::PlanView(v)) => gone.contains(&v.level) || v.parent.is_some_and(|p| gone.contains(&p)),
@@ -14976,6 +16385,12 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
             kept.push((id, d));
         }
     }
+    let electrical: BTreeSet<Id> = gone.iter().flat_map(|g| lookup.referrers(g)).collect();
+    let electrical_edits: Vec<_> = electrical
+        .into_iter()
+        .filter(|id| !gone.contains(&m.guid(*id)))
+        .filter_map(|id| electrical_after_delete(m.elements.get(id)?, &gone).map(|e| (id, e)))
+        .collect();
     let mut deleted: Vec<Id> = gone.iter().filter_map(|g| m.elements.id(*g)).collect();
     deleted.sort_unstable();
     let ties: BTreeSet<Id> = gone
@@ -15016,6 +16431,9 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
     for (id, d) in kept {
         m.elements.insert(id, Element::Dimension(d));
     }
+    for (id, element) in electrical_edits {
+        m.elements.insert(id, element);
+    }
     for id in ties {
         match m.elements.get_mut(id) {
             Some(Element::Wall(w)) => {
@@ -15036,6 +16454,103 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
     Ok(json!({"deleted": deleted}))
 }
 
+fn wire_loses_all_devices(w: &crate::model::Run, gone: &BTreeSet<Guid>) -> bool {
+    (w.source.is_some() || !w.devices.is_empty()) && w.source.into_iter().chain(w.devices.iter().copied()).all(|g| gone.contains(&g))
+}
+
+fn electrical_after_delete(e: &Element, gone: &BTreeSet<Guid>) -> Option<Element> {
+    if let Element::Link(link) = e
+        && e.refs().iter().any(|id| gone.contains(id))
+    {
+        let mut link = link.clone();
+        link.detector_groups.retain_mut(|group| {
+            group.ids.retain(|id| !gone.contains(id));
+            !group.ids.is_empty()
+                && !gone.contains(&group.room)
+                && !group.space.is_some_and(|bounds| bounds.iter().any(|bound| matches!(bound, IfcSlab::Local(id) if gone.contains(id))))
+        });
+        return Some(Element::Link(link));
+    }
+    if let Element::FireZone(zone) = e
+        && zone.include_rooms.iter().chain(&zone.exclude_rooms).chain(&zone.notify).any(|g| gone.contains(g))
+    {
+        let mut zone = zone.clone();
+        zone.include_rooms.retain(|g| !gone.contains(g));
+        zone.exclude_rooms.retain(|g| !gone.contains(g));
+        zone.notify.retain(|g| !gone.contains(g));
+        return Some(Element::FireZone(zone));
+    }
+    if let Element::ElectricalLine(line) = e
+        && line
+            .members()
+            .chain(line.segments.iter().copied())
+            .chain(line.terminals.iter().copied())
+            .chain(line.isolators.iter().copied())
+            .any(|g| gone.contains(&g))
+    {
+        let mut line = line.clone();
+        let mut predecessors = BTreeMap::new();
+        for (start, devices) in
+            std::iter::once((line.source, &line.devices)).chain(line.branches.iter().map(|branch| (branch.from, &branch.devices)))
+        {
+            predecessors.extend(
+                std::iter::once(start).chain(devices.iter().copied()).zip(devices.iter().copied()).map(|(parent, child)| (child, parent)),
+            );
+        }
+        line.devices.retain(|g| !gone.contains(g));
+        for branch in &mut line.branches {
+            while gone.contains(&branch.from) {
+                branch.from = predecessors.get(&branch.from).copied().unwrap_or(line.source);
+            }
+            branch.devices.retain(|g| !gone.contains(g));
+        }
+        line.branches.retain(|branch| !branch.devices.is_empty());
+        line.segments.retain(|g| !gone.contains(g));
+        line.isolators.retain(|g| !gone.contains(g));
+        line.terminals.retain(|g| !gone.contains(g));
+        line.locked_marks.retain(|entry| !gone.contains(&entry.device));
+        return Some(Element::ElectricalLine(line));
+    }
+    // A wired run loses the components it names that go; the run itself stays while it has a place.
+    if let Element::Wire(w) = e
+        && w.source
+            .into_iter()
+            .chain(w.devices.iter().copied())
+            .chain(w.carrier)
+            .chain(w.connections.iter().flat_map(|connection| connection.carrier.into_iter().chain(connection.terminal)))
+            .any(|g| gone.contains(&g))
+    {
+        let mut w = w.clone();
+        if w.source.into_iter().any(|g| gone.contains(&g)) {
+            w.source = None;
+        }
+        w.devices.retain(|d| !gone.contains(d));
+        if w.source.is_none() || w.devices.is_empty() {
+            w.source = None;
+            w.devices.clear();
+        }
+        if w.carrier.is_some_and(|g| gone.contains(&g)) {
+            w.carrier = None;
+            for connection in &mut w.connections {
+                if connection.carrier.is_none() {
+                    connection.in_carrier = false;
+                }
+            }
+        }
+        for connection in &mut w.connections {
+            if connection.terminal.is_some_and(|guid| gone.contains(&guid)) {
+                connection.terminal = None;
+            }
+            if connection.carrier.is_some_and(|guid| gone.contains(&guid)) {
+                connection.carrier = None;
+                connection.in_carrier = false;
+            }
+        }
+        return Some(Element::Wire(w));
+    }
+    None
+}
+
 #[cfg(test)]
 fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
     let c = "delete";
@@ -15053,6 +16568,7 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
                         Element::Door(o) | Element::Window(o) => gone.contains(&o.host),
                         Element::ElectricalLine(line) => gone.contains(&line.source),
                         Element::ElectricalTerminal(t) => gone.contains(&t.device),
+                        Element::FireZone(zone) => gone.contains(&zone.level),
                         Element::Railing(r) => r.host.is_some_and(|h| gone.contains(&h)),
                         Element::Rebar(rb) => rb.host.is_some_and(|h| gone.contains(&h)),
                         // A plan view goes with its level and its parent; what is annotated in a view goes with it.
@@ -15071,10 +16587,7 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
                         // An import in one view only goes with it.
                         Element::CadImport(ci) => ci.view.is_some_and(|v| gone.contains(&v)),
                         // A wired run goes when every component it names has gone.
-                        Element::Wire(w) => {
-                            (w.source.is_some() || !w.devices.is_empty())
-                                && w.source.into_iter().chain(w.devices.iter().copied()).all(|g| gone.contains(&g))
-                        }
+                        Element::Wire(w) => wire_loses_all_devices(w, &gone),
                         _ => false,
                     }
             })
@@ -15088,34 +16601,10 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
     // A dimension loses the references that go; left with fewer than two, it goes too.
     let mut kept = Vec::new();
     for (id, guid, e) in m.elements.with_guids() {
-        if let Element::ElectricalLine(line) = e
-            && !gone.contains(&guid)
-            && line.members().chain(line.segments.iter().copied()).chain(line.terminals.iter().copied()).any(|g| gone.contains(&g))
+        if !gone.contains(&guid)
+            && let Some(element) = electrical_after_delete(e, &gone)
         {
-            let mut line = line.clone();
-            let mut predecessors = BTreeMap::new();
-            for (start, devices) in
-                std::iter::once((line.source, &line.devices)).chain(line.branches.iter().map(|branch| (branch.from, &branch.devices)))
-            {
-                predecessors.extend(
-                    std::iter::once(start)
-                        .chain(devices.iter().copied())
-                        .zip(devices.iter().copied())
-                        .map(|(parent, child)| (child, parent)),
-                );
-            }
-            line.devices.retain(|g| !gone.contains(g));
-            for branch in &mut line.branches {
-                while gone.contains(&branch.from) {
-                    branch.from = predecessors.get(&branch.from).copied().unwrap_or(line.source);
-                }
-                branch.devices.retain(|g| !gone.contains(g));
-            }
-            line.branches.retain(|branch| !branch.devices.is_empty());
-            line.segments.retain(|g| !gone.contains(g));
-            line.terminals.retain(|g| !gone.contains(g));
-            line.locked_marks.retain(|entry| !gone.contains(&entry.device));
-            kept.push((id, Element::ElectricalLine(line)));
+            kept.push((id, element));
         }
         if let Element::Dimension(d) = e
             && !gone.contains(&guid)
@@ -15128,44 +16617,6 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
             } else {
                 kept.push((id, Element::Dimension(d)));
             }
-        }
-        // A wired run loses the components it names that go; the run itself stays while it has a place.
-        if let Element::Wire(w) = e
-            && !gone.contains(&guid)
-            && w.source
-                .into_iter()
-                .chain(w.devices.iter().copied())
-                .chain(w.carrier)
-                .chain(w.connections.iter().flat_map(|connection| connection.carrier.into_iter().chain(connection.terminal)))
-                .any(|g| gone.contains(&g))
-        {
-            let mut w = w.clone();
-            if w.source.into_iter().any(|g| gone.contains(&g)) {
-                w.source = None;
-            }
-            w.devices.retain(|d| !gone.contains(d));
-            if w.source.is_none() || w.devices.is_empty() {
-                w.source = None;
-                w.devices.clear();
-            }
-            if w.carrier.is_some_and(|g| gone.contains(&g)) {
-                w.carrier = None;
-                for connection in &mut w.connections {
-                    if connection.carrier.is_none() {
-                        connection.in_carrier = false;
-                    }
-                }
-            }
-            for connection in &mut w.connections {
-                if connection.terminal.is_some_and(|guid| gone.contains(&guid)) {
-                    connection.terminal = None;
-                }
-                if connection.carrier.is_some_and(|guid| gone.contains(&guid)) {
-                    connection.carrier = None;
-                    connection.in_carrier = false;
-                }
-            }
-            kept.push((id, Element::Wire(w)));
         }
     }
     let deleted: Vec<Id> = m.elements.with_guids().filter(|(_, g, _)| gone.contains(g)).map(|(id, ..)| id).collect();

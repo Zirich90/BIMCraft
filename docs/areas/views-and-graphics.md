@@ -81,7 +81,8 @@ sizes go into millimetres with no rounding.
 
 Family components are split by category. A component is of its family's category (`graphics::category_of`; `component_category` names
 each `family::Category`: `furniture`, `casework`, `plumbing`, `drain`, `pipefitting`, `pipeaccessory`, `equipment`, `outlet`, `switch`,
-`airterminal`, `earthing`, `inspectionbox`, `lighting`, `generic`, `dataoutlet`, `voiceoutlet`, `patchpanel`, `rack`; `graphics::COMPONENTS`),
+`airterminal`, `earthing`, `inspectionbox`, `lighting`, `generic`, `dataoutlet`, `voiceoutlet`, `patchpanel`, `rack`,
+`alarmpanel`, `smokedetector`, `heatdetector`, `callpoint`, `sounder`, `exitsign`, `speaker`, `motiondetector`, `camera`; `graphics::COMPONENTS`),
 and each is a row of `graphics::MODEL`, so of Visibility/Graphics, Object Styles and `object_styles`: a power plan hides the luminaires
 and a lighting plan the outlets. A door's or a window's family is placed in a wall as a door or a window and has no row. `component`
 (`graphics::COMPONENT`) is no row but still a name, for every one of them: `drawn` and `styles::known` accept it, `Graphics::hides` takes

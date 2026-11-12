@@ -43,7 +43,7 @@ fn the_room_separator_tool_beside_room_lays_a_line_each_click_until_escape() {
     tool(&mut h, "Room");
     click(&mut h, P2(2000.0, 3000.0));
     let room = find(&h, |e| matches!(e, Element::Room(_)));
-    assert_eq!(field(&h, room, "area_m2"), json!(24.0));
+    assert_eq!(field(&h, room, "area_m2"), json!(22.62));
 }
 
 #[test]
@@ -55,20 +55,20 @@ fn a_room_is_frozen_from_its_properties_and_keeps_its_size() {
     for label in ["Upper Limit", "Limit Offset", "Unbounded Height", "Volume (m³)"] {
         assert!(h.query_by_label(label).is_some(), "{label}");
     }
-    assert_eq!(field(&h, room, "volume_m3"), json!(129.6), "48 m² by 2700 mm, up to 300 mm under Level 2");
+    assert_eq!(field(&h, room, "volume_m3"), json!(122.15), "45.24 m² by 2700 mm, up to 300 mm under Level 2");
     // At the foot of the palette, past its fold.
     h.get_by_role_and_label(Role::CheckBox, "Frozen").scroll_to_me();
     h.run();
     pick(&mut h, Role::CheckBox, "Frozen");
     assert_eq!(field(&h, room, "frozen"), json!(true));
-    // A wall moved: the frozen room keeps its 48 m².
+    // A wall moved: the frozen room keeps its 45.24 m².
     let east = find(&h, |e| matches!(e, Element::Wall(w) if w.start.0 == 8000.0 && w.end.0 == 8000.0));
     let moved = h.state_mut().run("move", json!({"ids": [east], "by": [2000, 0]}));
     assert!(moved.is_some());
-    assert_eq!(field(&h, room, "area_m2"), json!(48.0));
+    assert_eq!(field(&h, room, "area_m2"), json!(45.24));
     // Its limit offset typed: up to Level 2 itself, taller, more volume.
     type_role(&mut h, Role::TextInput, "Limit Offset", "0");
-    assert_eq!(field(&h, room, "volume_m3"), json!(144.0));
+    assert_eq!(field(&h, room, "volume_m3"), json!(135.72));
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn visibility_graphics_folds_a_categorys_subcategories_under_it_indented() {
 fn a_walls_room_bounding_is_switched_off_in_its_properties() {
     let mut h = app(&format!("{BOX}\nwall {{\"points\": [[4000,0],[4000,6000]]}}\nroom {{\"point\": [2000, 3000]}}"));
     let room = find(&h, |e| matches!(e, Element::Room(_)));
-    assert_eq!(field(&h, room, "area_m2"), json!(24.0));
+    assert_eq!(field(&h, room, "area_m2"), json!(22.04));
     click(&mut h, P2(4000.0, 4500.0));
     let wall = h.state().selection[0];
     assert_eq!(field(&h, wall, "room_bounding"), json!(true));
@@ -113,7 +113,7 @@ fn a_walls_room_bounding_is_switched_off_in_its_properties() {
     h.run();
     pick(&mut h, Role::CheckBox, "Room Bounding");
     assert_eq!(field(&h, wall, "room_bounding"), json!(false));
-    assert_eq!(field(&h, room, "area_m2"), json!(48.0), "the room runs through it");
+    assert_eq!(field(&h, room, "area_m2"), json!(45.24), "the room runs through it");
 }
 
 #[test]
