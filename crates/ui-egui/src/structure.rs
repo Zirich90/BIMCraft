@@ -5,7 +5,7 @@
 use bimcraft_i18n::msg;
 
 use bimcraft_core::geom::P2;
-use bimcraft_core::model::{Element, Id, Justify, Model, TOL};
+use bimcraft_core::model::{Component, Element, Guid, Id, Justify, Model, TOL};
 use bimcraft_core::{runs_of, stood_of};
 use egui::{ComboBox, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -18,6 +18,17 @@ use crate::{BimApp, Status, Tool, big_button, panel, top_params};
 /// The command that makes elements of `category`.
 pub(crate) fn command(category: &str) -> &'static str {
     bimcraft_core::command_of(category)
+}
+
+/// The family's normative mounting height of a device, when it has one.
+pub(crate) fn mounting_height(m: &Model, device: &Component) -> Option<f64> {
+    m.families.get(&device.family).and_then(|family| {
+        let values = family.values(&device.type_name, &device.params).ok()?;
+        match values.get(m.language.word(msg!("Mounting Height"))) {
+            Some(bimcraft_core::family::Val::Number(height)) => Some(*height),
+            _ => None,
+        }
+    })
 }
 
 /// The title of the contextual tab while the tool is on.
@@ -226,18 +237,108 @@ impl BimApp {
         let m = &self.session.model;
         let Some(id) = picked else { return false };
         let Some(Element::Component(device)) = m.elements.get(id) else { return false };
-        let mounting = m.families.get(&device.family).and_then(|family| {
-            let values = family.values(&device.type_name, &device.params).ok()?;
-            match values.get(m.language.word(msg!("Mounting Height"))) {
-                Some(bimcraft_core::family::Val::Number(height)) => Some(*height),
-                _ => None,
-            }
-        });
+        let mounting = mounting_height(m, device);
         let offset = m.elevation(device.level) + device.offset + mounting.unwrap_or_default() - m.elevation(m.guid(level));
         self.beam_offset = format!("{offset:.3} mm");
         self.wire_start_connection = Some((m.guid(id), mounting.unwrap_or_default()));
         self.tool = Tool::Run("wire", Some(device.at));
         true
+    }
+
+    /// Finish the wire being drawn at a device: the segment ends over it at the routing height, and the connection drops
+    /// (or rises) to its terminal.
+    pub(crate) fn end_wire_at_device(&mut self, level: Id, picked: Option<Id>) -> bool {
+        let Tool::Run("wire", Some(a)) = self.tool else { return false };
+        let Some(id) = picked else { return false };
+        let m = &self.session.model;
+        let Some(Element::Component(device)) = m.elements.get(id) else { return false };
+        if !device.is_placed() || a.dist(device.at) <= TOL {
+            return false;
+        }
+        self.wire_end_connection = Some((m.guid(id), mounting_height(m, device).unwrap_or_default()));
+        let at = device.at;
+        self.place_run(level, at);
+        true
+    }
+
+    /// Start a wire at a point on an existing cable: split the cable there and begin the chain at the cut's vertex, so a
+    /// continuation or a branch shares it without a gap. `hit` is the clicked 3D point of free routing; without it the
+    /// plan point is projected onto the cable's axis.
+    pub(crate) fn start_wire_at_wire(&mut self, level: Id, picked: Option<Id>, at: P2, hit: Option<[f64; 3]>) -> bool {
+        if !matches!(self.tool, Tool::Run("wire", None)) {
+            return false;
+        }
+        let Some(id) = picked else { return false };
+        let m = &self.session.model;
+        let Some(Element::Wire(wire)) = m.elements.get(id) else { return false };
+        if wire.feeder.is_some() {
+            return false;
+        }
+        let (joint, height, joint3d, params) = if let Some(point) = hit {
+            let Some(g) = m.elements.get(id).and_then(|element| m.run_geom(element)) else { return false };
+            let axis = bimcraft_core::view3d::sub(g.b, g.a);
+            let len2 = bimcraft_core::view3d::dot(axis, axis);
+            if len2 <= TOL * TOL {
+                return false;
+            }
+            let fraction = (bimcraft_core::view3d::dot(bimcraft_core::view3d::sub(point, g.a), axis) / len2).clamp(0.0, 1.0);
+            let joint: [f64; 3] = std::array::from_fn(|i| g.a[i] + axis[i] * fraction);
+            (P2(joint[0], joint[1]), joint[2], Some(joint), json!({"id":id,"fraction":fraction}))
+        } else {
+            let axis = wire.end - wire.start;
+            if axis.length() <= TOL {
+                return false;
+            }
+            let fraction = ((at - wire.start).dot(axis) / axis.dot(axis)).clamp(0.0, 1.0);
+            let joint = wire.start + axis * fraction;
+            let end_offset = wire.end_offset.unwrap_or(wire.offset);
+            let height = m.elevation(wire.level) + wire.offset + (end_offset - wire.offset) * fraction;
+            (joint, height, None, json!({"id":id,"at":[joint.0,joint.1]}))
+        };
+        let offset = height - m.elevation(m.guid(level));
+        if self.run("split", params).is_none() {
+            return true;
+        }
+        self.beam_offset = format!("{offset:.3} mm");
+        self.tool = Tool::Run("wire", Some(joint));
+        if let Some(point) = joint3d {
+            self.free_run_start = Some((point, None));
+        }
+        true
+    }
+
+    /// The lowest local piece of the equipment being placed, at offset 0: what a bottom-edge height stands on.
+    pub(crate) fn placing_bottom(&self, m: &Model, level: Guid) -> f64 {
+        let Some((family, type_name)) = self.placing() else { return 0.0 };
+        let component = Component {
+            family,
+            type_name,
+            level,
+            at: P2(0.0, 0.0),
+            angle: self.component_angle,
+            offset: 0.0,
+            mirrored: false,
+            params: Default::default(),
+            provision: None,
+            mount: None,
+            detector_space: None,
+            connection_sides: Vec::new(),
+        };
+        m.component_local_pieces(&component).iter().map(|piece| piece.bottom).min_by(f64::total_cmp).unwrap_or(0.0)
+    }
+
+    /// Shift at placement: the family's normative position (offset 0) when it has a Mounting Height, else its bottom 1500 mm
+    /// over the level.
+    pub(crate) fn normative_placement_offset(&self, m: &Model, level: Guid) -> Option<f64> {
+        let (family, type_name) = self.placing()?;
+        let mounting = m.families.get(&family).and_then(|family| {
+            let values = family.values(&type_name, &Default::default()).ok()?;
+            match values.get(m.language.word(msg!("Mounting Height"))) {
+                Some(bimcraft_core::family::Val::Number(_)) => Some(()),
+                _ => None,
+            }
+        });
+        Some(if mounting.is_some() { 0.0 } else { 1500.0 - self.placing_bottom(m, level) })
     }
 
     /// A click of a run's tool at `p`: the start, then the end, which makes it, and with Chain starts the next there.
@@ -254,6 +355,7 @@ impl BimApp {
             self.tool = Tool::Run(category, Some(p));
             return;
         };
+        let end_connection = if category == "wire" { self.wire_end_connection.take() } else { None };
         let vertical = matches!(category, "wire" | "cablecarrier") && self.run_vertical;
         let p = if vertical { a } else { p };
         let climbs = (lift.1 - lift.0).abs() > TOL;
@@ -270,10 +372,20 @@ impl BimApp {
                 if climbs {
                     params["end_offset"] = json!(offset + lift.1);
                 }
+                // A chain click continues the cable that ends here: one route, no gap.
+                if category == "wire"
+                    && let Some(route) =
+                        bimcraft_core::low_voltage::route_ending_at(&m, m.guid(level), a, m.elevation(level) + offset + lift.0)
+                {
+                    params["route"] = json!(route);
+                }
                 if category == "wire"
                     && let Some((device, height)) = self.wire_start_connection
                 {
                     params["start_connection"] = json!({"device":device,"point":[0.0,0.0,height]});
+                }
+                if let Some((device, height)) = end_connection {
+                    params["end_connection"] = json!({"device":device,"point":[0.0,0.0,height]});
                 }
                 if let Some(result) = self.run(command(category), params) {
                     self.wire_start_connection = None;

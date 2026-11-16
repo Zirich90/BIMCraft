@@ -765,6 +765,122 @@ fn stage4_batch_carrier_creates_a_supported_carrier_when_an_existing_carrier_can
 }
 
 #[test]
+fn stage4_batch_carrier_merges_parallel_mounted_wires_into_one_carrier() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    let low = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500,"system":"Fire Alarm"}));
+    let high = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1520,"system":"Fire Alarm"}));
+    for wire in [low, high] {
+        run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    }
+    let axes = [low, high].map(|wire| s.model.run_geom(s.model.elements.get(wire).unwrap()).unwrap());
+    let made_ids = ids(&run(&mut s, "cable_carrier", json!({"from_wires":{},"type":"Tray 100 x 50"})));
+    assert_eq!(made_ids.len(), 1);
+    let carrier = made_ids[0];
+    let guid = s.model.guid(carrier);
+    for wire in [low, high] {
+        let run = s.model.elements.get(wire).unwrap().run().unwrap();
+        assert_eq!(run.carrier, Some(guid));
+        assert!(run.mount.is_none());
+    }
+    let mount = s.model.elements.get(carrier).unwrap().run().unwrap().mount.clone().unwrap();
+    assert_eq!(mount.host, s.model.guid(wall));
+    assert_eq!(mount.face, "interior");
+    for (wire, axis) in [low, high].into_iter().zip(axes) {
+        assert_eq!(s.model.run_geom(s.model.elements.get(wire).unwrap()).unwrap(), axis);
+    }
+    // The carrier axis sits on the envelope centre between the two wires.
+    let geometry = s.model.run_geom(s.model.elements.get(carrier).unwrap()).unwrap();
+    assert!((geometry.a[2] - 1510.0).abs() < 1e-6);
+}
+
+#[test]
+fn stage4_batch_carrier_keeps_parallel_wires_separate_when_the_group_overfills() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    // 100 mm apart: half-span 50 plus the 10 mm radius exceeds the tray's 50 mm half-width.
+    let low = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500}));
+    let high = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1600}));
+    for wire in [low, high] {
+        run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    }
+    let made_ids = ids(&run(&mut s, "cable_carrier", json!({"from_wires":{},"type":"Tray 100 x 50"})));
+    assert_eq!(made_ids.len(), 2);
+    let carriers = [low, high].map(|wire| s.model.elements.get(wire).unwrap().run().unwrap().carrier);
+    assert!(carriers.iter().all(|carrier| carrier.is_some()));
+    assert_ne!(carriers[0], carriers[1]);
+}
+
+#[test]
+fn stage4_batch_carrier_keeps_wires_of_different_systems_separate() {
+    let mut s = Session::new();
+    let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();
+    let fire = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500,"system":"Fire Alarm"}));
+    let security = made(&mut s, "wire", json!({"points":[[3500,-500],[5000,-500]],"offset":1500,"system":"Security"}));
+    for wire in [fire, security] {
+        run(&mut s, "run_mount", json!({"id":wire,"host":wall,"face":"interior"}));
+    }
+    let made_ids = ids(&run(&mut s, "cable_carrier", json!({"from_wires":{},"type":"Tray 100 x 50"})));
+    assert_eq!(made_ids.len(), 2);
+    let carriers = [fire, security].map(|wire| s.model.elements.get(wire).unwrap().run().unwrap().carrier);
+    assert!(carriers.iter().all(|carrier| carrier.is_some()));
+    assert_ne!(carriers[0], carriers[1]);
+}
+
+#[test]
+fn stage4_chain_of_segments_is_one_route_with_one_journal_row() {
+    let mut s = Session::new();
+    let panel = made(&mut s, "component", json!({"family":"Fire Alarm Panel","type":"300 x 400","at":[0,0]}));
+    let detector = made(&mut s, "component", json!({"family":"Fire Alarm Panel","type":"300 x 400","at":[4000,0]}));
+    // A three-point chain makes two segments under one head.
+    let made_ids = ids(&run(
+        &mut s,
+        "wire",
+        json!({"points":[[0,0],[2000,0],[2000,2000]],"offset":2500,"system":"Fire Alarm","cable":"KPSEng 2x0.5"}),
+    ));
+    assert_eq!(made_ids.len(), 2);
+    let head = s.model.guid(made_ids[0]);
+    for id in &made_ids {
+        assert_eq!(s.model.run_of(*id).unwrap().route, Some(head));
+    }
+    // A continuation from the chain's end joins the same route and inherits the head's system and cable.
+    let next = made(&mut s, "wire", json!({"points":[[2000,2000],[4000,2000]],"offset":2500,"route":head}));
+    let continued = s.model.run_of(next).unwrap();
+    assert_eq!(continued.route, Some(head));
+    assert_eq!(continued.system, "Fire Alarm");
+    assert_eq!(continued.cable, "KPSEng 2x0.5");
+    // The line takes the head's guid and unfolds it into every segment; the journal gives one row with the total length.
+    let line = made(&mut s, "electrical_line", json!({"source":panel,"devices":[detector],"segments":[head]}));
+    let segments = run(&mut s, "electrical_line_inspect", json!({"id":line}))["segments"].as_array().unwrap().len();
+    assert_eq!(segments, 3);
+    let rows = run(&mut s, "cable_journal", json!({"id":line}))["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["length"], json!(6000.0));
+    // Deleting the head takes the whole route with it.
+    run(&mut s, "delete", json!({"ids":[made_ids[0]]}));
+    for id in made_ids.iter().chain(std::iter::once(&next)) {
+        assert!(s.model.elements.get(*id).is_none());
+    }
+}
+
+#[test]
+fn stage4_route_survives_split_and_file_roundtrip() {
+    let mut s = Session::new();
+    let made_ids = ids(&run(&mut s, "wire", json!({"points":[[0,0],[2000,0],[4000,0]],"offset":2500})));
+    let head = s.model.guid(made_ids[0]);
+    let second = made_ids[1];
+    run(&mut s, "split", json!({"id":second,"at":[3000,0]}));
+    // Both halves stay on the route: the head and the two pieces of the split segment.
+    let on_route = s.model.elements.with_guids().filter(|(_, _, e)| matches!(e, Element::Wire(w) if w.route == Some(head))).count();
+    assert_eq!(on_route, 3);
+    let saved = s.model.to_json().unwrap();
+    let (opened, omitted) = crate::model::Model::read(&saved).unwrap();
+    assert!(omitted.is_empty());
+    assert_eq!(opened.to_json().unwrap(), saved);
+    assert_eq!(opened.run_of(second).unwrap().route, Some(head));
+}
+
+#[test]
 fn stage4_round_mount_preserves_contact_through_radius_host_motion_and_delete() {
     let mut s = Session::new();
     let wall = run(&mut s, "wall", json!({"points":[[0,0],[8000,0]]}))["ids"][0].as_u64().unwrap();

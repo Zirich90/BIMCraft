@@ -21,6 +21,778 @@ fn fails(s: &mut Session, id: &str, p: Value) -> String {
 }
 
 #[test]
+fn stage8_line_table_keeps_traversal_marks_and_terminal_addresses_separate() {
+    let mut s = Session::new();
+    let upper = run(&mut s, "level", json!({"name":"Upper","elevation":4000}))["id"].clone();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let b = run(&mut s, "component", json!({"family":"Smoke Detector","at":[2000,0],"level":upper}))["id"].clone();
+    let branch = run(&mut s, "component", json!({"family":"Heat Detector","at":[1000,1000]}))["id"].clone();
+    let first = run(&mut s, "electrical_terminal", json!({"device":a,"name":"A","address":"101","load_ma":0}))["id"].clone();
+    let second = run(&mut s, "electrical_terminal", json!({"device":a,"name":"B","address":"102","limit_ma":20}))["id"].clone();
+    run(&mut s, "electrical_terminal", json!({"device":branch,"name":"Unattached","address":"999"}));
+    let line = run(
+        &mut s,
+        "electrical_line",
+        json!({
+            "source":panel,"devices":[a,b],"branches":[{"from":a,"devices":[branch]}],
+            "system":"СПС","mark_prefix":"L","terminals":[second,first]
+        }),
+    )["id"]
+        .clone();
+    run(&mut s, "electrical_line_mark", json!({"id":line,"device":b,"mark":"FIXED"}));
+    let before = s.model.clone();
+    let history = s.history().into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let report = run(&mut s, "electrical_line_table", json!({"id":line}));
+    let cell = |row: usize, column: &str| {
+        let index = report["columns"].as_array().unwrap().iter().position(|v| v == column).unwrap();
+        report["rows"][row][index].clone()
+    };
+    assert_eq!(report["elements"], json!([[panel], [a], [branch], [b]]));
+    assert_eq!(report["device_count"], 3);
+    assert_eq!(cell(0, "Role"), "source");
+    assert_eq!(cell(3, "Mark"), "FIXED");
+    assert_eq!(cell(3, "Order"), 4);
+    assert_eq!(cell(1, "GUID"), json!(s.model.guid(a.as_u64().unwrap())));
+    let terminals = cell(1, "Terminals");
+    assert_eq!(terminals[0]["id"], second);
+    assert_eq!(terminals[0]["address"], "102");
+    assert!(terminals[0]["load_ma"].is_null());
+    assert_eq!(terminals[1]["address"], "101");
+    assert_eq!(terminals[1]["load_ma"].as_f64(), Some(0.0));
+    assert!(terminals[1]["limit_ma"].is_null());
+    assert_eq!(cell(2, "Terminals"), json!([]));
+    assert_eq!(report["groups"].as_array().unwrap().len(), 2);
+    let filtered = run(&mut s, "electrical_line_table", json!({"system":"СПС","level":upper}));
+    assert_eq!(filtered["elements"], json!([[b]]));
+    let order = filtered["columns"].as_array().unwrap().iter().position(|v| v == "Order").unwrap();
+    assert_eq!(filtered["rows"][0][order], 4);
+    assert_eq!(run(&mut s, "electrical_line_table", json!({"system":"СОУЭ"}))["rows"], json!([]));
+    assert_eq!(s.model, before);
+    assert_eq!(s.history().into_iter().map(str::to_owned).collect::<Vec<_>>(), history);
+    let (back, _) = crate::model::Model::read(&s.model.to_json().unwrap()).unwrap();
+    let mut reopened = Session::new();
+    reopened.model = std::sync::Arc::new(back);
+    assert_eq!(run(&mut reopened, "electrical_line_table", json!({"id":s.model.guid(line.as_u64().unwrap())})), report);
+}
+
+#[test]
+fn stage8_line_table_exports_without_editing_or_overwriting_protected_files() {
+    use crate::engine::{Files, touches_files};
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let detector = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[detector],"system":"=СПС,\"Тест\""}));
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project.bimcraft");
+    run(&mut s, "save", json!({"path":project}));
+    let saved = std::fs::read(&project).unwrap();
+    let before = s.model.clone();
+    s.read_only = Some("test permission");
+    let command = crate::commands::ALL.iter().find(|c| c.id == "electrical_line_table").unwrap();
+    assert_eq!(touches_files(command, &json!({})), None);
+    assert_eq!(touches_files(command, &json!({"path":"table.csv"})), Some(Files::Write));
+    let csv = dir.path().join("table.csv");
+    run(&mut s, "electrical_line_table", json!({"path":csv}));
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert!(text.contains("'="), "spreadsheet formula text is escaped: {text}");
+    let xlsx = dir.path().join("table.XLSX");
+    run(&mut s, "electrical_line_table", json!({"path":xlsx}));
+    let bytes = std::fs::read(&xlsx).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    use std::io::Read;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).unwrap();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        let mut reader = quick_xml::Reader::from_str(&body);
+        while reader.read_event().unwrap() != quick_xml::events::Event::Eof {}
+        if entry.name().unwrap() == "xl/worksheets/sheet1.xml" {
+            assert!(!body.contains("<f>"));
+            assert!(body.contains(&format!("<v>{panel}</v>")));
+            assert!(body.contains("=СПС,&quot;Тест&quot;"));
+        }
+    }
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":project})).contains("read-only"));
+    assert_eq!(std::fs::read(&project).unwrap(), saved);
+    let unsupported = dir.path().join("manual.odt");
+    std::fs::write(&unsupported, b"manual text").unwrap();
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":unsupported})).contains(".csv or .xlsx"));
+    assert_eq!(std::fs::read(&unsupported).unwrap(), b"manual text");
+    let script = format!("electrical_line_table {}", json!({"path":csv}));
+    assert!(s.script_dry_run(&script).is_err());
+    assert_eq!(std::fs::read_to_string(&csv).unwrap(), text);
+    assert_eq!(s.model, before);
+}
+
+#[test]
+fn stage8_line_table_rejects_hostile_filters_without_changes() {
+    let mut s = Session::new();
+    for params in [
+        json!([]),
+        json!("table"),
+        json!({"unknown":true}),
+        json!({"id":100000}),
+        json!({"level":1e300}),
+        json!({"level":"Missing"}),
+        json!({"system":false}),
+        json!({"system":"x".repeat(crate::model::MAX_TEXT+1)}),
+        json!({"path":""}),
+    ] {
+        fails(&mut s, "electrical_line_table", params);
+    }
+}
+
+#[test]
+fn stage8_line_table_counts_shared_devices_once_and_keeps_line_terminal_scope() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let b = run(&mut s, "component", json!({"family":"Heat Detector","at":[2000,0]}))["id"].clone();
+    let terminal = run(&mut s, "electrical_terminal", json!({"device":a,"name":"A","address":"42"}))["id"].clone();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[a,b],"mark_prefix":"A","terminals":[terminal]}));
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[a],"mark_prefix":"B"}));
+    run(&mut s, "electrical_line", json!({"source":a,"devices":[b],"mark_prefix":"C"}));
+    let report = run(&mut s, "electrical_line_table", json!({}));
+    assert_eq!(report["device_count"], 2);
+    assert_eq!(report["elements"], json!([[panel], [a], [b], [panel], [a], [a], [b]]));
+    let columns = report["columns"].as_array().unwrap();
+    let marks = columns.iter().position(|v| v == "Mark").unwrap();
+    let terminals = columns.iter().position(|v| v == "Terminals").unwrap();
+    assert_eq!(report["rows"][1][marks], "A2");
+    assert_eq!(report["rows"][4][marks], "B2");
+    assert_eq!(report["rows"][5][marks], "C1");
+    assert_eq!(report["rows"][1][terminals][0]["address"], "42");
+    assert_eq!(report["rows"][4][terminals], json!([]));
+    assert_eq!(report["rows"][5][terminals], json!([]));
+}
+
+#[test]
+fn stage8_line_table_refuses_lossy_xlsx_without_overwriting() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[a],"system":"A\u{1}B"}));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("table.xlsx");
+    std::fs::write(&path, b"previous report").unwrap();
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":path})).contains("XML cannot preserve"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous report");
+    let csv = dir.path().join("table.csv");
+    run(&mut s, "electrical_line_table", json!({"path":csv}));
+    assert!(std::fs::read_to_string(csv).unwrap().contains("A\u{1}B"));
+}
+
+#[test]
+fn stage8_line_table_rejects_unrepresentable_nested_xlsx_cells() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let terminal = run(&mut s, "electrical_terminal", json!({"device":a,"name":"A","address":"\u{FFFE}"}))["id"].clone();
+    let line = run(&mut s, "electrical_line", json!({"source":panel,"devices":[a],"terminals":[terminal]}))["id"].clone();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("table.xlsx");
+    std::fs::write(&path, b"previous table").unwrap();
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":path})).contains("XML cannot preserve"));
+    let mut terminals = Vec::new();
+    let long = "\u{10000}".repeat(crate::model::MAX_TEXT);
+    for _ in 0..40 {
+        terminals.push(run(&mut s, "electrical_terminal", json!({"device":a,"name":long,"address":long,"purpose":long}))["id"].clone());
+    }
+    run(&mut s, "electrical_line_edit", json!({"id":line,"terminals":terminals}));
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":path})).contains("32767"));
+    assert_eq!(std::fs::read(path).unwrap(), b"previous table");
+}
+
+#[test]
+fn stage8_line_table_caps_aggregate_rows_before_overwriting() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let detector = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let id = run(&mut s, "electrical_line", json!({"source":panel,"devices":[detector]}))["id"].as_u64().unwrap();
+    let original = s.model.elements.get(id).unwrap().clone();
+    let model = std::sync::Arc::make_mut(&mut s.model);
+    for _ in 1..crate::model::MAX_POINTS / 2 {
+        let id = model.fresh_id();
+        model.elements.insert(id, original.clone());
+    }
+    let report = run(&mut s, "electrical_line_table", json!({}));
+    assert_eq!(report["rows"].as_array().unwrap().len(), crate::model::MAX_POINTS);
+    let model = std::sync::Arc::make_mut(&mut s.model);
+    let id = model.fresh_id();
+    model.elements.insert(id, original);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("table.csv");
+    std::fs::write(&path, b"previous table").unwrap();
+    assert!(fails(&mut s, "electrical_line_table", json!({"path":path})).contains("rows and copied terminals"));
+    assert_eq!(std::fs::read(path).unwrap(), b"previous table");
+}
+
+#[test]
+fn stage8_specification_deduplicates_members_and_counts_nonspatial_quantities() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].as_u64().unwrap();
+    let smoke = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].as_u64().unwrap();
+    let heat = run(&mut s, "component", json!({"family":"Heat Detector","at":[2000,0]}))["id"].as_u64().unwrap();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[smoke,heat],"system":"СПС"}));
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[smoke],"system":"СОУЭ"}));
+    for quantity in [2, 4] {
+        run(
+            &mut s,
+            "equipment",
+            json!({"name":"License","quantity":quantity,"system":"СПС","product":{"description":"Software","brand":"LV","article":"LIC","manufacturer":"Own","mass_kg":0.0}}),
+        );
+    }
+    let (family, ty) = s.model.elements[heat].family().unwrap();
+    let key = format!("{family}: {ty}");
+    std::sync::Arc::make_mut(&mut s.model).library.set_placeholder(&Kind::FamilyType, &key, true).unwrap();
+    let before = s.model.clone();
+    let report = run(&mut s, "electrical_specification", json!({}));
+    assert_eq!(report["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(report["excluded"], json!([heat]));
+    assert_eq!(report["ready"], false);
+    let items = report["items"].as_array().unwrap();
+    for id in [panel, smoke] {
+        let item = items.iter().find(|item| item["elements"].as_array().unwrap().contains(&json!(id))).unwrap();
+        assert_eq!(item["quantity"], 1.0);
+        assert_eq!(item["systems"], json!(["СОУЭ", "СПС"]));
+    }
+    let software = report["rows"].as_array().unwrap().iter().find(|row| row[1] == "Software").unwrap();
+    assert_eq!(software[6], 6.0);
+    assert_eq!(software[7], 0.0);
+    let filtered = run(&mut s, "electrical_specification", json!({"system":"СОУЭ"}));
+    assert_eq!(filtered["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(filtered["excluded"], json!([]));
+    assert_eq!(*s.model, *before);
+}
+
+#[test]
+fn stage8_specification_uses_the_type_name_for_a_blank_description() {
+    let mut s = Session::new();
+    run(&mut s, "equipment", json!({"name":"License","product":{"description":"   ","brand":"LV","article":"LIC","manufacturer":"Own"}}));
+    let report = run(&mut s, "electrical_specification", json!({}));
+    assert_eq!(report["rows"][0][1], "Specification Items: License");
+}
+
+#[test]
+fn stage8_specification_counts_physical_wires_carriers_and_reserve_once() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let carrier = run(&mut s, "cable_carrier", json!({"points":[[0,0],[3000,0]]}))["ids"][0].clone();
+    let wire = run(&mut s, "wire", json!({"points":[[0,0],[3000,0]],"carrier":carrier,"reserve":10,"cable":"КПС"}))["ids"][0].clone();
+    assert!(wire.is_number() && carrier.is_number());
+    for system in ["СПС", "СОУЭ"] {
+        run(&mut s, "electrical_line", json!({"source":panel,"devices":[],"segments":[wire],"system":system}));
+    }
+    let report = run(&mut s, "electrical_specification", json!({}));
+    let item = report["items"].as_array().unwrap().iter().find(|item| item["elements"].as_array().unwrap().contains(&wire)).unwrap();
+    assert!((item["length_mm"].as_f64().unwrap() - 3300.0).abs() < 1e-6);
+    assert!((item["quantity"].as_f64().unwrap() - 3.3).abs() < 1e-9);
+    let item = report["items"].as_array().unwrap().iter().find(|item| item["elements"].as_array().unwrap().contains(&carrier)).unwrap();
+    assert_eq!(item["length_mm"], 3000.0);
+    run(&mut s, "wire_connect", json!({"wire":wire,"device":panel,"point":[0,0,1000]}));
+    let parent = s.model.guid(wire.as_u64().unwrap());
+    let members: Vec<_> = s
+        .model
+        .elements
+        .with_guids()
+        .filter_map(|(id, guid, element)| match element {
+            crate::model::Element::Wire(run) if guid == parent || run.feeder.as_ref().is_some_and(|f| f.wire == parent) => {
+                Some((id, s.model.run_geom(element).unwrap().length()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(members.len() > 1, "connection creates physical feeder legs");
+    let expected = members.iter().map(|(_, length)| length).sum::<f64>() * 1.1;
+    let report = run(&mut s, "electrical_specification", json!({}));
+    let item = report["items"].as_array().unwrap().iter().find(|item| item["elements"].as_array().unwrap().contains(&wire)).unwrap();
+    assert!((item["length_mm"].as_f64().unwrap() - expected).abs() < 1e-6);
+    assert_eq!(item["elements"].as_array().unwrap().len(), members.len());
+}
+
+#[test]
+fn stage8_specification_exports_atomically_and_refuses_hostile_parameters() {
+    let mut s = Session::new();
+    let dir = tempfile::tempdir().unwrap();
+    run(
+        &mut s,
+        "equipment",
+        json!({"name":"=License","quantity":2,"system":"СПС","product":{"description":"=Software","brand":"LV","article":"LIC","manufacturer":"Own"}}),
+    );
+    let before = s.model.clone();
+    for suffix in ["csv", "xlsx"] {
+        let path = dir.path().join(format!("specification.{suffix}"));
+        run(&mut s, "electrical_specification", json!({"path":path}));
+        let bytes = std::fs::read(&path).unwrap();
+        if suffix == "csv" {
+            assert!(String::from_utf8(bytes).unwrap().contains("'=Software"));
+        } else {
+            assert_eq!(&bytes[..2], b"PK");
+        }
+    }
+    assert_eq!(*s.model, *before);
+    run(&mut s, "equipment", json!({"name":"CR text","product":{"description":"A\rB"}}));
+    let cr_path = dir.path().join("cr.xlsx");
+    run(&mut s, "electrical_specification", json!({"path":cr_path}));
+    let parts = crate::xlsx::unzip(&std::fs::read(cr_path).unwrap());
+    assert!(parts["xl/worksheets/sheet1.xml"].contains("A&#13;B"));
+    let before = s.model.clone();
+    let manual = dir.path().join("manual.odt");
+    std::fs::write(&manual, b"manual text").unwrap();
+    for params in [json!([]), json!({"system":false}), json!({"id":100000}), json!({"path":manual}), json!({"path":false})] {
+        fails(&mut s, "electrical_specification", params);
+    }
+    assert_eq!(std::fs::read(manual).unwrap(), b"manual text");
+    assert_eq!(*s.model, *before);
+}
+
+#[test]
+fn stage8_specification_caps_carrier_system_memberships_before_overwrite() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let carrier = run(&mut s, "cable_carrier", json!({"points":[[0,0],[3000,0]]}))["ids"][0].clone();
+    let wire = run(&mut s, "wire", json!({"points":[[0,0],[3000,0]],"carrier":carrier}))["ids"][0].clone();
+    let line = run(&mut s, "electrical_line", json!({"source":panel,"devices":[],"segments":[wire],"system":"S0"}))["id"].as_u64().unwrap();
+    let crate::model::Element::ElectricalLine(template) = s.model.elements[line].clone() else {
+        panic!("line expected");
+    };
+    let model = std::sync::Arc::make_mut(&mut s.model);
+    for i in 1..4000 {
+        let mut line = template.clone();
+        line.system = format!("S{i}");
+        model.insert(crate::model::Element::ElectricalLine(line));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("specification.csv");
+    std::fs::write(&path, b"existing report").unwrap();
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("10000"));
+    assert_eq!(std::fs::read(path).unwrap(), b"existing report");
+}
+
+#[test]
+fn stage8_specification_refuses_lossy_and_oversized_exports_before_overwrite() {
+    let mut s = Session::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("specification.xlsx");
+    std::fs::write(&path, b"existing report").unwrap();
+    let id =
+        run(&mut s, "equipment", json!({"name":"License","quantity":2,"product":{"description":"Software\u{1}"}}))["id"].as_u64().unwrap();
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("XML"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing report");
+    let element = s.model.elements[id].clone();
+    let model = std::sync::Arc::make_mut(&mut s.model);
+    for _ in 0..crate::model::MAX_POINTS {
+        model.insert(element.clone());
+    }
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("10000"));
+    assert_eq!(std::fs::read(path).unwrap(), b"existing report");
+}
+
+#[test]
+fn stage8_specification_pdf_paginates_without_changing_the_model() {
+    let mut s = Session::new();
+    for i in 0..80 {
+        run(
+            &mut s,
+            "equipment",
+            json!({"name":format!("License {i}"),"quantity":2,"system":"СПС","product":{"description":format!("Software {i}\nManual text"),"brand":"LV","article":"LIC","manufacturer":"Own","mass_kg":0.0}}),
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("specification.pdf");
+    let before = s.model.clone();
+    let report = run(&mut s, "electrical_specification", json!({"path":path}));
+    assert!(report["pages"].as_u64().unwrap() > 1);
+    assert_eq!(report["rows"].as_array().unwrap().len(), 80);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert_eq!(std::sync::Arc::as_ptr(&s.model), std::sync::Arc::as_ptr(&before));
+    assert!(s.script_dry_run(&format!("electrical_specification {}", json!({"path":path}))).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn stage8_specification_pdf_refuses_unprintable_cells_and_empty_selection_before_overwrite() {
+    let mut s = Session::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("specification.pdf");
+    std::fs::write(&path, b"existing report").unwrap();
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("no items"));
+    run(&mut s, "equipment", json!({"name":"License","product":{"description":"Software\u{1}"}}));
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("control"));
+    let mut s = Session::new();
+    run(&mut s, "equipment", json!({"name":"License","product":{"description":"X\n".repeat(100)}}));
+    assert!(fails(&mut s, "electrical_specification", json!({"path":path})).contains("fit"));
+    assert_eq!(std::fs::read(path).unwrap(), b"existing report");
+}
+
+#[test]
+fn stage8_diagram_groups_types_per_floor_and_line_with_one_head() {
+    let mut s = Session::new();
+    let upper = run(&mut s, "level", json!({"name":"Upper","elevation":4000}))["id"].clone();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0],"level":upper}))["id"].clone();
+    let b = run(&mut s, "component", json!({"family":"Smoke Detector","at":[2000,0],"level":upper}))["id"].clone();
+    let c = run(&mut s, "component", json!({"family":"Heat Detector","at":[3000,0],"level":upper}))["id"].clone();
+    let first = run(&mut s, "electrical_line", json!({"source":panel,"devices":[a,b,c],"system":"СПС","mark_prefix":"L2."}))["id"].clone();
+    run(&mut s, "electrical_line_mark", json!({"id":first,"device":b,"mark":"LOCKED"}));
+    let second = run(&mut s, "electrical_line", json!({"source":panel,"devices":[a],"system":"СПС","mark_prefix":"L10."}))["id"].clone();
+    let before = s.model.clone();
+    let report = run(&mut s, "electrical_line_diagram", json!({"mode":"grouped"}));
+    let diagram = &report["diagram"];
+    assert_eq!(diagram["heads"].as_array().unwrap().len(), 1);
+    assert_eq!(diagram["heads"][0]["id"], panel);
+    assert_eq!(diagram["bands"][0]["name"], "Upper");
+    let rows = diagram["bands"][0]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["line"], first);
+    assert_eq!(rows[1]["line"], second);
+    assert_eq!(rows[0]["groups"][0]["count"], 2);
+    assert_eq!(rows[0]["groups"][0]["ids"], json!([a, b]));
+    assert_eq!(rows[0]["groups"][0]["marks"], json!(["L2.2", "LOCKED"]));
+    assert_eq!(rows[0]["groups"][1]["count"], 1);
+    assert_eq!(rows[1]["groups"][0]["count"], 1);
+    assert_eq!(s.model, before);
+    assert_eq!(run(&mut s, "electrical_line_diagram", json!({"system":"Missing","mode":"grouped"}))["pages"], 0);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("diagram.pdf");
+    s.read_only = Some("reports only");
+    let exported = run(&mut s, "electrical_line_diagram", json!({"path":path,"mode":"grouped"}));
+    assert_eq!(exported["diagram"], *diagram);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(s.script_dry_run(&format!("electrical_line_diagram {}", json!({"path":path}))).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert_eq!(s.model, before);
+}
+
+#[test]
+fn stage8_diagram_full_and_simplified_keep_branch_boundaries_and_marks() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let mut devices = Vec::new();
+    for i in 1..=4 {
+        devices.push(run(&mut s, "component", json!({"family":"Smoke Detector","at":[i*1000,0]}))["id"].clone());
+    }
+    let branch = run(&mut s, "component", json!({"family":"Heat Detector","at":[1000,1000]}))["id"].clone();
+    let line = run(
+        &mut s,
+        "electrical_line",
+        json!({"source":panel,"devices":devices,"branches":[{"from":devices[0],"devices":[branch]}],"mark_prefix":"L"}),
+    )["id"]
+        .clone();
+    let full = run(&mut s, "electrical_line_diagram", json!({"id":line,"mode":"full"}));
+    let chains = full["segments"].as_array().unwrap();
+    let ids: Vec<_> = chains
+        .iter()
+        .flat_map(|chain| chain["items"].as_array().unwrap().iter())
+        .flat_map(|item| item["ids"].as_array().unwrap().iter().cloned())
+        .collect();
+    assert_eq!(ids, [devices[0].clone(), branch, devices[1].clone(), devices[2].clone(), devices[3].clone()]);
+    assert!(chains.iter().any(|chain| chain["from"] == devices[0]));
+    let simplified = run(&mut s, "electrical_line_diagram", json!({"id":line,"mode":"simplified"}));
+    let gaps: Vec<_> = simplified["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|chain| chain["items"].as_array().unwrap().iter())
+        .filter(|item| item["kind"] == "gap")
+        .collect();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["ids"], json!([devices[2]]));
+    assert_eq!(gaps[0]["omitted"], 1);
+    assert_eq!(gaps[0]["marks"], json!(["L5"]));
+    run(&mut s, "electrical_line_mark", json!({"id":line,"device":devices[2],"mark":"MANUAL"}));
+    let locked = run(&mut s, "electrical_line_diagram", json!({"id":line,"mode":"simplified"}));
+    assert!(
+        locked["segments"].as_array().unwrap().iter().all(|chain| chain["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["kind"] != "gap"))
+    );
+}
+
+#[test]
+fn stage8_diagram_keeps_explicit_branch_start_after_trunk_leaf() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let mut devices = Vec::new();
+    for i in 1..=6 {
+        devices.push(run(&mut s, "component", json!({"family":"Smoke Detector","at":[i*1000,0]}))["id"].clone());
+    }
+    let line = run(
+        &mut s,
+        "electrical_line",
+        json!({
+            "source":panel,"devices":devices[..3],
+            "branches":[{"from":devices[2],"devices":devices[3..]}],"mark_prefix":"L"
+        }),
+    )["id"]
+        .clone();
+    for mode in ["full", "simplified"] {
+        let report = run(&mut s, "electrical_line_diagram", json!({"id":line,"mode":mode}));
+        let segments = report["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1]["from"], devices[2]);
+        assert_eq!(segments[0]["items"].as_array().unwrap().last().unwrap()["ids"], json!([devices[2]]));
+        assert_eq!(segments[1]["items"][0]["ids"], json!([devices[3]]));
+    }
+}
+
+#[test]
+fn stage8_diagram_nested_forks_have_distinct_nonconnecting_routes() {
+    use crate::render::{Part, Prim};
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let mut devices = Vec::new();
+    for i in 1..=5 {
+        devices.push(run(&mut s, "component", json!({"family":"Smoke Detector","at":[i*1000,0]}))["id"].clone());
+    }
+    let line = run(
+        &mut s,
+        "electrical_line",
+        json!({
+            "source":panel,"devices":[devices[0],devices[4]],
+            "branches":[{"from":devices[0],"devices":[devices[1],devices[3]]},
+                        {"from":devices[1],"devices":[devices[2]]}]
+        }),
+    )["id"]
+        .as_u64()
+        .unwrap();
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, Some(line), None, None).unwrap();
+    let segments = crate::low_voltage::diagram_devices::segments(&s.model, Some(line), None, None, false).unwrap();
+    let pages = crate::low_voltage::diagram_layout::draw_devices(&s.model, &diagram, &segments, false).unwrap();
+    assert_eq!(pages.len(), 1);
+    let mut gutters: Vec<_> = pages[0]
+        .prims
+        .iter()
+        .filter_map(|prim| {
+            let Prim::Line { pts, .. } = prim else { return None };
+            pts.windows(2).find_map(|pair| {
+                let [(x, y), (xx, yy)] = pair else { return None };
+                (*x == *xx && (254.0 * 5.0..270.0 * 5.0).contains(x) && (y - yy).abs() > 20.0).then_some(*x)
+            })
+        })
+        .collect();
+    gutters.sort_by(f32::total_cmp);
+    gutters.dedup();
+    assert!(gutters.len() >= 2, "different parents must not share one visible vertical connection");
+    let verticals: Vec<_> = pages[0]
+        .prims
+        .iter()
+        .filter_map(|prim| {
+            let Prim::Line { pts, .. } = prim else { return None };
+            if pts.len() != 2 {
+                return None;
+            }
+            let (a, b) = (pts[0], pts[1]);
+            (a.0 == b.0 && (254.0 * 5.0..270.0 * 5.0).contains(&a.0)).then_some((a, b))
+        })
+        .collect();
+    for (prim, part) in pages[0].prims.iter().zip(&pages[0].parts) {
+        if *part == Part::Text {
+            continue;
+        }
+        let Prim::Line { pts, .. } = prim else { continue };
+        if pts.len() != 2 || pts[0].1 != pts[1].1 {
+            continue;
+        }
+        let (a, b) = (pts[0], pts[1]);
+        for &(v, w) in &verticals {
+            let crossing = v.0 > a.0.min(b.0) && v.0 < a.0.max(b.0) && a.1 > v.1.min(w.1) && a.1 < v.1.max(w.1);
+            assert!(!crossing, "crossing routes need a visible nonconnecting gap: {a:?}–{b:?} crosses {v:?}–{w:?}");
+        }
+    }
+}
+
+#[test]
+fn stage8_diagram_source_taps_do_not_join_neighboring_risers() {
+    use crate::render::{Part, Prim};
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let a = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let b = run(&mut s, "component", json!({"family":"Heat Detector","at":[2000,0]}))["id"].clone();
+    let first = run(&mut s, "electrical_line", json!({"source":panel,"devices":[a],"mark_prefix":"L1"}))["id"].as_u64().unwrap();
+    let second = run(&mut s, "electrical_line", json!({"source":panel,"devices":[b],"mark_prefix":"L2"}))["id"].as_u64().unwrap();
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, None, None, None).unwrap();
+    let segments = crate::low_voltage::diagram_devices::segments(&s.model, None, None, None, false).unwrap();
+    for pages in [
+        crate::low_voltage::diagram_layout::draw_devices(&s.model, &diagram, &segments, false).unwrap(),
+        crate::low_voltage::diagram_layout::draw_devices(&s.model, &diagram, &segments, true).unwrap(),
+        crate::low_voltage::diagram_layout::draw(&s.model, &diagram).unwrap(),
+    ] {
+        for ((prim, owner), part) in pages[0].prims.iter().zip(&pages[0].owners).zip(&pages[0].parts) {
+            if *part == Part::Text {
+                continue;
+            }
+            let other_x = if *owner == Some(first) {
+                130.0 * 5.0
+            } else if *owner == Some(second) {
+                118.0 * 5.0
+            } else {
+                continue;
+            };
+            let Prim::Line { pts, .. } = prim else { continue };
+            for pair in pts.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                assert!(
+                    !(a.1 == b.1 && (52.0 * 5.0..=244.0 * 5.0).contains(&a.1) && a.0.min(b.0) < other_x && a.0.max(b.0) > other_x),
+                    "source tap must visibly cross the other line's riser without joining it"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stage8_diagram_continuation_references_source_and_keeps_heading_on_paper() {
+    use crate::render::{Part, Prim};
+    let mut s = Session::new();
+    let level = run(&mut s, "level", json!({"name":"A".repeat(120),"elevation":4000}))["id"].clone();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0],"level":level}))["id"].clone();
+    let mut devices = Vec::new();
+    for i in 1..=36 {
+        devices.push(run(&mut s, "component", json!({"family":"Smoke Detector","at":[i*1000,0],"level":level}))["id"].clone());
+    }
+    let line = run(&mut s, "electrical_line", json!({"source":panel,"devices":devices}))["id"].as_u64().unwrap();
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, Some(line), None, None).unwrap();
+    let segments = crate::low_voltage::diagram_devices::segments(&s.model, Some(line), None, None, false).unwrap();
+    let pages = crate::low_voltage::diagram_layout::draw_devices(&s.model, &diagram, &segments, false).unwrap();
+    assert!(pages.len() > 1);
+    for (i, page) in pages.iter().enumerate() {
+        let source_links: Vec<_> = page
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { pts, dash, .. } if pts == &[(150.0, 270.0), (590.0, 270.0)] => Some(dash),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(source_links.len(), 1);
+        assert_eq!(source_links[0].is_some(), i > 0);
+        for (prim, part) in page.prims.iter().zip(&page.parts) {
+            if *part == Part::Text && prim.points().iter().any(|p| p.1 >= 22.0 * 5.0 && p.1 <= 36.0 * 5.0) {
+                assert!(prim.points().iter().all(|p| p.0 <= 408.0 * 5.0), "heading clips outside A3");
+            }
+        }
+    }
+}
+
+#[test]
+fn stage8_diagram_preserves_conflicting_source_marks_and_orders_lanes() {
+    use crate::render::Prim;
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let l10 = run(&mut s, "electrical_line", json!({"source":panel,"devices":[],"mark_prefix":"L10."}))["id"].clone();
+    let l2 = run(&mut s, "electrical_line", json!({"source":panel,"devices":[],"mark_prefix":"L2."}))["id"].clone();
+    run(&mut s, "electrical_line_mark", json!({"id":l10,"device":panel,"mark":"PANEL-10"}));
+    run(&mut s, "electrical_line_mark", json!({"id":l2,"device":panel,"mark":"PANEL-2"}));
+    let report = run(&mut s, "electrical_line_diagram", json!({"mode":"grouped"}));
+    assert_eq!(report["diagram"]["heads"].as_array().unwrap().len(), 1);
+    assert_eq!(report["diagram"]["heads"][0]["line_marks"][l10.to_string()], "PANEL-10");
+    assert_eq!(report["diagram"]["heads"][0]["line_marks"][l2.to_string()], "PANEL-2");
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, None, None, None).unwrap();
+    let pages = crate::low_voltage::diagram_layout::draw(&s.model, &diagram).unwrap();
+    let lane = pages[0].prims.iter().zip(&pages[0].owners).find_map(|(p, owner)| match p {
+        Prim::Line { pts, .. } if pts == &[(590.0, 260.0), (590.0, 1220.0)] => *owner,
+        _ => None,
+    });
+    assert_eq!(lane, l2.as_u64());
+    run(&mut s, "electrical_line_mark", json!({"id":l10,"device":panel,"mark":"PANEL-2"}));
+    let single = run(&mut s, "electrical_line_diagram", json!({"id":l10}));
+    assert_eq!(single["diagram"]["heads"][0]["mark"], "PANEL-2");
+}
+
+#[test]
+fn stage8_diagram_draws_family_lines_dots_and_labels_in_all_modes() {
+    use crate::render::{Part, Prim};
+    let mut s = Session::new();
+    for name in ["Fire Alarm Panel", "Smoke Detector"] {
+        run(
+            &mut s,
+            "family",
+            json!({"name":name,"symbols":[
+                {"line":[[0,0],[10,0],[5,10],[0,0]]},
+                {"dot":{"centre":[1,1],"radius":0.5}},
+                {"text":{"at":[5,5],"height":4,"value":"A","align":"center"}}
+            ]}),
+        );
+    }
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].as_u64().unwrap();
+    let device = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].as_u64().unwrap();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[device]}));
+    let before = s.model.clone();
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, None, None, None).unwrap();
+    for mode in ["full", "simplified", "grouped"] {
+        let report = run(&mut s, "electrical_line_diagram", json!({"mode":mode}));
+        assert!(
+            report["diagnostics"].as_array().unwrap().iter().all(|note| !note.as_str().unwrap().contains("generic rectangle")),
+            "{mode}"
+        );
+        let pages = if mode == "grouped" {
+            crate::low_voltage::diagram_layout::draw(&s.model, &diagram).unwrap()
+        } else {
+            let segments = crate::low_voltage::diagram_devices::segments(&s.model, None, None, None, mode == "simplified").unwrap();
+            crate::low_voltage::diagram_layout::draw_devices(&s.model, &diagram, &segments, mode == "simplified").unwrap()
+        };
+        assert_eq!(pages.len(), 1, "{mode}");
+        let page = &pages[0];
+        for id in [panel, device] {
+            let owned: Vec<_> = page
+                .prims
+                .iter()
+                .zip(&page.owners)
+                .zip(&page.parts)
+                .filter_map(|((p, owner), part)| (*owner == Some(id)).then_some((p, part)))
+                .collect();
+            assert!(
+                owned
+                    .iter()
+                    .any(|(p, part)| **part != Part::Text && matches!(p, Prim::Line { pts, .. } if pts.len() == 4 && pts[0] == pts[3])),
+                "{mode}: line {id}"
+            );
+            assert!(
+                owned
+                    .iter()
+                    .any(|(p, part)| **part != Part::Text
+                        && matches!(p, Prim::Fill { rings, .. } if rings.len() == 1 && rings[0].len() == 24)),
+                "{mode}: dot {id}"
+            );
+            assert!(owned.iter().any(|(_, part)| **part == Part::Text), "{mode}: label {id}");
+        }
+    }
+    assert_eq!(*s.model, *before);
+}
+
+#[test]
+fn stage8_diagram_reports_unsupported_symbol_glyphs() {
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    run(&mut s, "electrical_line", json!({"source":panel,"devices":[]}));
+    std::sync::Arc::make_mut(&mut s.model).families.get_mut("Fire Alarm Panel").unwrap().symbols =
+        vec![serde_json::from_value(json!({"text":{"at":[0,0],"height":5,"value":"火"}})).unwrap()];
+    let diagram = crate::low_voltage::diagram_layout::build(&s.model, None, None, None).unwrap();
+    let pages = crate::low_voltage::diagram_layout::draw(&s.model, &diagram).unwrap();
+    assert_eq!(pages[0].notes.iter().any(|n| n.contains("unsupported symbol label glyph")), !crate::font::supports("火"));
+}
+
+#[test]
+fn stage8_diagram_rejects_invalid_modes_and_preserves_existing_files() {
+    let mut s = Session::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manual.odt");
+    std::fs::write(&path, b"manual paragraphs").unwrap();
+    for params in
+        [json!([]), json!({"mode":"unknown"}), json!({"mode":false}), json!({"id":100000}), json!({"level":100000}), json!({"path":path})]
+    {
+        fails(&mut s, "electrical_line_diagram", params);
+    }
+    assert_eq!(std::fs::read(path).unwrap(), b"manual paragraphs");
+}
+
+#[test]
 fn fire_battery_capacity_checks_both_operating_modes() {
     let mut s = Session::new();
     let mut params = json!({
@@ -408,10 +1180,12 @@ fn fire_isolator_splits_a_wired_segment_in_one_undo() {
     let ids = |value: &Value| serde_json::from_value::<Id>(value.clone()).unwrap();
     let original_guid = s.model.guid(ids(&wire));
     let before = s.model.clone();
+    let table_before = run(&mut s, "electrical_line_table", json!({"id":line}));
     let mut params = json!({"id":line,"wire":wire,"family":"Sounder","fraction":0.25});
     let preview = run(&mut s, "fire_isolator", params.clone());
     assert_eq!(preview["at"], json!([1000.0, 0.0, 1000.0]));
     assert_eq!(s.model, before);
+    assert_eq!(run(&mut s, "electrical_line_table", json!({"id":line})), table_before);
     fails(&mut s, "fire_isolator", json!({"id":line,"wire":wire,"family":"Sounder","fraction":1,"apply":true}));
     params["apply"] = json!(true);
     let result = run(&mut s, "fire_isolator", params);
@@ -429,11 +1203,19 @@ fn fire_isolator_splits_a_wired_segment_in_one_undo() {
         assert!(run.connections.iter().any(|end| end.device == device));
     }
     assert_eq!(run(&mut s, "fire_line_faults", json!({"id":line}))["faults"].as_array().unwrap().len(), 4);
+    let table = run(&mut s, "electrical_line_table", json!({"id":line}));
+    assert_eq!(table["device_count"], 2);
+    assert_eq!(table["elements"][2], json!([result["device"]]));
+    for (name, value) in [("Role", json!("isolator")), ("Order", Value::Null), ("Mark", Value::Null)] {
+        let column = table["columns"].as_array().unwrap().iter().position(|v| v == name).unwrap();
+        assert_eq!(table["rows"][2][column], value);
+    }
     let (loaded, left_out) = Model::read(&s.model.to_json().unwrap()).unwrap();
     assert!(left_out.is_empty(), "{left_out:?}");
     assert_eq!(loaded.elements.get(ids(&line)), s.model.elements.get(ids(&line)));
     run(&mut s, "undo", json!({}));
     assert_eq!(s.model, before);
+    assert_eq!(run(&mut s, "electrical_line_table", json!({"id":line})), table_before);
 }
 
 /// The `name` entry of `kind` is in the library, with an id and a GUID.
@@ -791,4 +1573,44 @@ fn the_starter_set_is_data_that_passes_its_own_checks() {
     for (n, x) in &w {
         assert_eq!(x.check(n), Ok(()));
     }
+}
+
+#[test]
+fn typed_low_voltage_release_keeps_system_sections_and_rolls_back_bad_output() {
+    use std::io::Read;
+    let mut s = Session::new();
+    let panel = run(&mut s, "component", json!({"family":"Fire Alarm Panel","at":[0,0]}))["id"].clone();
+    let smoke = run(&mut s, "component", json!({"family":"Smoke Detector","at":[1000,0]}))["id"].clone();
+    let other = run(&mut s, "component", json!({"family":"Smoke Detector","at":[2000,0]}))["id"].clone();
+    let first = run(&mut s, "electrical_line", json!({"source":panel,"devices":[smoke],"profile":"sps"}))["id"].clone();
+    let second = run(&mut s, "electrical_line", json!({"source":panel,"devices":[other],"profile":"sot"}))["id"].clone();
+    let a = run(&mut s, "electrical_line_inspect", json!({"id":first}));
+    let b = run(&mut s, "electrical_line_inspect", json!({"id":second}));
+    assert_eq!(a["marks"], json!(["SPS-1", "SPS-2"]));
+    assert_eq!(b["marks"], json!(["SOT-1", "SOT-2"]));
+    assert_eq!(a["requires_okl"], true);
+    assert_eq!(run(&mut s, "fire_okl_check", json!({"profile":"sot"}))["status"], "optional");
+    fails(&mut s, "electrical_line_edit", json!({"id":first,"profile":"unknown"}));
+    let dir = tempfile::tempdir().unwrap();
+    let ods = dir.path().join("equipment.ods");
+    let pdf = dir.path().join("design.pdf");
+    let before = s.model.clone();
+    let spec = run(&mut s, "electrical_specification", json!({"path":ods}));
+    for name in ["sps", "sot", "shared"] {
+        assert_eq!(spec["sections"][name].as_array().unwrap().len(), 1);
+    }
+    let mut workbook = zip::ZipArchive::new(std::fs::File::open(ods).unwrap()).unwrap();
+    let mut content = String::new();
+    workbook.by_name("content.xml").unwrap().read_to_string(&mut content).unwrap();
+    assert!(
+        content.contains("table:name=\"1 shared\"") && content.contains("table:name=\"2 sot\"") && content.contains("table:name=\"3 sps\"")
+    );
+    let report = run(&mut s, "electrical_design_pdf", json!({"path":pdf,"code":"IOS5","title":"Fire and security systems"}));
+    assert_eq!(report["pages"], 5);
+    let bytes = std::fs::read(&pdf).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(String::from_utf8_lossy(&bytes).contains("/Count 5"));
+    fails(&mut s, "electrical_design_pdf", json!({"path":pdf,"code":"IOS5","title":"Fire","sheets":[first]}));
+    assert_eq!(std::fs::read(pdf).unwrap(), bytes);
+    assert_eq!(s.model, before);
 }

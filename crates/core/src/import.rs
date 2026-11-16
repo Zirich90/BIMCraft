@@ -2609,6 +2609,7 @@ pub(crate) fn from_step(file: File, name: &str, seed: u64) -> Result<Imported, S
             reserve: 0.0,
             along_walls: false,
             carrier: None,
+            route: None,
             local_offset: 0.0,
             size_locked: false,
             compartments: Default::default(),

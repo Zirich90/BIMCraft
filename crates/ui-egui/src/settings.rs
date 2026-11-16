@@ -119,6 +119,8 @@ pub struct Settings {
     pub high_contrast: [u8; 3],
     /// Grid snapping applies to every view, using the active view's enabled lattice.
     pub grid_snapping: bool,
+    /// The equipment height typed at placement is its bottom edge over the level, not the offset of its mounting reference.
+    pub equipment_height_by_bottom: bool,
     /// The plans' origin marker, and the view's name in their corner: working aids on the screen.
     pub origin_marker: bool,
     pub view_name: bool,
@@ -162,6 +164,7 @@ impl Settings {
             "window": self.window.to_json(),
             "high_contrast": self.high_contrast,
             "grid_snapping": self.grid_snapping,
+            "equipment_height_by_bottom": self.equipment_height_by_bottom,
             "origin_marker": self.origin_marker,
             "view_name": self.view_name,
             "shortcuts": self.shortcuts,
@@ -212,6 +215,7 @@ impl Settings {
             window: Window::from_json(&v["window"], base.window),
             high_contrast: colour(&v["high_contrast"]).unwrap_or(base.high_contrast),
             grid_snapping: v["grid_snapping"].as_bool().unwrap_or(base.grid_snapping),
+            equipment_height_by_bottom: v["equipment_height_by_bottom"].as_bool().unwrap_or(base.equipment_height_by_bottom),
             origin_marker: v["origin_marker"].as_bool().unwrap_or(base.origin_marker),
             view_name: v["view_name"].as_bool().unwrap_or(base.view_name),
             shortcuts: shortcuts_from(&v["shortcuts"], base.shortcuts),
@@ -327,6 +331,7 @@ impl BimApp {
         self.window.kept = kept.window;
         self.scan_contrast = kept.high_contrast;
         self.grid_snapping = kept.grid_snapping;
+        self.height_by_bottom = kept.equipment_height_by_bottom;
         (self.show_origin, self.show_view_name) = (kept.origin_marker, kept.view_name);
         self.custom_shortcuts = kept.shortcuts.clone();
         self.system_title_bar = kept.system_title_bar;
@@ -364,6 +369,7 @@ impl BimApp {
             window: self.window.kept,
             high_contrast: self.scan_contrast,
             grid_snapping: self.grid_snapping,
+            equipment_height_by_bottom: self.height_by_bottom,
             origin_marker: self.show_origin,
             view_name: self.show_view_name,
             shortcuts: self.custom_shortcuts.clone(),
@@ -589,6 +595,10 @@ impl BimApp {
         }
         heading(ui, msg!("Palettes"));
         self.palette_switches(ui);
+        heading(ui, msg!("Placement"));
+        ui.checkbox(&mut self.height_by_bottom, t(msg!("Equipment height by its bottom edge"))).on_hover_text(t(msg!(
+            "The height typed at placement puts the equipment's bottom edge there; Shift places it at its normative height instead"
+        )));
         heading(ui, msg!("Plans"));
         ui.checkbox(&mut self.show_origin, t("Show the origin marker in plans")).on_hover_text(t(
             "A small marker at the project's 0, 0 with the directions of x (east) and y (north). It is drawn on the screen only: \

@@ -233,7 +233,31 @@ pub(crate) fn sweep_payloads(s: &mut Session) -> Vec<(&'static str, Value)> {
     let heat = run(s, "detectors", json!({"room": room, "kind": "heat"}));
     let (one, two) = (heat["ids"][0].as_u64().unwrap(), heat["ids"][1].as_u64().unwrap());
     let id = wire(s, json!({"source": smoke, "devices": [one]}));
+    let line = made(s, "electrical_line", json!({"source": smoke, "devices": [one, two]}));
     vec![
+        ("electrical_line_diagram", json!({"id":line,"mode":"full"})),
+        ("electrical_line_diagram", json!({"id":line,"mode":"simplified"})),
+        ("electrical_line_diagram", json!({"id":line,"mode":"grouped"})),
+        ("electrical_line_diagram", json!({"id":line,"mode":1})),
+        ("electrical_line_diagram", json!({"id":line,"path":"manual.odt"})),
+        ("electrical_line_diagram", json!({"id":line,"unknown":true})),
+        ("odt_template", json!({"template":"missing.odt","path":"copy.odt","fields":{"Name":"Value"}})),
+        ("odt_template", json!({"template":1,"path":"copy.odt","fields":[]})),
+        ("odt_template", json!({"unknown":true})),
+        ("odt_set", json!({"templates":["missing.odt"],"path":"out","fields":{"Name":"Value"}})),
+        ("odt_set", json!({"templates":[],"path":"out","fields":{}})),
+        ("odt_set", json!({"templates":"missing.odt","path":"out","fields":[]})),
+        ("odt_set", json!({"unknown":true})),
+        ("electrical_specification", json!({})),
+        ("electrical_specification", json!({"system":false})),
+        ("electrical_specification", json!({"path":"manual.odt"})),
+        ("electrical_specification", json!({"unknown":true})),
+        ("electrical_line_table", json!({"id":line})),
+        ("electrical_line_table", json!({"id":line,"level":room})),
+        ("electrical_line_table", json!({"id":line,"system":false})),
+        ("electrical_line_table", json!({"id":line,"path":1})),
+        ("electrical_line_table", json!({"id":line,"path":"manual.odt"})),
+        ("electrical_line_table", json!({"id":line,"unknown":true})),
         ("wire", json!({"points": [[0, 0], [1000, 0]], "source": smoke, "devices": [one, two], "reserve": 10})),
         ("wire", json!({"points": [[0, 0], [1000, 0]], "source": room, "devices": [one]})),
         ("wire", json!({"points": [[0, 0], [1000, 0]], "source": smoke, "devices": [smoke]})),

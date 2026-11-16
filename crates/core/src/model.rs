@@ -13,6 +13,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::low_voltage::lines::{ElectricalBranch, ElectricalLine, ElectricalMark, ElectricalTerminal};
+pub use crate::low_voltage::zones::{FireZone, FireZoneKind, FireZoneUnit};
+
 use crate::cad::{Cad, Colors};
 use crate::cloud::Cloud;
 use crate::family::{Family, Piece};
@@ -331,7 +334,7 @@ fn is_yes(b: &bool) -> bool {
     *b
 }
 
-fn is_zero(x: &f64) -> bool {
+pub(crate) fn is_zero(x: &f64) -> bool {
     *x == 0.0
 }
 
@@ -1689,6 +1692,9 @@ pub struct Run {
     pub along_walls: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carrier: Option<Guid>,
+    /// The head segment of the drawn route this segment belongs to: one cable over many segments; the head names itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Guid>,
     #[serde(default)]
     pub local_offset: f64,
     /// Manual carrier size boundary: never changed by automatic sizing.
@@ -1726,118 +1732,13 @@ impl Default for Run {
             reserve: 0.0,
             along_walls: false,
             carrier: None,
+            route: None,
             local_offset: 0.0,
             size_locked: false,
             compartments: BTreeMap::new(),
             compartment: String::new(),
             params: BTreeMap::new(),
         }
-    }
-}
-
-/// An electrical line's connectivity, independent of physical wire geometry.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElectricalLine {
-    pub source: Guid,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub system: String,
-    pub devices: Vec<Guid>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub branches: Vec<ElectricalBranch>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segments: Vec<Guid>,
-    /// Confirmed standalone short-circuit isolators, separate from the addressed device order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub isolators: Vec<Guid>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub terminals: Vec<Guid>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub mark_prefix: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub locked_marks: Vec<ElectricalMark>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElectricalBranch {
-    pub from: Guid,
-    pub devices: Vec<Guid>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElectricalTerminal {
-    pub device: Guid,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub purpose: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_ma: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit_ma: Option<f64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElectricalMark {
-    pub device: Guid,
-    pub mark: String,
-}
-
-impl ElectricalLine {
-    pub fn members(&self) -> impl Iterator<Item = Guid> + '_ {
-        std::iter::once(self.source)
-            .chain(self.devices.iter().copied())
-            .chain(self.branches.iter().flat_map(|branch| branch.devices.iter().copied()))
-    }
-
-    pub fn order(&self, model: &Model) -> Vec<Guid> {
-        let at = |guid| model.anchor(guid).unwrap_or(P2(0.0, 0.0));
-        let mut continuation = BTreeMap::new();
-        let mut branches = BTreeMap::<_, Vec<_>>::new();
-        continuation.extend(std::iter::once(self.source).chain(self.devices.iter().copied()).zip(self.devices.iter().copied()));
-        for ElectricalBranch { from, devices } in &self.branches {
-            continuation.extend(devices.windows(2).map(|pair| (pair[0], pair[1])));
-            if let Some(first) = devices.first() {
-                let length = at(*from).dist(at(*first)) + devices.windows(2).map(|pair| at(pair[0]).dist(at(pair[1]))).sum::<f64>();
-                let delta = at(*first) - at(*from);
-                let angle = (-delta.1.atan2(delta.0)).rem_euclid(std::f64::consts::TAU);
-                branches.entry(*from).or_default().push((length, angle, *first));
-            }
-        }
-        let mut order = Vec::new();
-        let mut stack = vec![self.source];
-        let mut seen = BTreeSet::new();
-        while let Some(device) = stack.pop() {
-            if !seen.insert(device) {
-                continue;
-            }
-            order.push(device);
-            stack.extend(continuation.get(&device).copied());
-            if let Some(mut children) = branches.remove(&device) {
-                children.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
-                stack.extend(children.into_iter().rev().map(|(_, _, guid)| guid));
-            }
-        }
-        order
-    }
-
-    pub fn marks(&self, model: &Model) -> Vec<String> {
-        let locked: BTreeMap<_, _> = self.locked_marks.iter().map(|entry| (entry.device, entry.mark.as_str())).collect();
-        let reserved: BTreeSet<_> = locked.values().copied().collect();
-        let prefix = if self.mark_prefix.is_empty() {
-            model.electrical_mark_templates.get(&self.system).map_or("", String::as_str)
-        } else {
-            &self.mark_prefix
-        };
-        let mut automatic = (1..).map(|number| format!("{prefix}{number}")).filter(|mark| !reserved.contains(mark.as_str()));
-        self.order(model)
-            .into_iter()
-            .map(|device| locked.get(&device).map_or_else(|| automatic.next().unwrap_or_default(), |mark| (*mark).to_owned()))
-            .collect()
     }
 }
 
@@ -1941,46 +1842,6 @@ pub struct Component {
 pub enum DetectorSpace {
     Plenum,
     Underfloor,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FireZoneKind {
-    Detection,
-    Notification,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FireZoneUnit {
-    Dwelling,
-    Apartment,
-    HotelRoom,
-}
-
-/// A volume and room overrides for an alarm or notification zone.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FireZone {
-    pub name: String,
-    pub kind: FireZoneKind,
-    pub level: Guid,
-    pub boundary: Vec<P2>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub base_offset: f64,
-    pub height: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<DetectorSpace>,
-    /// One complete dwelling, apartment or hotel room under SP 484, 6.3.4.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<FireZoneUnit>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include_rooms: Vec<Guid>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude_rooms: Vec<Guid>,
-    /// Notification zones activated by a fire event in this detection zone.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notify: Vec<Guid>,
 }
 
 /// A billable equipment position, including items without a location in the building.
@@ -2450,12 +2311,7 @@ macro_rules! visit_refs {
                 f(level);
                 if let Some(g) = top_level { f(g) }
             }
-            Element::FireZone(zone) => {
-                f(& $($m)? zone.level);
-                for g in & $($m)? zone.include_rooms { f(g); }
-                for g in & $($m)? zone.exclude_rooms { f(g); }
-                for g in & $($m)? zone.notify { f(g); }
-            }
+            Element::FireZone(zone) => crate::low_voltage::zones::visit_zone!(zone, f, $($m)?),
             Element::Shaft(Shaft { level, top_level, .. })
             | Element::Mass(Mass { level, top_level, .. })
             | Element::Column(Column { level, top_level, .. })
@@ -2484,23 +2340,13 @@ macro_rules! visit_refs {
                 f(& $($m)? v.view);
             }
             Element::ElectricalTerminal(terminal) => f(& $($m)? terminal.device),
-            Element::ElectricalLine(line) => {
-                for terminal in & $($m)? line.terminals { f(terminal); }
-                f(& $($m)? line.source);
-                for device in & $($m)? line.devices { f(device); }
-                for branch in & $($m)? line.branches {
-                    f(& $($m)? branch.from);
-                    for device in & $($m)? branch.devices { f(device); }
-                }
-                for segment in & $($m)? line.segments { f(segment); }
-                for isolator in & $($m)? line.isolators { f(isolator); }
-                for entry in & $($m)? line.locked_marks { f(& $($m)? entry.device); }
-            }
+            Element::ElectricalLine(line) => crate::low_voltage::lines::visit_line!(line, f, $($m)?),
             run_arm!(r) => {
                 f(& $($m)? r.level);
                 if let Some(mount) = & $($m)? r.mount { f(& $($m)? mount.host); }
                 if let Some(g) = & $($m)? r.source { f(g) }
                 if let Some(g) = & $($m)? r.carrier { f(g) }
+                if let Some(g) = & $($m)? r.route { f(g) }
                 for connection in & $($m)? r.connections {
                     f(& $($m)? connection.device);
                     if let Some(g) = & $($m)? connection.terminal { f(g); }
@@ -4394,11 +4240,7 @@ impl Model {
         // either: a file of 17's connectors are a power or a switch one, each with its system, which 18 reads as they were; a
         // file of 17 holds no title blocks, its sheets keeping the built-in one, no `join`, which reads as joining, as it always
         // did, and none of its dimensions measures `across`.
-        // 22 combines the upstream and low-voltage schemas. Missing fork fields keep their legacy defaults.
-        // 22 to 23: detectors without an explicit space still belong to the main room.
-        // 24 to 25: lines from older files have no recorded standalone short-circuit isolators.
-        // 25 to 26: links from older files have no recorded detector groups.
-        // In format 27 the missing fire zone unit defaults to None, retaining single-level membership.
+        crate::low_voltage::migrate(self);
         self.format = FORMAT;
     }
 
@@ -5871,297 +5713,6 @@ impl Model {
         self.types.runs.get(e.category())?.get(&e.run()?.type_name)
     }
 
-    /// Peak simultaneous cable section along each carrier, compared with its gross section.
-    /// Regulatory limits and internal usable dimensions require an explicit profile.
-    pub fn carrier_sections(&self) -> BTreeMap<Guid, f64> {
-        let area = |t: &RunType| if t.round { std::f64::consts::PI * t.width * t.width / 4.0 } else { t.width * t.depth };
-        let mut events: BTreeMap<Guid, Vec<(f64, f64)>> = BTreeMap::new();
-        for e in self.elements.values() {
-            let Element::Wire(wire) = e else { continue };
-            let Some(carrier) = wire.carrier else { continue };
-            let Some(host @ Element::CableCarrier(_)) = self.elements.get(carrier) else { continue };
-            let (Some(h), Some(w), Some(t)) = (self.run_geom(host), self.run_geom(e), self.run_type(e)) else { continue };
-            let axis = [h.b[0] - h.a[0], h.b[1] - h.a[1], h.b[2] - h.a[2]];
-            let length2: f64 = axis.iter().map(|v| v * v).sum();
-            if length2 <= TOL * TOL {
-                continue;
-            }
-            let project = |p: [f64; 3]| (0..3).map(|i| (p[i] - h.a[i]) * axis[i]).sum::<f64>() / length2;
-            let (a, b) = (project(w.a), project(w.b));
-            let (lo, hi) = (a.min(b).max(0.0), a.max(b).min(1.0));
-            if hi <= lo {
-                continue;
-            }
-            let section = area(t);
-            let list = events.entry(carrier).or_default();
-            list.push((lo, section));
-            list.push((hi, -section));
-        }
-        let mut peaks = BTreeMap::new();
-        for (carrier, mut list) in events {
-            list.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-            let (mut current, mut peak) = (0.0_f64, 0.0_f64);
-            for (_, delta) in list {
-                current += delta;
-                peak = peak.max(current);
-            }
-            peaks.insert(carrier, peak);
-        }
-        peaks
-    }
-
-    /// Follow a mounted carrier's physical frame, or a legacy carrier's type-height shift.
-    /// Explicit cable edits already moved themselves and take precedence.
-    pub(crate) fn follow_carrier_type_changes(&mut self, before: &Self) {
-        let types_changed = self.types.runs.get("cablecarrier") != before.types.runs.get("cablecarrier");
-        let mut moved = Vec::new();
-        for (&id, element) in &self.elements {
-            let Element::Wire(wire) = element else { continue };
-            if before.elements.get(id) != Some(element) {
-                continue;
-            }
-            let Some(host) = wire.carrier.and_then(|id| self.elements.get(id)) else { continue };
-            let Some(old_host) = wire.carrier.and_then(|id| before.elements.get(id)) else { continue };
-            if host.run().is_some_and(|r| r.mount.is_some()) {
-                let (Some(old), Some(new), Some(old_wire)) = (before.run_geom(old_host), self.run_geom(host), before.run_geom(element))
-                else {
-                    continue;
-                };
-                if old.a == new.a && old.b == new.b && old.frame() == new.frame() {
-                    continue;
-                }
-                let (oa, ox, oy) = old.frame();
-                let (na, nx, ny) = new.frame();
-                let vector = |p| {
-                    use crate::view3d::{add, dot, mul};
-                    add(add(mul(na, dot(p, oa)), mul(nx, dot(p, ox))), mul(ny, dot(p, oy)))
-                };
-                let map = |p| crate::view3d::add(new.a, vector(crate::view3d::sub(p, old.a)));
-                let (a, b) = (map(old_wire.a), map(old_wire.b));
-                let mut updated = wire.clone();
-                updated.start = P2(a[0], a[1]);
-                updated.end = P2(b[0], b[1]);
-                updated.offset = a[2] - self.elevation(wire.level);
-                updated.end_offset = Some(b[2] - self.elevation(wire.level));
-                updated.justify = Justify::Centre;
-                let depth = vector(old_wire.frame().2);
-                let (_, x, y) = crate::runs::Geom { a, b, roll: 0.0, ..old_wire }.frame();
-                updated.section_roll = (-crate::view3d::dot(depth, x)).atan2(crate::view3d::dot(depth, y)).to_degrees();
-                moved.push((id, Element::Wire(updated)));
-                continue;
-            }
-            if !types_changed {
-                continue;
-            }
-            if host != old_host {
-                continue;
-            }
-            let (Some(old), Some(new)) = (before.run_geom(old_host), self.run_geom(host)) else { continue };
-            let dz = new.a[2] - old.a[2];
-            if dz == 0.0 {
-                continue;
-            }
-            let (Some(old_wire), Some(new_wire)) = (before.run_geom(element), self.run_geom(element)) else { continue };
-            let shift = dz - (new_wire.a[2] - old_wire.a[2]);
-            let mut wire = wire.clone();
-            wire.offset += shift;
-            if let Some(end) = &mut wire.end_offset {
-                *end += shift;
-            }
-            moved.push((id, Element::Wire(wire)));
-        }
-        for (id, wire) in moved {
-            self.elements.insert(id, wire);
-        }
-    }
-
-    /// Cable envelope around each carrier axis: width, depth and enclosing diameter.
-    /// Includes endpoint offsets and the cable's oriented section, not just its area.
-    pub fn carrier_envelopes(&self) -> BTreeMap<Guid, [f64; 3]> {
-        use crate::view3d::sub;
-        let dot = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-        let frame = |g: crate::runs::Geom| g.frame();
-        let mut result: BTreeMap<Guid, [f64; 3]> = BTreeMap::new();
-        for e in self.elements.values() {
-            let Element::Wire(wire) = e else { continue };
-            let Some(guid) = wire.carrier else { continue };
-            let Some(host) = self.elements.get(guid).and_then(|e| self.run_geom(e)) else { continue };
-            let Some(cable) = self.run_geom(e) else { continue };
-            let (_, x, y) = frame(host);
-            let (axis, cx, cy) = frame(cable);
-            let required = result.entry(guid).or_default();
-            for end in [cable.a, cable.b] {
-                let delta = sub(end, host.a);
-                let (px, py) = (dot(delta, x), dot(delta, y));
-                if cable.round {
-                    let r = cable.width / 2.0;
-                    required[0] = required[0].max(2.0 * (px.abs() + r * (1.0 - dot(x, axis).powi(2)).max(0.0).sqrt()));
-                    required[1] = required[1].max(2.0 * (py.abs() + r * (1.0 - dot(y, axis).powi(2)).max(0.0).sqrt()));
-                    required[2] = required[2].max(2.0 * (px.hypot(py) + r));
-                } else {
-                    for a in [-0.5, 0.5] {
-                        for b in [-0.5, 0.5] {
-                            let vx = px + a * cable.width * dot(cx, x) + b * cable.depth * dot(cy, x);
-                            let vy = py + a * cable.width * dot(cx, y) + b * cable.depth * dot(cy, y);
-                            required[0] = required[0].max(2.0 * vx.abs());
-                            required[1] = required[1].max(2.0 * vy.abs());
-                            required[2] = required[2].max(2.0 * vx.hypot(vy));
-                        }
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    pub fn carrier_fits(t: &RunType, required: [f64; 3]) -> bool {
-        if t.round { t.width + TOL >= required[2] } else { t.width + TOL >= required[0] && t.depth + TOL >= required[1] }
-    }
-
-    /// Advisory per-compartment occupancy and explicitly configured system separation.
-    pub fn carrier_compartment_warnings(&self, percent: f64) -> BTreeMap<Guid, Vec<String>> {
-        use crate::view3d::sub;
-        let dot = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-        let mut warnings: BTreeMap<Guid, Vec<String>> = BTreeMap::new();
-        let mut events: BTreeMap<(Guid, String), Vec<(f64, f64)>> = BTreeMap::new();
-        for e in self.elements.values() {
-            let Element::Wire(wire) = e else { continue };
-            let Some(guid) = wire.carrier else { continue };
-            let Some(host @ Element::CableCarrier(run)) = self.elements.get(guid) else { continue };
-            if run.compartments.is_empty() && wire.compartment.is_empty() {
-                continue;
-            }
-            let Some(slot) = run.compartments.get(&wire.compartment) else {
-                warnings.entry(guid).or_default().push(format!("cable carrier {guid}: assign the wire to an existing compartment"));
-                continue;
-            };
-            let notes = warnings.entry(guid).or_default();
-            if !slot.systems.is_empty() && !slot.systems.contains(&wire.system) {
-                notes
-                    .push(format!("cable carrier {guid}: compartment {} system separation conflict for {}", wire.compartment, wire.system));
-            }
-            let (Some(h), Some(w)) = (self.run_geom(host), self.run_geom(e)) else { continue };
-            let (axis, x, y) = h.frame();
-            let (wa, wx, wy) = w.frame();
-            let support = |n| {
-                if w.round {
-                    w.width / 2.0 * (1.0 - dot(n, wa).powi(2)).max(0.0).sqrt()
-                } else {
-                    (w.width * dot(n, wx).abs() + w.depth * dot(n, wy).abs()) / 2.0
-                }
-            };
-            if [w.a, w.b].iter().any(|p| {
-                let d = sub(*p, h.a);
-                (dot(d, x) - slot.offset).abs() + support(x) > slot.width / 2.0 + TOL
-                    || dot(d, y).abs() + support(y) > slot.depth / 2.0 + TOL
-            }) {
-                notes.push(format!(
-                    "cable carrier {guid}: compartment {} geometric conflict; cable envelope does not fit its usable section",
-                    wire.compartment
-                ));
-            }
-            let a = dot(sub(w.a, h.a), axis) / h.length();
-            let b = dot(sub(w.b, h.a), axis) / h.length();
-            let lo = a.min(b).max(0.0);
-            let hi = a.max(b).min(1.0);
-            if hi > lo {
-                let area = if w.round { std::f64::consts::PI * w.width * w.width / 4.0 } else { w.width * w.depth };
-                events.entry((guid, wire.compartment.clone())).or_default().extend([(lo, area), (hi, -area)]);
-            }
-        }
-        for ((guid, name), mut list) in events {
-            list.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-            let (mut current, mut peak) = (0.0_f64, 0.0_f64);
-            for (_, delta) in list {
-                current += delta;
-                peak = peak.max(current);
-            }
-            let Some(Element::CableCarrier(run)) = self.elements.get(guid) else { continue };
-            let Some(slot) = run.compartments.get(&name) else { continue };
-            if peak > slot.width * slot.depth * percent / 100.0 {
-                warnings.entry(guid).or_default().push(format!(
-                    "cable carrier {guid}: compartment {name} simultaneous cable section exceeds {percent}% of its usable section"
-                ));
-            }
-        }
-        warnings.retain(|_, notes| !notes.is_empty());
-        warnings
-    }
-
-    /// Measured product section, kept with the catalogue type rather than a placed run.
-    pub fn carrier_section(&self, name: &str) -> Option<&crate::carrier_limits::Section> {
-        let id = self.library.id(&crate::library::Kind::Type("cablecarrier".into()), name)?;
-        self.library.get(id)?.product.as_ref()?.carrier.as_ref()
-    }
-
-    pub fn carrier_capacity(&self, name: &str, profile: crate::carrier_limits::Profile, percent: f64) -> Result<f64, String> {
-        let t = self.types.runs.get("cablecarrier").and_then(|types| types.get(name)).ok_or("carrier type is missing")?;
-        let gross = if t.round { std::f64::consts::PI * t.width * t.width / 4.0 } else { t.width * t.depth };
-        crate::carrier_limits::capacity(profile, percent, gross, self.carrier_section(name))
-    }
-
-    pub fn carrier_type_fits(&self, name: &str, required: [f64; 3], profile: crate::carrier_limits::Profile) -> bool {
-        let Some(t) = self.types.runs.get("cablecarrier").and_then(|types| types.get(name)) else { return false };
-        if !Self::carrier_fits(t, required) {
-            return false;
-        }
-        if profile == crate::carrier_limits::Profile::Project {
-            return true;
-        }
-        self.carrier_section(name).is_some_and(|section| {
-            section.clear_width.is_some_and(|w| w + TOL >= required[0]) && section.clear_depth.is_some_and(|d| d + TOL >= required[1])
-        })
-    }
-
-    pub(crate) fn carrier_compartments_fit(&self, name: &str, run: &Run, profile: crate::carrier_limits::Profile) -> bool {
-        run.compartments.is_empty()
-            || self.carrier_type_fits(
-                name,
-                run.compartments
-                    .values()
-                    .fold([0.0_f64; 3], |a, slot| [a[0].max(slot.width + 2.0 * slot.offset.abs()), a[1].max(slot.depth), 0.0]),
-                profile,
-            )
-    }
-
-    pub fn carrier_warnings(&self) -> Vec<String> {
-        let profile = self.carrier_settings.as_ref().map_or(crate::carrier_limits::Profile::default(), |p| p.profile);
-        let percent = self.carrier_settings.as_ref().map_or(100.0, |p| p.fill_percent);
-        let mut warnings: Vec<_> = self.carrier_sections().into_iter().filter_map(|(carrier, peak)| {
-            let Element::CableCarrier(run) = self.elements.get(carrier)? else { return None };
-            match self.carrier_capacity(&run.type_name, profile, percent) {
-                Err(error) => Some(format!("cable carrier {carrier}: {error}; capacity cannot be verified")),
-                Ok(allowed) if peak > allowed => Some(format!("cable carrier {carrier}: simultaneous cable section {peak:.1} mm2 exceeds allowed section {allowed:.1} mm2; choose a larger carrier or smaller cables")),
-                _ => None,
-            }
-        }).collect();
-        for (guid, required) in self.carrier_envelopes() {
-            let Some(Element::CableCarrier(run)) = self.elements.get(guid) else { continue };
-            if !self.carrier_type_fits(&run.type_name, required, profile) {
-                warnings.push(format!(
-                    "cable carrier {guid}: geometric conflict; cable envelope needs {:.1} x {:.1} mm, diameter {:.1} mm",
-                    required[0], required[1], required[2]
-                ));
-            }
-        }
-        for (id, element) in self.elements.iter() {
-            if let Element::CableCarrier(run) = element
-                && !self.carrier_compartments_fit(&run.type_name, run, profile)
-            {
-                warnings.push(format!(
-                    "cable carrier {}: geometric conflict; measured compartment does not fit the carrier section",
-                    self.guid(*id)
-                ));
-            }
-        }
-        warnings.extend(
-            self.carrier_compartment_warnings(if profile == crate::carrier_limits::Profile::Project { percent } else { 100.0 })
-                .into_values()
-                .flatten(),
-        );
-        warnings
-    }
-
     /// A run worked out: its ends and its section. None for another element, or a type it doesn't have.
     pub fn run_geom(&self, e: &Element) -> Option<crate::runs::Geom> {
         Some(crate::runs::Geom::of(self, e.run()?, self.run_type(e)?))
@@ -7230,76 +6781,7 @@ impl Model {
     /// Everything that must hold between commands: references resolve, geometry is finite and
     /// not degenerate, doors and windows fit their walls and don't overlap.
     pub fn check(&self) -> Result<(), String> {
-        self.check_wire_connections()?;
-        if self.electrical_mark_templates.len() > MAX_POINTS {
-            return Err("Too many electrical mark templates".into());
-        }
-        for (system, prefix) in &self.electrical_mark_templates {
-            text("Electrical mark template", "system", system)?;
-            text("Electrical mark template", "prefix", prefix)?;
-            if system.trim().is_empty() {
-                return Err("Electrical mark template needs a system name".into());
-            }
-        }
-        for element in self.elements.values() {
-            let Element::ElectricalLine(line) = element else { continue };
-            let mut devices = BTreeSet::new();
-            if line.branches.len() > MAX_POINTS
-                || line.branches.iter().any(|branch| branch.devices.is_empty())
-                || line.members().skip(1).take(MAX_POINTS + 1).count() > MAX_POINTS
-                || line
-                    .members()
-                    .any(|g| !devices.insert(g) || !matches!(self.elements.get(g), Some(Element::Component(c)) if c.is_placed()))
-            {
-                return Err("Electrical line needs distinct placed components as source and devices".into());
-            }
-            if line.order(self).len() != devices.len() {
-                return Err("Electrical line branches must connect to the source without cycles".into());
-            }
-            if line.isolators.len() > MAX_POINTS
-                || line
-                    .isolators
-                    .iter()
-                    .any(|&g| !devices.insert(g) || !matches!(self.elements.get(g), Some(Element::Component(c)) if c.is_placed()))
-            {
-                return Err(
-                    "Electrical line standalone isolators must be distinct placed components outside the addressed device order".into()
-                );
-            }
-            let mut segments = BTreeSet::new();
-            if line.segments.len() > MAX_POINTS
-                || line
-                    .segments
-                    .iter()
-                    .any(|g| !segments.insert(*g) || !matches!(self.elements.get(*g), Some(Element::Wire(w)) if w.feeder.is_none()))
-            {
-                return Err("Electrical line segments must be distinct main wires".into());
-            }
-            let mut terminals = BTreeSet::new();
-            if line.terminals.len() > MAX_POINTS
-                || line.terminals.iter().any(|g| {
-                    !terminals.insert(*g)
-                        || !matches!(self.elements.get(*g), Some(Element::ElectricalTerminal(t)) if devices.contains(&t.device))
-                })
-            {
-                return Err("Electrical line terminals must be distinct and belong to devices on the line".into());
-            }
-            text("Electrical line", "mark_prefix", &line.mark_prefix)?;
-            text("Electrical line", "system", &line.system)?;
-            let mut marked_devices = BTreeSet::new();
-            let mut marks = BTreeSet::new();
-            for entry in &line.locked_marks {
-                text("Electrical line", "locked mark", &entry.mark)?;
-                if entry.mark.trim().is_empty()
-                    || !devices.contains(&entry.device)
-                    || line.isolators.contains(&entry.device)
-                    || !marked_devices.insert(entry.device)
-                    || !marks.insert(&entry.mark)
-                {
-                    return Err("Electrical line locked marks must be nonempty and unique, with one per device on the line".into());
-                }
-            }
-        }
+        crate::low_voltage::check(self)?;
         if let Some(p) = &self.carrier_settings {
             text("Carrier settings", "default_type", &p.default_type)?;
             if !p.default_type.is_empty() && !self.types.runs.get("cablecarrier").is_some_and(|types| types.contains_key(&p.default_type)) {
@@ -7767,61 +7249,7 @@ impl Model {
         phasing::check_order(self, &who, e)?;
         match e {
             Element::ElectricalLine(_) => {}
-            Element::FireZone(zone) => {
-                level_ok(zone.level)?;
-                text(&who, "name", &zone.name)?;
-                if zone.name.trim().is_empty() {
-                    return Err(format!("{who}: name the fire zone"));
-                }
-                coord(&format!("{who} base offset"), zone.base_offset)?;
-                size(&format!("{who} height"), zone.height)?;
-                coord(&format!("{who} top offset"), zone.base_offset + zone.height)?;
-                boundary(&who, &zone.boundary)?;
-                if zone.boundary.len() > 512 {
-                    return Err(format!("{who}: a fire zone boundary has at most 512 points"));
-                }
-                if crate::sketch::solve(&crate::sketch::lines_of(&zone.boundary, &[])).is_err() {
-                    return Err(format!("{who}: give a simple fire zone boundary"));
-                }
-                if zone.unit.is_some() && (zone.kind != FireZoneKind::Detection || zone.space.is_some()) {
-                    return Err(format!("{who}: a whole unit needs a main detection zone"));
-                }
-                let mut rooms = BTreeSet::new();
-                for room in zone.include_rooms.iter().chain(&zone.exclude_rooms) {
-                    if !rooms.insert(room)
-                        || !matches!(self.elements.get(*room), Some(Element::Room(r)) if r.level == zone.level || zone.unit.is_some())
-                    {
-                        return Err(format!("{who}: name each room once, on the zone's level unless it covers one whole unit"));
-                    }
-                }
-                if rooms.len() > 512 || zone.notify.len() > 512 {
-                    return Err(format!("{who}: at most 512 room overrides and 512 notification links"));
-                }
-                if zone.kind == FireZoneKind::Notification && (zone.space.is_some() || !zone.notify.is_empty()) {
-                    return Err(format!("{who}: only detection zones can specify a hidden space or trigger notification"));
-                }
-                let mut targets = BTreeSet::new();
-                for g in &zone.notify {
-                    if !targets.insert(g)
-                        || !matches!(self.elements.get(*g), Some(Element::FireZone(target)) if target.kind == FireZoneKind::Notification)
-                    {
-                        return Err(format!("{who}: fire events must target distinct notification zones"));
-                    }
-                }
-            }
-            Element::ElectricalTerminal(t) => {
-                text(&who, "name", &t.name)?;
-                text(&who, "purpose", &t.purpose)?;
-                text(&who, "address", &t.address)?;
-                for current in [t.load_ma, t.limit_ma].into_iter().flatten() {
-                    if !current.is_finite() || !(0.0..=MAX_COORD).contains(&current) {
-                        return Err(format!("{who}: terminal currents must be finite nonnegative milliamps"));
-                    }
-                }
-                if t.name.trim().is_empty() || !matches!(self.elements.get(t.device), Some(Element::Component(c)) if c.is_placed()) {
-                    return Err(format!("{who}: a terminal needs a name and a placed component"));
-                }
-            }
+            Element::FireZone(_) | Element::ElectricalTerminal(_) => crate::low_voltage::check_element(self, &who, e)?,
             Element::Level(l) => {
                 text(&who, "name", &l.name)?;
                 coord(&format!("{who} elevation"), l.elevation)?;
@@ -8543,106 +7971,7 @@ impl Model {
                 text(&who, "cable", &r.cable)?;
                 text(&who, "system", &r.system)?;
                 crate::runs::check(&who, category, &crate::runs::Geom::of(self, r, t))?;
-                if r.compartments.len() > 32 || (!r.compartments.is_empty() && (category != "cablecarrier" || t.round)) {
-                    return Err(format!("{who}: at most 32 compartments belong to a rectangular cable carrier"));
-                }
-                text(&who, "compartment", &r.compartment)?;
-                if !r.compartment.is_empty() && category != "wire" {
-                    return Err(format!("{who}: only a wire names its compartment"));
-                }
-                for (name, slot) in &r.compartments {
-                    text(&who, "compartment name", name)?;
-                    size(&who, slot.width)?;
-                    size(&who, slot.depth)?;
-                    coord(&who, slot.offset)?;
-                    if name.trim().is_empty()
-                        || slot.systems.len() > 32
-                        || 2.0 * slot.offset.abs() + slot.width > t.width + TOL
-                        || slot.depth > t.depth + TOL
-                    {
-                        return Err(format!("{who}: named compartments must fit the carrier section and list at most 32 systems"));
-                    }
-                    for system in &slot.systems {
-                        text(&who, "compartment system", system)?;
-                    }
-                }
-                let slots: Vec<_> = r.compartments.values().collect();
-                for (i, a) in slots.iter().enumerate() {
-                    for b in &slots[i + 1..] {
-                        if (a.offset - b.offset).abs() + TOL < (a.width + b.width) / 2.0 {
-                            return Err(format!("{who}: compartments overlap; separate their usable sections"));
-                        }
-                    }
-                }
-                if r.size_locked && category != "cablecarrier" {
-                    return Err(format!("{who}: size_locked is only for cable carriers"));
-                }
-                let wire = category == "wire";
-                if !wire && (r.source.is_some() || !r.devices.is_empty() || r.carrier.is_some()) {
-                    return Err(format!("{who}: only a wire carries its source, devices and carrier"));
-                }
-                coord(&format!("{who} local_offset"), r.local_offset)?;
-                if let Some(g) = r.carrier {
-                    match self.elements.get(g) {
-                        Some(Element::CableCarrier(_)) => {}
-                        Some(other) => {
-                            return Err(format!("{who}: its carrier is a cable carrier, not {} {g}", other.category()));
-                        }
-                        None => {
-                            return Err(format!("{who}: element {g} doesn't exist"));
-                        }
-                    }
-                }
-                if !wire {
-                    return Ok(());
-                }
-                if r.devices.len() > MAX_POINTS {
-                    return Err(format!("{who}: a wire names at most {MAX_POINTS} devices"));
-                }
-                if !(r.reserve.is_finite() && (0.0..=100.0).contains(&r.reserve)) {
-                    return Err(format!("{who}: its reserve is a per cent from 0 to 100, not {}", r.reserve));
-                }
-                match (r.source, !r.devices.is_empty()) {
-                    (Some(source), true) => {
-                        match self.elements.get(source) {
-                            Some(Element::Component(c)) if c.is_placed() => {}
-                            Some(Element::Component(_)) => {
-                                return Err(format!("{who}: source equipment must be placed before connecting"));
-                            }
-                            Some(other) => {
-                                return Err(format!("{who}: its source is a device, a component, not {} {}", other.category(), source));
-                            }
-                            None => {
-                                return Err(format!("{who}: element {source} doesn't exist"));
-                            }
-                        }
-                        let mut seen = BTreeSet::from([source]);
-                        for d in r.devices.iter().copied() {
-                            match self.elements.get(d) {
-                                Some(Element::Component(c)) if c.is_placed() => {}
-                                Some(Element::Component(_)) => {
-                                    return Err(format!("{who}: equipment {d} must be placed before connecting"));
-                                }
-                                Some(other) => {
-                                    return Err(format!("{who}: its device is a component, not {} {}", other.category(), d));
-                                }
-                                None => {
-                                    return Err(format!("{who}: element {d} doesn't exist"));
-                                }
-                            }
-                            if !seen.insert(d) {
-                                return Err(format!("{who}: element {d} is in it twice, or is its source"));
-                            }
-                        }
-                    }
-                    (Some(_), false) => {
-                        return Err(format!("{who}: a wire with a source reaches one device at least"));
-                    }
-                    (None, true) => {
-                        return Err(format!("{who}: a wire that reaches devices has a source"));
-                    }
-                    (None, false) => {}
-                }
+                crate::low_voltage::carrier::check_run(self, &who, category, r, t)?;
             }
             Element::Stair(st) => {
                 level_ok(st.level)?;
@@ -9048,7 +8377,7 @@ struct Tally<'a> {
     shapes: HashMap<(&'a str, &'a str, String), Result<(), String>>,
 }
 
-fn coord(what: &str, v: f64) -> Result<(), String> {
+pub(crate) fn coord(what: &str, v: f64) -> Result<(), String> {
     if v.is_finite() && v.abs() <= MAX_COORD { Ok(()) } else { Err(format!("{what}: {v} is not a usable number")) }
 }
 
@@ -9099,7 +8428,7 @@ pub(crate) fn range_ok(who: &str, r: &ViewRange) -> Result<(), String> {
     Ok(())
 }
 
-fn size(what: &str, v: f64) -> Result<(), String> {
+pub(crate) fn size(what: &str, v: f64) -> Result<(), String> {
     coord(what, v)?;
     if v > 0.0 { Ok(()) } else { Err(format!("{what} must be above zero, got {v}")) }
 }
@@ -9294,7 +8623,7 @@ fn kept(who: &str, r: &Room) -> Result<(), String> {
     Ok(())
 }
 
-fn boundary(who: &str, ring: &[P2]) -> Result<(), String> {
+pub(crate) fn boundary(who: &str, ring: &[P2]) -> Result<(), String> {
     if ring.len() < 3 || ring.len() > MAX_POINTS {
         return Err(format!("{who}: a boundary needs 3 to {MAX_POINTS} points"));
     }
@@ -9347,7 +8676,7 @@ fn line(who: &str, a: P2, b: P2) -> Result<(), String> {
     if a.dist(b) > TOL { Ok(()) } else { Err(format!("{who}: too short ({} mm)", a.dist(b))) }
 }
 
-fn text(who: &str, what: &str, s: &str) -> Result<(), String> {
+pub(crate) fn text(who: &str, what: &str, s: &str) -> Result<(), String> {
     if s.chars().count() <= MAX_TEXT { Ok(()) } else { Err(format!("{who}: {what} is longer than {MAX_TEXT} characters")) }
 }
 

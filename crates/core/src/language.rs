@@ -138,6 +138,10 @@ mod tests {
         assert_eq!(es.find("TABLA DE PUERTAS", &["Room Schedule", "Door Schedule"]), Some("Door Schedule"));
         let ru = Language::Russian;
         assert_eq!([ru.word("Level"), ru.word("UP"), ru.word("Room Schedule")], ["Уровень", "ВВЕРХ", "Экспликация помещений"]);
+        assert_eq!(
+            [ru.word("Electrical Equipment and Material Specification"), ru.word("Position"), ru.word("Mass kg")],
+            ["Спецификация оборудования, изделий и материалов", "Поз.", "Масса, кг"]
+        );
         assert_eq!(ru.find("ведомость дверей", &["Room Schedule", "Door Schedule"]), Some("Door Schedule"));
         // Codes as commands write them, and locales as systems give them.
         assert_eq!(

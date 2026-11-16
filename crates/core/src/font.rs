@@ -227,6 +227,13 @@ pub fn has(c: char) -> bool {
     }
 }
 
+pub(crate) fn supports(text: &str) -> bool {
+    match face() {
+        Some(face) => text.chars().all(|c| face.glyph_index(c).is_some()),
+        None => text.chars().all(has),
+    }
+}
+
 /// Grid units from one character to the next.
 const ADVANCE: f32 = 11.0;
 
@@ -235,7 +242,7 @@ pub fn width(text: &str, height: f32) -> f32 {
     if let Some(face) = face() {
         return face_width(face, text, height);
     }
-    let n = text.chars().count() as f32;
+    let n = text.chars().flat_map(char::to_uppercase).count() as f32;
     if n == 0.0 { 0.0 } else { (n * ADVANCE - 3.0) * height / 12.0 }
 }
 
@@ -492,6 +499,7 @@ mod tests {
         for c in "aÁőŰčŘåŁøßé€!?Жй".chars() {
             assert!(has(c), "{c}");
         }
+        assert_eq!(width("ß", 12.0), width("SS", 12.0));
         for c in "ωΣ漢".chars() {
             assert!(!has(c), "{c}");
         }

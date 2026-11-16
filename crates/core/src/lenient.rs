@@ -34,13 +34,16 @@ pub fn element(category: &str, v: &Value) -> Vec<String> {
             }
         };
     }
+    if let Some(fields) = crate::low_voltage::unknown_fields(category, v) {
+        return fields;
+    }
     kinds! {
         "level" => Level, "grid" => Grid, "wall" => Wall, "floor" => Floor, "ceiling" => Ceiling, "shaft" => Shaft,
         "mass" => Mass, "door" => Opening, "window" => Opening, "room" => Room, "roomseparator" => RoomSeparator, "dimension" => Dimension, "dimension3d" => Dimension3D, "tag" => Tag,
         "section" => Section, "elevation" => Section, "sheet" => Sheet, "viewport" => Viewport, "column" => Column,
         "structuralcolumn" => Column, "footing" => Column, "beam" => Run, "stripfooting" => Run, "pipe" => Run, "duct" => Run, "cablecarrier" => Run,
-        "conduit" => Run, "cabletray" => Run, "electricalline" => ElectricalLine, "electricalterminal" => ElectricalTerminal, "wire" => Run, "downconductor" => Run, "groundconductor" => Run,
-        "cable" => Run, "rebar" => Rebar, "component" => Component, "stair" => Stair, "ramp" => Ramp, "railing" => Railing, "roof" => Roof, "fire_zone" => FireZone,
+        "conduit" => Run, "cabletray" => Run, "wire" => Run, "downconductor" => Run, "groundconductor" => Run,
+        "cable" => Run, "rebar" => Rebar, "component" => Component, "stair" => Stair, "ramp" => Ramp, "railing" => Railing, "roof" => Roof,
         "text" => Note, "line" => DetailLine, "region" => FilledRegion, "detailgroup" => DetailGroup, "repeatingdetail" => RepeatingDetail, "spot" => Spot, "schedule" => Schedule, "view3d" => View3D,
         "planview" => PlanView, "link" => Link, "pointcloud" => PointCloud, "cadimport" => CadImport,
     }

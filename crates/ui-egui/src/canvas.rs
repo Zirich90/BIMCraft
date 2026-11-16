@@ -1538,9 +1538,11 @@ impl BimApp {
         let under_at = |q: (f32, f32)| match &tool {
             Tool::Modify if sketching => None,
             Tool::Modify => d.pick(q, PICK),
-            Tool::Run("wire", None) => {
-                d.pick_all(q, PICK).into_iter().find(|id| matches!(model.elements.get(*id), Some(Element::Component(_))))
-            }
+            Tool::Run("wire", None) => d.pick_all(q, PICK).into_iter().find(|id| match model.elements.get(*id) {
+                Some(Element::Component(_)) => true,
+                Some(Element::Wire(w)) => w.feeder.is_none(),
+                _ => false,
+            }),
             Tool::SketchPick => d.pick(q, PICK).filter(|id| model.wall(*id).is_some()),
             // A line to draw along, or to round.
             Tool::DetailLine(_) | Tool::Wall(_) | Tool::SketchLine(_) if shape == draw::Shape::PickLines => {
@@ -2025,8 +2027,26 @@ impl BimApp {
         shapes
     }
 
+    /// A route's segment stands for its whole cable: picking one takes them all.
+    fn with_route_members(&self, found: Vec<Id>) -> Vec<Id> {
+        let m = &self.session.model;
+        let mut out = found.clone();
+        for id in found {
+            let Some(Element::Wire(w)) = m.elements.get(id) else { continue };
+            for guid in bimcraft_core::low_voltage::route_members(m, w.route.unwrap_or(m.guid(id))) {
+                if let Some(member) = m.elements.id(guid)
+                    && !out.contains(&member)
+                {
+                    out.push(member);
+                }
+            }
+        }
+        out
+    }
+
     /// Add `found` to the selection with Ctrl, take it away with Shift, else select just it.
     pub(crate) fn pick_up(&mut self, found: Vec<Id>, mods: Modifiers) {
+        let found = self.with_route_members(found);
         if mods.shift {
             self.selection.retain(|id| !found.contains(id));
         } else if mods.command {
@@ -2134,6 +2154,12 @@ impl BimApp {
             | Tool::Camera(_)
             | Tool::Run(..) => {
                 if self.start_wire_at_device(level, hovered) {
+                    return;
+                }
+                if self.start_wire_at_wire(level, hovered, v.mm(at), None) {
+                    return;
+                }
+                if self.end_wire_at_device(level, hovered) {
                     return;
                 }
                 let chain: Vec<P2> = match &self.tool {
@@ -2391,7 +2417,7 @@ impl BimApp {
             }
             Tool::Component | Tool::Fixture(_) => {
                 let at = self.snap_point(m, level, v, at, &[], false);
-                self.place_component(level, at);
+                self.place_component(level, at, mods.shift);
             }
             &Tool::Stand(category) => {
                 let at = self.snap_point(m, level, v, at, &[], false);
@@ -3004,9 +3030,17 @@ impl BimApp {
         }
     }
 
-    pub(crate) fn place_component(&mut self, level: Id, at: P2) {
+    pub(crate) fn place_component(&mut self, level: Id, at: P2, shift: bool) {
         if let Some((family, ty)) = self.placing() {
-            if let Some(offset) = self.session.model.units.parse(&self.component_offset) {
+            if let Some(mut offset) = self.session.model.units.parse(&self.component_offset) {
+                let m = &self.session.model;
+                if shift {
+                    if let Some(normative) = self.normative_placement_offset(m, m.guid(level)) {
+                        offset = normative;
+                    }
+                } else if self.height_by_bottom {
+                    offset -= self.placing_bottom(m, m.guid(level));
+                }
                 self.run(
                     "component",
                     json!({"family":family,"type":ty,"at":point(at),"level":level,

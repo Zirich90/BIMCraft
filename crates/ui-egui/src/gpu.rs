@@ -2290,7 +2290,8 @@ mod tests {
             let (wrong, ink) = wire_differences(gpu, s, tints, cam);
             eprintln!("{what}: {wrong} pixels differ, of {ink} inked");
             assert!(ink > 500, "{what}: a picture with lines in it, {ink}");
-            assert!(wrong * 500 < ink, "{what}: {wrong} of the {ink} pixels inked differ");
+            // 0.4%, not 0.2%: RADV rounds near-plane clips its own way (91 of 31382 pixels on RX 9060 XT, identically on HEAD).
+            assert!(wrong * 250 < ink, "{what}: {wrong} of the {ink} pixels inked differ");
         };
         // DUMP=<folder> keeps a tinted picture to look at.
         draws_through(&mut gpu, &s, &[(wall, Rgb(255, 160, 0))], flat);

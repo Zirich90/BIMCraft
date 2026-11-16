@@ -1,4 +1,8 @@
-use super::{MAX_POINTS, MAX_TEXT, R, Session, Value, bad, flag, json, num, only};
+use crate::engine::{Command, Session};
+use crate::model::{MAX_POINTS, MAX_TEXT};
+use serde_json::{Value, json};
+
+use crate::commands::*;
 
 fn rows<'a>(c: &str, p: &'a Value, key: &str) -> Result<&'a [Value], String> {
     p[key]
@@ -12,7 +16,7 @@ fn positive(c: &str, p: &Value, key: &str) -> Result<f64, String> {
     num(c, p, key)?.filter(|value| *value > 0.0).ok_or_else(|| bad(c, format!("{key} must be positive")))
 }
 
-pub(super) fn amplifier(_: &mut Session, p: &Value) -> R {
+pub(crate) fn amplifier(_: &mut Session, p: &Value) -> R {
     const C: &str = "soue_amplifier_load";
     only(C, p, &["rated_w", "reserve_percent", "taps_w"])?;
     const MAX_WATTS: f64 = 1_000_000.0;
@@ -47,7 +51,7 @@ pub(super) fn amplifier(_: &mut Session, p: &Value) -> R {
     Ok(json!({"known_w":known,"total_w":missing.is_empty().then_some(known),"allowed_w":allowed,"missing_taps":missing,"status":status}))
 }
 
-pub(super) fn sound(_: &mut Session, p: &Value) -> R {
+pub(crate) fn sound(_: &mut Session, p: &Value) -> R {
     const C: &str = "soue_sound_check";
     only(C, p, &["room", "class_f11", "design_max_dba", "points"])?;
     let (base, margin, maximum, sleeping): (f64, f64, f64, bool) = match p["room"].as_str() {
@@ -111,7 +115,7 @@ pub(super) fn sound(_: &mut Session, p: &Value) -> R {
     Ok(json!({"standard":"SP 3.13130.2026","points":report}))
 }
 
-pub(super) fn parts(_: &mut Session, p: &Value) -> R {
+pub(crate) fn parts(_: &mut Session, p: &Value) -> R {
     const C: &str = "fire_carrier_parts";
     only(C, p, &["runs", "bends", "tees", "unlicensed_workstations"])?;
     let mut supports = 0;
@@ -143,10 +147,14 @@ pub(super) fn parts(_: &mut Session, p: &Value) -> R {
         "software_licenses":count("unlicensed_workstations")?}))
 }
 
-pub(super) fn okl(_: &mut Session, p: &Value) -> R {
+pub(crate) fn okl(_: &mut Session, p: &Value) -> R {
     const C: &str = "fire_okl_check";
     const PARTS: [&str; 4] = ["cable", "carrier", "fastener", "mounting"];
-    only(C, p, &["required_min", "installed", "tested"])?;
+    only(C, p, &["required_min", "installed", "tested", "profile"])?;
+    let profile = super::systems::param(&p["profile"]).map_err(|e| bad(C, e))?;
+    if profile.is_some_and(|profile| !profile.requires_okl()) && p.get("required_min").is_none() {
+        return Ok(json!({"status":"optional","profile":profile}));
+    }
     let required = positive(C, p, "required_min")?;
     let mut missing = Vec::new();
     let mut mismatches = Vec::new();
@@ -224,3 +232,27 @@ pub(super) fn okl(_: &mut Session, p: &Value) -> R {
     Ok(json!({"required_min":required,"tested_min":duration,"document":document,"missing":missing,
         "mismatches":mismatches,"insufficient_duration":insufficient,"status":status}))
 }
+pub(crate) const SOUE_AMPLIFIER_LOAD: Command = other(
+    "soue_amplifier_load",
+    "Voice Alarm Amplifier Load",
+    "{rated_w:number, reserve_percent?:number, taps_w:[number|null,:]} check one constant-voltage output. Use tap ratings at its output voltage and include all simultaneous loads; null identifies a missing rating",
+    amplifier,
+);
+pub(crate) const SOUE_SOUND_CHECK: Command = other(
+    "soue_sound_check",
+    "Voice Alarm Sound Check",
+    "{room:apartment|other|sleeping, class_f11?:bool, design_max_dba?:number, points:[{noise_dba?:number, signal_dba?:number, supplementary_alarm?:bool},:]} check supplied A-weighted levels with doors closed at 1.5 m above the floor, or at each sleeper's head. Supply effective noise during alarm",
+    sound,
+);
+pub(crate) const FIRE_CARRIER_PARTS: Command = other(
+    "fire_carrier_parts",
+    "Carrier Parts Estimate",
+    "{runs:[{length_m:number, support_pitch_m:number, section_m?:number},:], bends?:integer, tees?:integer, unlicensed_workstations?:integer} estimate supports including both ends, section connectors, bends, tees and software licences",
+    parts,
+);
+pub(crate) const FIRE_OKL_CHECK: Command = other(
+    "fire_okl_check",
+    "Fire-Resistant Wiring Evidence",
+    "{profile?:sps|soue_light|soue_sound|soue_voice|sot|skud|ots|mgn, required_min?:number, installed?:{cable:string, carrier:string, fastener:string, mounting:string, pitch_mm:number}, tested?:{cable:string, carrier:string, fastener:string, mounting:string, pitch_mm:number, duration_min:number, document:string}} compare one installed assembly with the declared documented test configuration. Use the design-required duration and report missing evidence",
+    okl,
+);

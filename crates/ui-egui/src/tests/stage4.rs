@@ -805,6 +805,60 @@ fn stage41_split_places_a_route_bend_and_undoes_in_one_step() {
 }
 
 #[test]
+fn wire_tool_taps_a_cable_and_branches_from_the_cut_vertex() {
+    let mut h = app(r#"wire {"points":[[1000,1000],[5000,1000]],"offset":2500}"#);
+    let cable = ids(&h, "wire")[0];
+    let guid = h.state().session.model.guid(cable);
+    let before = h.state().session.model.to_json().unwrap();
+    shortcut(&mut h, "EW");
+    click(&mut h, P2(3000.0, 1000.0));
+    assert_eq!(ids(&h, "wire").len(), 2, "{}", h.state().status.text);
+    assert!(matches!(h.state().tool, Tool::Run("wire", Some(at)) if (at - P2(3000.0, 1000.0)).length() < 1.0));
+    click(&mut h, P2(3000.0, 3000.0));
+    let wires = ids(&h, "wire");
+    assert_eq!(wires.len(), 3, "{}", h.state().status.text);
+    let m = &h.state().session.model;
+    assert_eq!(m.guid(cable), guid);
+    let branch = m.elements.get(*wires.last().unwrap()).unwrap().run().unwrap();
+    assert!((branch.start - P2(3000.0, 1000.0)).length() < 1.0);
+    assert!((branch.offset - 2500.0).abs() < 1e-6);
+    // The branch shares the cut vertex with both halves of the tapped cable.
+    let halves: Vec<_> = wires[..2].iter().map(|id| m.elements.get(*id).unwrap().run().unwrap()).collect();
+    assert!(halves.iter().any(|r| (r.end - branch.start).length() < 1.0));
+    assert!(halves.iter().any(|r| (r.start - branch.start).length() < 1.0));
+    h.state_mut().run("undo", json!({})).unwrap();
+    h.state_mut().run("undo", json!({})).unwrap();
+    assert_eq!(h.state().session.model.to_json().unwrap(), before);
+}
+
+#[test]
+fn wire_chain_clicks_make_one_route_selected_and_deleted_as_a_whole() {
+    let mut h = app("");
+    shortcut(&mut h, "EW");
+    click(&mut h, P2(1000.0, 1000.0));
+    click(&mut h, P2(3000.0, 1000.0));
+    click(&mut h, P2(3000.0, 3000.0));
+    click(&mut h, P2(5000.0, 3000.0));
+    let wires = ids(&h, "wire");
+    assert_eq!(wires.len(), 3, "{}", h.state().status.text);
+    let m = &h.state().session.model;
+    let head = m.guid(wires[0]);
+    let runs: Vec<_> = wires.iter().map(|id| m.elements.get(*id).unwrap().run().unwrap()).collect();
+    for run in &runs {
+        assert_eq!(run.route, Some(head));
+    }
+    // The chain shares exact vertices: no gaps between the segments of the cable.
+    assert!((runs[0].end - runs[1].start).length() < 1e-6);
+    assert!((runs[1].end - runs[2].start).length() < 1e-6);
+    // Picking one segment selects the whole cable.
+    h.state_mut().pick_up(vec![wires[1]], Modifiers::NONE);
+    assert_eq!(h.state().selection.len(), 3);
+    let selection = h.state().selection.clone();
+    h.state_mut().run("delete", json!({"ids":selection})).unwrap();
+    assert!(ids(&h, "wire").is_empty());
+}
+
+#[test]
 fn mounted_route_can_bend_and_move_on_its_wall_in_3d() {
     let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}"#);
     press(&mut h, "Default 3D View");
@@ -1102,6 +1156,78 @@ fn free_3d_routes_snap_to_surfaces_and_share_the_ortho_preview() {
 }
 
 #[test]
+fn free_3d_route_turns_the_corner_between_ceiling_and_wall_mounted() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}
+ceiling {"boundary":[[0,-200],[8000,-200],[8000,6000],[0,6000]],"offset":2600}"#);
+    press(&mut h, "Default 3D View");
+    let state = h.state_mut();
+    let camera = state.orbit.camera.unwrap();
+    let scene = bimcraft_core::view3d::Scene::new(&state.session.model);
+    state.orbit.camera = Some(scene.fit(camera.azimuth, -35.0, camera.width, camera.height));
+    h.run();
+    shortcut(&mut h, "EW");
+    press(&mut h, "Free 3D");
+    // The start sits over the ceiling strip in front of the wall, so the camera ray reaches it without crossing the wall.
+    stage4_click_world(&mut h, [2000.0, -150.0, 2600.0], true);
+    stage4_click_world(&mut h, [5000.0, -100.0, 1500.0], true);
+    let wires = ids(&h, "wire");
+    assert_eq!(wires.len(), 2, "{}", h.state().status.text);
+    let m = &h.state().session.model;
+    let ceiling = m.guid(ids(&h, "ceiling")[0]);
+    let wall = m.guid(ids(&h, "wall")[0]);
+    let first = m.elements.get(wires[0]).unwrap().run().unwrap();
+    let second = m.elements.get(wires[1]).unwrap().run().unwrap();
+    let mount = first.mount.as_ref().unwrap();
+    assert_eq!((mount.host, mount.face.as_str()), (ceiling, "bottom"));
+    let mount = second.mount.as_ref().unwrap();
+    assert_eq!((mount.host, mount.face.as_str()), (wall, "interior"));
+    // The legs share the corner on the planes' intersection: over the wall point at the ceiling's height.
+    assert!((first.end.0 - 5000.0).abs() < 1.0 && (first.end.1 + 100.0).abs() < 1.0);
+    assert!((first.end - second.start).length() < 1e-6);
+    // Clicks land within a pixel's rounding of the aimed point.
+    assert!((first.offset - 2600.0).abs() < 1.0);
+    assert!((second.offset - 2600.0).abs() < 1.0);
+    assert!((second.end_offset.unwrap() - 1500.0).abs() < 1.0);
+}
+
+#[test]
+fn free_3d_wire_drops_from_its_routing_height_to_a_clicked_device() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]]}"#);
+    let wall = h.state().session.model.guid(ids(&h, "wall")[0]);
+    assert!(
+        h.state_mut()
+            .run(
+                "component",
+                json!({"family":"Outlet","type":"Low 300","at":[4000,-100],"offset":0,"mount":{"host":wall,"face":"interior"}})
+            )
+            .is_some(),
+        "{}",
+        h.state().status.text
+    );
+    let device = ids(&h, "component")[0];
+    press(&mut h, "Default 3D View");
+    shortcut(&mut h, "EW");
+    press(&mut h, "Free 3D");
+    stage4_click_world(&mut h, [1500.0, -100.0, 2500.0], true);
+    stage4_click_world(&mut h, [4000.0, -100.0, 300.0], true);
+    let m = &h.state().session.model;
+    let main: Vec<_> = ids(&h, "wire").into_iter().filter(|id| m.elements.get(*id).unwrap().run().unwrap().feeder.is_none()).collect();
+    assert_eq!(main.len(), 1, "{}", h.state().status.text);
+    let run = m.elements.get(main[0]).unwrap().run().unwrap();
+    assert!((run.start.0 - 1500.0).abs() < 1.0);
+    assert!((run.end.0 - 4000.0).abs() < 1.0 && (run.end.1 + 100.0).abs() < 1.0);
+    assert!((run.offset - 2500.0).abs() < 1.0);
+    assert_eq!(run.connections.len(), 1);
+    assert_eq!(run.connections[0].device, m.guid(device));
+    assert_eq!(run.connections[0].end, 1);
+    // The owned feeder drops from the routing height to the device's terminal.
+    let feeder = ids(&h, "wire").into_iter().find(|id| m.elements.get(*id).unwrap().run().unwrap().feeder.is_some()).unwrap();
+    let g = m.run_geom(m.elements.get(feeder).unwrap()).unwrap();
+    let low = g.a[2].min(g.b[2]);
+    assert!((low - 300.0).abs() < 20.0, "feeder reaches {low}, not the terminal");
+}
+
+#[test]
 fn stage41_3d_draws_a_wire_in_each_work_plane() {
     for (axis, ortho) in [(0, false), (1, false), (0, true), (1, true), (2, true)] {
         let mut h = app(r#"floor {"boundary":[[0,0],[8000,0],[8000,6000],[0,6000]]}"#);
@@ -1148,4 +1274,76 @@ fn stage41_3d_draws_a_wire_in_each_work_plane() {
             assert!((actual - expected).abs() < 20.0, "axis {axis}: {actual} != {expected}");
         }
     }
+}
+
+#[test]
+fn equipment_height_by_bottom_edge_stands_the_typed_height_on_the_bottom() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]],"height":3000}"#);
+    h.state_mut().set_tool(Tool::Component);
+    // An outlet's plate stands 250..350 at offset 0: its mounting reference (300) is its centre, not its bottom.
+    h.state_mut().component = Some(("Outlet".into(), "Low 300".into()));
+    h.state_mut().height_by_bottom = true;
+    h.state_mut().component_offset = "1000".into();
+    h.run();
+    click(&mut h, P2(2000.0, -100.0));
+    let device = ids(&h, "component")[0];
+    let Some(Element::Component(c)) = h.state().session.model.elements.get(device) else { panic!("expected equipment") };
+    assert!((c.offset - 750.0).abs() < 1e-6, "1000 over the level minus the 250 bottom: {}", c.offset);
+}
+
+#[test]
+fn shift_places_equipment_at_its_normative_height() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]],"height":3000}"#);
+    h.state_mut().set_tool(Tool::Component);
+    h.state_mut().component = Some(("Outlet".into(), "Low 300".into()));
+    h.state_mut().component_offset = "5000".into();
+    h.run();
+    click_with(&mut h, P2(2000.0, -100.0), Modifiers::SHIFT);
+    let device = ids(&h, "component")[0];
+    let Some(Element::Component(c)) = h.state().session.model.elements.get(device) else { panic!("expected equipment") };
+    assert!(c.offset.abs() < 1e-6, "the family's Mounting Height is its normative position: {}", c.offset);
+}
+
+#[test]
+fn shift_places_equipment_without_a_normative_height_with_its_bottom_at_1500() {
+    let mut h = app("");
+    h.state_mut().set_tool(Tool::Component);
+    h.state_mut().component = Some(("Kitchen Sink".into(), "1200 x 550".into()));
+    h.state_mut().component_offset = "0".into();
+    h.run();
+    click_with(&mut h, P2(2000.0, 2000.0), Modifiers::SHIFT);
+    let device = ids(&h, "component")[0];
+    let m = &h.state().session.model;
+    let Some(Element::Component(c)) = m.elements.get(device) else { panic!("expected equipment") };
+    let bottom = m.component_local_pieces(c).iter().map(|piece| piece.bottom).min_by(f64::total_cmp).unwrap();
+    assert!((m.elevation(c.level) + c.offset + bottom - 1500.0).abs() < 1e-6, "bottom at 1500: {}", c.offset + bottom);
+}
+
+#[test]
+fn bottom_edge_mode_places_wall_equipment_by_its_bottom_in_3d() {
+    let mut h = app(r#"wall {"points":[[0,0],[8000,0]],"height":3000}"#);
+    press(&mut h, "Default 3D View");
+    h.state_mut().set_tool(Tool::Component);
+    h.state_mut().component = Some(("Outlet".into(), "Low 300".into()));
+    h.state_mut().height_by_bottom = true;
+    h.run();
+    press(&mut h, "Place on Face");
+    stage4_click_world(&mut h, [4000.0, -100.0, 1000.0], true);
+    let device = ids(&h, "component")[0];
+    let Some(Element::Component(c)) = h.state().session.model.elements.get(device) else { panic!("expected wall equipment") };
+    assert!((c.offset - 750.0).abs() < 15.0, "clicked 1000 minus the 250 bottom: {}", c.offset);
+}
+
+#[test]
+fn equipment_height_by_bottom_survives_the_settings_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("settings.json");
+    let mut h = app("");
+    h.state_mut().use_settings(path.clone());
+    h.state_mut().height_by_bottom = true;
+    h.state_mut().reopened();
+    h.run();
+    let mut restored = BimApp::new(Session::new());
+    restored.use_settings(path);
+    assert!(restored.height_by_bottom);
 }

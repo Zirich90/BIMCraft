@@ -120,7 +120,8 @@ fn one_dwelling_zone_keeps_its_members_on_each_level() {
     assert_eq!(report["devices"], json!([lower_detector, upper_detector]));
     assert_eq!(report["assessment"]["room_group"]["status"], "unit_exception");
     let memberships =
-        crate::fire_zones::detection_memberships(&s.model, &[s.model.guid(upper)].into_iter().collect(), &[upper_detector]).unwrap();
+        crate::low_voltage::zone_geometry::detection_memberships(&s.model, &[s.model.guid(upper)].into_iter().collect(), &[upper_detector])
+            .unwrap();
     assert_eq!(memberships.get(&upper_detector), Some(&vec![id]));
     run(&mut s, "modify", json!({"id":upper,"graphics":{"engineering":true}}));
     let drawing = crate::render::plan(&s.model, upper, 800, 600);

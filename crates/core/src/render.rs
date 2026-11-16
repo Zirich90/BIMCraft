@@ -726,7 +726,7 @@ fn plan_candidates<'a>(
 
 fn additional_fire_zones(m: &Model, level: Guid) -> impl Iterator<Item = Id> + '_ {
     m.rare("fire_zone").into_iter().filter(
-        move |&id| matches!(m.elements.get(id), Some(Element::FireZone(zone)) if crate::fire_zones::on_additional_level(m, zone, level)),
+        move |&id| matches!(m.elements.get(id), Some(Element::FireZone(zone)) if crate::low_voltage::zone_geometry::on_additional_level(m, zone, level)),
     )
 }
 
@@ -770,7 +770,7 @@ fn plan_filter<'a>(
                 bottom < r.cut && top > r.depth || c.level == level && m.families.get(&c.family).is_some_and(|f| !f.symbols.is_empty())
             }
             Element::Room(x) => x.level == level,
-            Element::FireZone(zone) => zone.level == level || crate::fire_zones::on_additional_level(m, zone, level),
+            Element::FireZone(zone) => zone.level == level || crate::low_voltage::zone_geometry::on_additional_level(m, zone, level),
             Element::RoomSeparator(x) => x.level == level,
             Element::Rebar(_) => m.level_of(e) == Some(level),
             Element::Ceiling(_) => false,
@@ -1143,10 +1143,12 @@ fn plan_shows_among(m: &Model, key: Guid, among: bool) -> Vec<P2> {
             }
             Element::Room(r) if r.level == level => extent.push(r.point),
             Element::FireZone(zone) if engineering && zone.level == level => extent.extend(&zone.boundary),
-            Element::FireZone(zone) if crate::fire_zones::on_additional_level(m, zone, level) => {
+            Element::FireZone(zone) if crate::low_voltage::zone_geometry::on_additional_level(m, zone, level) => {
                 if let Some(rooms) = &rooms {
                     extent.extend(
-                        crate::fire_zones::additional_plan_regions(m, rooms, zone, level).into_iter().flat_map(|region| region.outer),
+                        crate::low_voltage::zone_geometry::additional_plan_regions(m, rooms, zone, level)
+                            .into_iter()
+                            .flat_map(|region| region.outer),
                     );
                 }
             }
@@ -2906,13 +2908,18 @@ fn draw_plan_among(m: &Model, key: Guid, view: View, up: bool, k: f32, n: f64, t
                     grid(&mut d, a, b, &g.name);
                 }
             }
-            Element::FireZone(zone) if eng_mode && (zone.level == level || crate::fire_zones::on_additional_level(m, zone, level)) => {
+            Element::FireZone(zone)
+                if eng_mode && (zone.level == level || crate::low_voltage::zone_geometry::on_additional_level(m, zone, level)) =>
+            {
                 let color = match zone.kind {
                     crate::model::FireZoneKind::Detection => Rgb(180, 65, 50),
                     crate::model::FireZoneKind::Notification => Rgb(75, 112, 175),
                 };
-                let extra =
-                    if zone.level == level { Vec::new() } else { crate::fire_zones::additional_plan_regions(m, &rooms, zone, level) };
+                let extra = if zone.level == level {
+                    Vec::new()
+                } else {
+                    crate::low_voltage::zone_geometry::additional_plan_regions(m, &rooms, zone, level)
+                };
                 let mut rings = (zone.level == level).then_some(zone.boundary.as_slice()).into_iter().chain(
                     extra.iter().flat_map(|region| std::iter::once(region.outer.as_slice()).chain(region.holes.iter().map(Vec::as_slice))),
                 );

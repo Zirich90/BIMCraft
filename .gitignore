@@ -11,3 +11,6 @@ target/
 /COMPILADO/
 /COMPILADO_COMPLETO/
 .vscode/
+
+# Local agent config (Windows paths, per-machine)
+.codex/

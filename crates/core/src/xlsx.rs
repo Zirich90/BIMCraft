@@ -96,7 +96,8 @@ fn escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            '\t' | '\n' | '\r' => out.push(c),
+            '\r' => out.push_str("&#13;"),
+            '\t' | '\n' => out.push(c),
             c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {}
             c => out.push(c),
         }
@@ -246,5 +247,6 @@ mod tests {
         assert_eq!(sheet_name(&"x".repeat(40)).len(), MAX_NAME);
         assert_eq!(sheet_name("[]"), "Sheet1");
         assert_eq!(escape("a\u{1}b\tc"), "ab\tc");
+        assert_eq!(escape("A\r\nB"), "A&#13;\nB");
     }
 }

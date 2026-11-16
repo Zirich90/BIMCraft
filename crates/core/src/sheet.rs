@@ -29,7 +29,7 @@ const TITLE_ROW: f32 = 45.0;
 const PAD: f32 = 10.0;
 
 /// Paper mm (from the bottom left corner, y up) to the sheet drawing's pixels.
-fn page(paper: P2) -> View {
+pub(crate) fn page(paper: P2) -> View {
     View {
         scale: DENSITY,
         cx: paper.0 / 2.0,
@@ -443,6 +443,18 @@ mod tests {
         let pm = tiny_skia::Pixmap::decode_png(png).unwrap();
         let c = pm.pixel(x as u32, y as u32).unwrap();
         (c.red(), c.green(), c.blue())
+    }
+
+    #[test]
+    fn specification_keeps_nonzero_small_numbers_visible() {
+        assert_eq!(
+            crate::low_voltage::ods::specification_cell(
+                crate::units::Units::Millimetres,
+                schedule::Kind::Number,
+                &serde_json::json!(0.001)
+            ),
+            "0.001"
+        );
     }
 
     #[test]

@@ -107,22 +107,22 @@ const AMBIENT_REACH: f64 = 4.0;
 /// How dark the deepest ambient shadow is: the share of the light it takes.
 const AMBIENT_DARK: f64 = 0.6;
 
-pub(crate) fn add(a: P3, b: P3) -> P3 {
+pub fn add(a: P3, b: P3) -> P3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
-pub(crate) fn sub(a: P3, b: P3) -> P3 {
+pub fn sub(a: P3, b: P3) -> P3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-pub(crate) fn mul(a: P3, k: f64) -> P3 {
+pub fn mul(a: P3, k: f64) -> P3 {
     [a[0] * k, a[1] * k, a[2] * k]
 }
-pub(crate) fn dot(a: P3, b: P3) -> f64 {
+pub fn dot(a: P3, b: P3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
-pub(crate) fn cross(a: P3, b: P3) -> P3 {
+pub fn cross(a: P3, b: P3) -> P3 {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
-pub(crate) fn unit(a: P3) -> P3 {
+pub fn unit(a: P3) -> P3 {
     let l = dot(a, a).sqrt();
     if l > 0.0 { mul(a, 1.0 / l) } else { [0.0; 3] }
 }
@@ -1523,7 +1523,7 @@ fn triangle_in_run(points: [P3; 3], run: crate::runs::Geom, axes: [P3; 3], lengt
 
 impl Scene {
     /// Continuous support of a contact line, including openings between its endpoints.
-    pub(crate) fn supports_segment(&self, host: Id, face: &str, a: P3, b: P3, normal: P3) -> Result<bool, String> {
+    pub fn supports_segment(&self, host: Id, face: &str, a: P3, b: P3, normal: P3) -> Result<bool, String> {
         let delta = sub(b, a);
         let length = dot(delta, delta).sqrt();
         if !a.iter().chain(b.iter()).chain(normal.iter()).all(|v| v.is_finite() && v.abs() <= crate::model::MAX_COORD)

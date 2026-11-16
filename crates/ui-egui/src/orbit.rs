@@ -26,8 +26,8 @@ use bimcraft_core::render::{self, Rgb};
 use bimcraft_core::snap::{self, Found, Kind, Reach, Snaps};
 use bimcraft_core::view3d::gpu::{Hit, Mesh};
 use bimcraft_core::view3d::{
-    AZIMUTH, Camera, ELEVATION, Image, MAX_SIDE, P3, Scene, Surface, SurfaceHit, box_grips, move_box_face, on_floor_top, shape_handles,
-    shape_pick_3d, shape_snap_3d,
+    AZIMUTH, Camera, ELEVATION, Image, MAX_SIDE, P3, Scene, Surface, SurfaceHit, add, box_grips, cross, dot, move_box_face, mul,
+    on_floor_top, shape_handles, shape_pick_3d, shape_snap_3d, sub, unit,
 };
 use bimcraft_core::workplane::{CursorPlane, Frame, cursor_plane};
 use egui::{
@@ -340,6 +340,40 @@ fn snap3d(m: &Model, cam: &Camera, at: (f64, f64), ppp: f32, q: P3, plane: Curso
     snap::snap(m, plane.level, P2(q[0], q[1]), reach, from, square, o)
 }
 
+/// The corner where two different mounting planes meet within reach: a slab and a wall meet over the wall point at the
+/// slab's height, two walls on their vertical intersection at the start's height. None when the planes do not meet on
+/// their faces, so the segment stays as drawn.
+fn corner_point(model: &Model, scene: &Scene, a: P3, hit_a: &SurfaceHit, b: P3, hit_b: &SurfaceHit) -> Option<P3> {
+    if hit_a.host == hit_b.host && hit_a.face == hit_b.face {
+        return None;
+    }
+    let slab = |hit: &SurfaceHit| matches!(model.elements.get(hit.host), Some(Element::Floor(_) | Element::Ceiling(_)));
+    let wall = |hit: &SurfaceHit| matches!(model.elements.get(hit.host), Some(Element::Wall(w)) if w.arc.abs() <= 1e-9);
+    let corner = match (slab(hit_a), slab(hit_b)) {
+        (true, false) if wall(hit_b) => [b[0], b[1], a[2]],
+        (false, true) if wall(hit_a) => [a[0], a[1], b[2]],
+        (false, false) if wall(hit_a) && wall(hit_b) => {
+            let (na, nb) = (hit_a.normal, hit_b.normal);
+            let det = na[0] * nb[1] - na[1] * nb[0];
+            if det.abs() < 1e-9 {
+                return None;
+            }
+            let (ca, cb) = (dot(na, hit_a.point), dot(nb, hit_b.point));
+            [(ca * nb[1] - cb * na[1]) / det, (na[0] * cb - nb[0] * ca) / det, a[2]]
+        }
+        _ => return None,
+    };
+    for hit in [hit_a, hit_b] {
+        let tangent = cross(hit.normal, [0.0, 0.0, 1.0]);
+        let tangent = if dot(tangent, tangent) < 1e-12 { [1.0, 0.0, 0.0] } else { unit(tangent) };
+        let probe = mul(tangent, 0.001);
+        if !scene.supports_segment(hit.host, hit.face, sub(corner, probe), add(corner, probe), hit.normal).ok()? {
+            return None;
+        }
+    }
+    Some(corner)
+}
+
 /// What the Aligned Dimension tool picks at pixel `at` of the 3D view through `cam` (`ppp` pixels a point): a corner seen within
 /// the snap's reach, else an edge within a pick's (the point of it nearest), else the point of `under`, the face there.
 fn dim_ref(scene: &Scene, cam: &Camera, at: (f64, f64), under: Option<Surface>, ppp: f32, look: &Look) -> Option<Ref3> {
@@ -422,13 +456,18 @@ fn micron(mm: f64) -> f64 {
     (mm * 1000.0).round() / 1000.0
 }
 
-fn equipment_pose(model: &Model, mut component: Component, hit: &SurfaceHit) -> Component {
+fn equipment_pose(model: &Model, mut component: Component, hit: &SurfaceHit, by_bottom: bool) -> Component {
     component.at = P2(micron(hit.point[0]), micron(hit.point[1]));
     let [nx, ny, _] = hit.normal;
     if matches!(hit.face, "interior" | "exterior") {
         component.angle = nx.atan2(-ny).to_degrees();
     }
-    let local_z = model.component_contact_height(&component, hit.face);
+    // A wall face in bottom-edge mode stands the equipment's bottom at the clicked height; floors and ceilings keep their contact.
+    let local_z = if by_bottom && matches!(hit.face, "interior" | "exterior") {
+        model.component_local_pieces(&component).iter().map(|piece| piece.bottom).min_by(f64::total_cmp).unwrap_or_default()
+    } else {
+        model.component_contact_height(&component, hit.face)
+    };
     component.offset = micron(hit.point[2] - model.elevation(component.level) - local_z);
     component
 }
@@ -650,6 +689,7 @@ impl BimApp {
                         if ui.selectable_value(&mut self.work_axis, axis, plane).changed() {
                             self.free_run_start = None;
                             self.wire_start_connection = None;
+                            self.wire_end_connection = None;
                             self.tool = match self.tool {
                                 Tool::Run(category, _) => Tool::Run(category, None),
                                 Tool::Move(_) => Tool::Move(None),
@@ -1451,7 +1491,7 @@ impl BimApp {
             };
             Some((point, surface))
         };
-        let free_params = |level, a: P3, b: P3, surface: Option<&SurfaceHit>| {
+        let free_params = |level, a: P3, b: P3, from_hit: Option<&SurfaceHit>, surface: Option<&SurfaceHit>| {
             let base = model.elevation(level);
             let mut params = json!({
                 "points":[[a[0],a[1]],[b[0],b[1]]],
@@ -1461,10 +1501,7 @@ impl BimApp {
                 params["type"] = json!(type_name);
             }
             if let Some(surface) = surface
-                && free_start
-                    .as_ref()
-                    .and_then(|(_, hit)| hit.as_ref())
-                    .is_some_and(|hit| hit.host == surface.host && hit.face == surface.face)
+                && from_hit.is_some_and(|hit| hit.host == surface.host && hit.face == surface.face)
                 && match (model.elements.get(surface.host), surface.face) {
                     (Some(Element::Wall(w)), "interior" | "exterior") => w.arc.abs() <= f64::EPSILON,
                     (Some(Element::Floor(_) | Element::Ceiling(_)), "top" | "bottom") => true,
@@ -1477,14 +1514,25 @@ impl BimApp {
             params
         };
         if free_run
-            && let (Tool::Run(category, _), Some(level), Some((a, _)), Some((b, hit))) =
+            && let (Tool::Run(category, _), Some(level), Some((a, start_hit)), Some((b, hit))) =
                 (&self.tool, placement_level, &free_start, hover.and_then(free_point))
         {
-            let params = free_params(level, *a, b, hit.as_ref());
-            let geometry =
-                bimcraft_core::runs_of(&model, &params, category).ok().and_then(|runs| runs.first().and_then(|run| model.run_geom(run)));
-            let (a, b) = geometry.map_or((*a, b), |g| (g.a, g.b));
-            p.line_segment([screen(a), screen(b)], Stroke::new(1.5, canvas_pal().accent));
+            let corner = match (start_hit.as_ref(), hit.as_ref()) {
+                (Some(ha), Some(hb)) => corner_point(&model, scene, *a, ha, b, hb),
+                _ => None,
+            };
+            let legs: Vec<(P3, P3, Option<&SurfaceHit>, Option<&SurfaceHit>)> = match corner {
+                Some(c) => vec![(*a, c, start_hit.as_ref(), start_hit.as_ref()), (c, b, hit.as_ref(), hit.as_ref())],
+                None => vec![(*a, b, start_hit.as_ref(), hit.as_ref())],
+            };
+            for (a, b, from_hit, surface) in legs {
+                let params = free_params(level, a, b, from_hit, surface);
+                let geometry = bimcraft_core::runs_of(&model, &params, category)
+                    .ok()
+                    .and_then(|runs| runs.first().and_then(|run| model.run_geom(run)));
+                let (a, b) = geometry.map_or((a, b), |g| (g.a, g.b));
+                p.line_segment([screen(a), screen(b)], Stroke::new(1.5, canvas_pal().accent));
+            }
         }
         let vertical_run = !free_run && matches!(self.tool, Tool::Run("wire" | "cablecarrier", _)) && work_axis != 2;
         let run_plane = vertical_run.then(|| model.units.parse(&self.work_coordinate)).flatten();
@@ -1802,7 +1850,7 @@ impl BimApp {
             }
             let surface = scene.surface_at(hit.id, &cam, px(at))?;
             (surface.face == hit.face).then(|| {
-                let mut component = equipment_pose(&model, component, &surface);
+                let mut component = equipment_pose(&model, component, &surface, self.height_by_bottom);
                 component.mount = Some(bimcraft_core::model::RunMount { host: model.guid(surface.host), face: surface.face.into() });
                 (component, surface)
             })
@@ -1844,21 +1892,108 @@ impl BimApp {
                     (self.tool.clone(), placement_level, click.and_then(free_point))
                 {
                     let base = model.elevation(level);
-                    if let Some((a, _)) = &free_start {
-                        let mut params = free_params(level, *a, b, hit.as_ref());
-                        if let Some((device, height)) = self.wire_start_connection {
-                            params["start_connection"] = json!({"device":device,"point":[0.0,0.0,height]});
-                        }
-                        if *a != b
-                            && let Some(result) = self.run(crate::structure::command(category), params)
+                    if let Some((a, start_hit)) = &free_start {
+                        // A chain click continues the cable that ends at the start: one route, no gap.
+                        let route = (category == "wire")
+                            .then(|| bimcraft_core::low_voltage::route_ending_at(&model, model.guid(level), P2(a[0], a[1]), a[2]))
+                            .flatten();
+                        if category == "wire"
+                            && let Some(found_id) = found
+                            && let Some(Element::Component(device)) = model.elements.get(found_id)
+                            && device.is_placed()
+                            && *a != [device.at.0, device.at.1, a[2]]
                         {
-                            self.wire_start_connection = None;
-                            self.free_run_start = self.chain.then_some((b, hit));
-                            self.tool = Tool::Run(category, self.chain.then_some(P2(b[0], b[1])));
-                            if category == "cablecarrier"
-                                && let Some(id) = result["ids"][0].as_u64()
-                            {
-                                self.offer_carrier_attachment(id);
+                            // Height mode: the segment ends over the device at the routing height; the connection drops to its terminal.
+                            let b = [device.at.0, device.at.1, a[2]];
+                            let mut params = free_params(level, *a, b, start_hit.as_ref(), None);
+                            if let Some(route) = route {
+                                params["route"] = json!(route);
+                            }
+                            if let Some((device_guid, height)) = self.wire_start_connection {
+                                params["start_connection"] = json!({"device":device_guid,"point":[0.0,0.0,height]});
+                            }
+                            let mounting = crate::structure::mounting_height(&model, device).unwrap_or_default();
+                            params["end_connection"] = json!({"device":model.guid(found_id),"point":[0.0,0.0,mounting]});
+                            if self.run(crate::structure::command(category), params).is_some() {
+                                self.wire_start_connection = None;
+                                self.free_run_start = None;
+                                self.tool = Tool::Run(category, None);
+                            }
+                        } else {
+                            let corner = match (start_hit.as_ref(), hit.as_ref()) {
+                                (Some(ha), Some(hb)) => corner_point(&model, scene, *a, ha, b, hb),
+                                _ => None,
+                            };
+                            let mut made = false;
+                            if let Some(corner) = corner {
+                                // Two mounted legs meet on the planes' intersection: a proper elbow instead of one unmounted diagonal.
+                                let mut first = free_params(level, *a, corner, start_hit.as_ref(), start_hit.as_ref());
+                                if let Some(route) = route {
+                                    first["route"] = json!(route);
+                                }
+                                if let Some((device, height)) = self.wire_start_connection {
+                                    first["start_connection"] = json!({"device":device,"point":[0.0,0.0,height]});
+                                }
+                                let second = free_params(level, corner, b, hit.as_ref(), hit.as_ref());
+                                if *a != corner
+                                    && corner != b
+                                    && bimcraft_core::runs_of(&model, &first, category).is_ok()
+                                    && bimcraft_core::runs_of(&model, &second, category).is_ok()
+                                    && self.run(crate::structure::command(category), first).is_some()
+                                {
+                                    made = true;
+                                    self.wire_start_connection = None;
+                                    // The second leg joins the first at the corner, on the same route.
+                                    let mut second = second;
+                                    if category == "wire"
+                                        && let Some(head) = bimcraft_core::low_voltage::route_ending_at(
+                                            &self.session.model,
+                                            model.guid(level),
+                                            P2(corner[0], corner[1]),
+                                            corner[2],
+                                        )
+                                    {
+                                        second["route"] = json!(head);
+                                    }
+                                    if let Some(result) = self.run(crate::structure::command(category), second) {
+                                        self.free_run_start = self.chain.then_some((b, hit.clone()));
+                                        self.tool = Tool::Run(category, self.chain.then_some(P2(b[0], b[1])));
+                                        if category == "cablecarrier"
+                                            && let Some(id) = result["ids"][0].as_u64()
+                                        {
+                                            self.offer_carrier_attachment(id);
+                                        }
+                                    }
+                                }
+                            }
+                            if !made {
+                                let unreachable = corner.is_none() && start_hit.is_some() && hit.is_some();
+                                let mut params = free_params(level, *a, b, start_hit.as_ref(), hit.as_ref());
+                                if let Some(route) = route {
+                                    params["route"] = json!(route);
+                                }
+                                if let Some((device, height)) = self.wire_start_connection {
+                                    params["start_connection"] = json!({"device":device,"point":[0.0,0.0,height]});
+                                }
+                                if *a != b
+                                    && let Some(result) = self.run(crate::structure::command(category), params)
+                                {
+                                    self.wire_start_connection = None;
+                                    self.free_run_start = self.chain.then_some((b, hit));
+                                    self.tool = Tool::Run(category, self.chain.then_some(P2(b[0], b[1])));
+                                    if category == "cablecarrier"
+                                        && let Some(id) = result["ids"][0].as_u64()
+                                    {
+                                        self.offer_carrier_attachment(id);
+                                    }
+                                    if unreachable {
+                                        self.status = Status {
+                                            text: t(msg!("The mounting surfaces do not meet within reach; the segment stays unmounted"))
+                                                .into(),
+                                            error: false,
+                                        };
+                                    }
+                                }
                             }
                         }
                     } else if self.start_wire_at_device(level, found) {
@@ -1867,6 +2002,8 @@ impl BimApp {
                         {
                             self.free_run_start = Some(([at.0, at.1, base + offset], None));
                         }
+                    } else if self.start_wire_at_wire(level, found, P2(b[0], b[1]), Some(b)) {
+                        // The chain starts at the cut's vertex, set inside.
                     } else {
                         self.free_run_start = Some((b, hit));
                         self.tool = Tool::Run(category, Some(P2(b[0], b[1])));
@@ -1882,11 +2019,17 @@ impl BimApp {
                         let a = world(from, coordinate);
                         let b = world(to, coordinate);
                         let base = model.elevation(level);
-                        let params = self.typed(
+                        let mut params = self.typed(
                             category,
                             json!({"points":[[a[0],a[1]],[b[0],b[1]]],
                             "level":level,"offset":a[2]-base,"end_offset":b[2]-base,"justify":self.run_justify}),
                         );
+                        if category == "wire"
+                            && let Some(route) =
+                                bimcraft_core::low_voltage::route_ending_at(&model, model.guid(level), P2(a[0], a[1]), a[2])
+                        {
+                            params["route"] = json!(route);
+                        }
                         if let Some(result) = self.run(crate::structure::command(category), params) {
                             self.tool = Tool::Run(category, self.chain.then_some(to));
                             if category == "cablecarrier"
@@ -1931,7 +2074,12 @@ impl BimApp {
             // Nothing under the cursor: nothing to take down, or to paint.
             Some(None) if demolish || paint || unpaint => {}
             Some(_) if equipment.is_some() => {
-                if let Some(c) = equipment_on_face {
+                if let Some(mut c) = equipment_on_face {
+                    if click_modifiers(ui).shift
+                        && let Some(normative) = self.normative_placement_offset(&model, c.level)
+                    {
+                        c.offset = normative;
+                    }
                     self.run(
                         "component",
                         json!({"family":c.family,"type":c.type_name,"level":c.level,
@@ -1993,9 +2141,11 @@ impl BimApp {
                         };
                         if let Some(point) = point {
                             if matches!(self.tool, Tool::Run(..)) {
-                                self.place_run(level, point);
+                                if !self.end_wire_at_device(level, found) && !self.start_wire_at_wire(level, found, point, None) {
+                                    self.place_run(level, point);
+                                }
                             } else {
-                                self.place_component(level, point);
+                                self.place_component(level, point, click_modifiers(ui).shift);
                             }
                         }
                     } else {

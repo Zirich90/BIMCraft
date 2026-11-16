@@ -88,8 +88,7 @@ The core caches what it works out from the model and keeps the whole computation
 - `derived.rs`: what elements point at, both ways, the walls by plan tile and height, components and runs by height band, and the
   kinds a project has few of, kept with each model and brought up to date by what changed (`Model::lookup`).
 - `rooms.rs`: rooms' boundaries, each level's found once. `shared.rs`: copy-on-write geometry definitions and allocation identities.
-- `fire_zones.rs`: spatial membership of detection and notification zones ([MEP](../../docs/areas/structure-and-mep.md)).
-- `fire_line.rs`: single-fault simulation on wired fire alarm lines ([low-voltage standards](../../docs/areas/low-voltage-standards.md)).
+- `low_voltage/`: system profiles, line and terminal connectivity, fire zones and fault simulation, carrier geometry and checks, ODS/ODT, floor diagrams and design PDF ([documents](../../docs/areas/low-voltage-documents.md), [standards](../../docs/areas/low-voltage-standards.md)).
 - `detector_beams.rs`: ceiling beam bays, clearances and transverse detector spacing ([low-voltage standards](../../docs/areas/low-voltage-standards.md)).
 - `ids/revisions.rs`: runtime revision columns. `bounds.rs`: byte-budgeted conservative primitive bounds. `family/bounds.rs`:
   conservative form envelopes without triangulation.

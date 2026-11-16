@@ -233,7 +233,7 @@ pub(crate) fn report(
         .collect();
     let levels = detectors.iter().filter_map(|(_, _, automatic, level)| automatic.then_some(*level)).collect();
     let automatic_ids: Vec<_> = detectors.iter().filter_map(|(_, id, automatic, _)| automatic.then_some(*id)).collect();
-    let memberships = crate::fire_zones::detection_memberships(model, &levels, &automatic_ids);
+    let memberships = crate::low_voltage::zone_geometry::detection_memberships(model, &levels, &automatic_ids);
     let audit = |net: &Network, isolators: &BTreeSet<Guid>, details| {
         assess(net, isolators, &detectors, memberships.as_ref(), details, |blocked, contaminated, short| {
             let mut live = net.energized(blocked, contaminated, |_| true);

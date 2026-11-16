@@ -1,3 +1,7 @@
+# Указания BIMCraft
+
+Перед работой прочитай [AGENT.MD](AGENT.MD). В нём собраны правила нашего проекта, включая запуск навыков и хуков и режим финальной проверки Cargo. Для правил отдельных крейтов смотри их локальные инструкции.
+
 # BIMCraft: instructions for agents
 
 BIMCraft is a clean-room, pure-Rust BIM application following the Revit workflow, modeled on

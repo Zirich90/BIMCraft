@@ -20,6 +20,10 @@ msgstr "Площадь"
 msgid "Arm Width"
 msgstr "Ширина подлокотника"
 
+#: crates/core/src/low_voltage/ods.rs:340
+msgid "Article"
+msgstr "Артикул"
+
 #: crates/core/src/family.rs:2152
 msgid "Base Cabinet"
 msgstr "Нижний шкаф"
@@ -32,7 +36,11 @@ msgstr "Ванна"
 msgid "Bed"
 msgstr "Кровать"
 
-#: crates/core/src/model.rs:3493
+#: crates/core/src/low_voltage/ods.rs:339
+msgid "Brand"
+msgstr "Марка"
+
+#: crates/core/src/model.rs:3353
 msgid "Brick"
 msgstr "Кирпич"
 
@@ -44,7 +52,7 @@ msgstr "Кирпич 225 x 75"
 msgid "Cable"
 msgstr "Кабель"
 
-#: crates/core/src/commands.rs:5205
+#: crates/core/src/commands.rs:4718
 #: crates/core/src/fixtures.rs:573
 msgid "Camera"
 msgstr "Видеокамера"
@@ -61,7 +69,7 @@ msgstr ""
 msgid "Ceiling Luminaire"
 msgstr "Светильник потолочный"
 
-#: crates/core/src/render.rs:3101
+#: crates/core/src/render.rs:3137
 msgid "Ceiling Plan"
 msgstr "План потолка"
 
@@ -77,7 +85,7 @@ msgstr "Ось"
 msgid "Centre Lines"
 msgstr "Осевые линии"
 
-#: crates/core/src/model.rs:3501
+#: crates/core/src/model.rs:3361
 msgid "Ceramic tile"
 msgstr "Керамическая плитка"
 
@@ -89,15 +97,19 @@ msgstr "Стул"
 msgid "Concrete"
 msgstr "Бетон"
 
-#: crates/core/src/model.rs:3495
+#: crates/core/src/model.rs:3355
 msgid "Concrete block"
 msgstr "Бетонный блок"
 
-#: crates/core/src/model.rs:3509
+#: crates/core/src/low_voltage/documents.rs:176
+msgid "Contents"
+msgstr "Содержание"
+
+#: crates/core/src/model.rs:3369
 msgid "Copper"
 msgstr "Медь"
 
-#: crates/core/src/commands.rs:1525
+#: crates/core/src/commands.rs:1379
 msgid "Copy"
 msgstr "Копия"
 
@@ -109,7 +121,7 @@ msgstr "Количество"
 msgid "Crosshatch"
 msgstr "Сетка"
 
-#: crates/core/src/render.rs:3752
+#: crates/core/src/render.rs:3788
 msgid "DN"
 msgstr "ВНИЗ"
 
@@ -125,13 +137,17 @@ msgstr "Штрихпунктирная"
 msgid "Data Outlet"
 msgstr "Розетка информационная"
 
-#: crates/core/src/commands.rs:12300
+#: crates/core/src/commands.rs:10475
 msgid "Dependent"
 msgstr "Зависимый"
 
 #: crates/core/src/family.rs:2015
 msgid "Depth"
 msgstr "Глубина"
+
+#: crates/core/src/low_voltage/ods.rs:338
+msgid "Description"
+msgstr "Наименование и техническая характеристика"
 
 #: crates/core/src/family.rs:2124
 msgid "Desk"
@@ -174,11 +190,11 @@ msgstr "Пунктирная"
 msgid "Double Door"
 msgstr "Дверь двупольная"
 
-#: crates/core/src/model.rs:2985
+#: crates/core/src/model.rs:2842
 msgid "Double Sliding"
 msgstr ""
 
-#: crates/core/src/model.rs:2983
+#: crates/core/src/model.rs:2840
 msgid "Double Swing"
 msgstr ""
 
@@ -186,7 +202,7 @@ msgstr ""
 msgid "Earthing Electrode"
 msgstr "Заземлитель вертикальный"
 
-#: crates/core/src/model.rs:2277
+#: crates/core/src/model.rs:2149
 msgid "East"
 msgstr "Восток"
 
@@ -198,16 +214,25 @@ msgstr "Отвод 90"
 msgid "Electrical Ceiling"
 msgstr ""
 
+#: crates/core/src/low_voltage/documents.rs:163
+#: crates/core/src/low_voltage/ods.rs:648
+msgid "Electrical Equipment and Material Specification"
+msgstr "Спецификация оборудования, изделий и материалов"
+
 #: crates/core/src/graphics.rs:967
 msgid "Electrical Lighting"
 msgstr ""
+
+#: crates/core/src/low_voltage/documents.rs:152
+msgid "Electrical Line Diagram"
+msgstr "Схема электрическая принципиальная"
 
 #: crates/core/src/graphics.rs:966
 msgid "Electrical Power"
 msgstr ""
 
-#: crates/core/src/commands.rs:12084
-#: crates/core/src/commands.rs:14843
+#: crates/core/src/commands.rs:10259
+#: crates/core/src/commands.rs:13018
 msgid "Elevation"
 msgstr "Фасад"
 
@@ -231,7 +256,7 @@ msgstr "Семейство"
 msgid "Fire Alarm Panel"
 msgstr "Прибор приёмно-контрольный"
 
-#: crates/core/src/model.rs:2987
+#: crates/core/src/model.rs:2844
 msgid "Fixed"
 msgstr ""
 
@@ -247,7 +272,7 @@ msgstr "Трап"
 msgid "Floor Schedule"
 msgstr "Ведомость полов"
 
-#: crates/core/src/model.rs:2986
+#: crates/core/src/model.rs:2843
 msgid "Folding"
 msgstr ""
 
@@ -276,7 +301,7 @@ msgstr "Стекло"
 msgid "Gross Floor Area"
 msgstr "Общая площадь"
 
-#: crates/core/src/model.rs:3500
+#: crates/core/src/model.rs:3360
 msgid "Gypsum board"
 msgstr "Гипсокартон"
 
@@ -336,8 +361,8 @@ msgstr "Ширина ножки"
 msgid "Length"
 msgstr "Длина"
 
-#: crates/core/src/commands.rs:7416
-#: crates/core/src/model.rs:3631
+#: crates/core/src/commands.rs:6929
+#: crates/core/src/model.rs:3491
 msgid "Level"
 msgstr "Уровень"
 
@@ -357,7 +382,11 @@ msgstr "Длинный штрих"
 msgid "Manual Call Point"
 msgstr "Извещатель пожарный ручной"
 
-#: crates/core/src/model.rs:1563
+#: crates/core/src/low_voltage/ods.rs:341
+msgid "Manufacturer"
+msgstr "Изготовитель"
+
+#: crates/core/src/model.rs:1566
 msgid "Mark"
 msgstr "Марка"
 
@@ -365,9 +394,13 @@ msgstr "Марка"
 msgid "Masking"
 msgstr "Маскировка"
 
-#: crates/core/src/commands.rs:8675
+#: crates/core/src/commands.rs:8188
 msgid "Mass"
 msgstr "Масса"
+
+#: crates/core/src/low_voltage/ods.rs:344
+msgid "Mass kg"
+msgstr "Масса, кг"
 
 #: crates/core/src/schedule.rs:236
 msgid "Material"
@@ -390,15 +423,15 @@ msgid "Motion Detector"
 msgstr "Извещатель охранный объёмный"
 
 #: crates/core/src/fixtures.rs:279
-#: crates/core/src/runs.rs:30
+#: crates/core/src/runs.rs:21
 msgid "Mounting Height"
 msgstr "Высота установки"
 
-#: crates/core/src/render.rs:2925
+#: crates/core/src/render.rs:2961
 msgid "NOT ENCLOSED"
 msgstr "НЕ ЗАМКНУТО"
 
-#: crates/core/src/model.rs:1564
+#: crates/core/src/model.rs:1567
 #: crates/core/src/schedule.rs:458
 msgid "Name"
 msgstr "Наименование"
@@ -411,9 +444,13 @@ msgstr "Новое строительство"
 msgid "No"
 msgstr "Нет"
 
-#: crates/core/src/model.rs:2275
+#: crates/core/src/model.rs:2147
 msgid "North"
 msgstr "Север"
+
+#: crates/core/src/low_voltage/ods.rs:345
+msgid "Note"
+msgstr "Примечание"
 
 #: crates/core/src/schedule.rs:253
 msgid "Number"
@@ -475,11 +512,19 @@ msgstr "Штукатурка"
 msgid "Porcelain"
 msgstr "Фаянс"
 
-#: crates/core/src/commands.rs:3588
+#: crates/core/src/low_voltage/ods.rs:337
+msgid "Position"
+msgstr "Поз."
+
+#: crates/core/src/commands.rs:3100
 msgid "Project"
 msgstr "Проект"
 
-#: crates/core/src/render.rs:2925
+#: crates/core/src/low_voltage/ods.rs:343
+msgid "Quantity"
+msgstr "Кол."
+
+#: crates/core/src/render.rs:2961
 msgid "REDUNDANT"
 msgstr ""
 
@@ -499,11 +544,11 @@ msgstr "Высота подступенка"
 msgid "Risers"
 msgstr "Подступенки"
 
-#: crates/core/src/model.rs:3502
+#: crates/core/src/model.rs:3362
 msgid "Roof tiles"
 msgstr "Черепица"
 
-#: crates/core/src/commands.rs:8900
+#: crates/core/src/commands.rs:8413
 msgid "Room"
 msgstr "Помещение"
 
@@ -531,7 +576,7 @@ msgstr "МАСШТАБ УКАЗАН"
 msgid "Sand"
 msgstr "Песок"
 
-#: crates/core/src/model.rs:3498
+#: crates/core/src/model.rs:3358
 msgid "Screed"
 msgstr "Стяжка"
 
@@ -539,8 +584,8 @@ msgstr "Стяжка"
 msgid "Seat Height"
 msgstr "Высота сиденья"
 
-#: crates/core/src/commands.rs:12061
-#: crates/core/src/commands.rs:14842
+#: crates/core/src/commands.rs:10236
+#: crates/core/src/commands.rs:13017
 msgid "Section"
 msgstr "Разрез"
 
@@ -576,7 +621,7 @@ msgstr "Подоконник"
 msgid "Single Door"
 msgstr "Дверь однопольная"
 
-#: crates/core/src/model.rs:2984
+#: crates/core/src/model.rs:2841
 msgid "Sliding"
 msgstr ""
 
@@ -616,15 +661,15 @@ msgstr "Оповещатель звуковой"
 msgid "Source"
 msgstr "Источник"
 
-#: crates/core/src/model.rs:2276
+#: crates/core/src/model.rs:2148
 msgid "South"
 msgstr "Юг"
 
-#: crates/core/src/commands.rs:13451
+#: crates/core/src/commands.rs:11626
 msgid "Specification Items"
 msgstr "Позиции спецификации"
 
-#: crates/core/src/model.rs:2982
+#: crates/core/src/model.rs:2839
 msgid "Swing"
 msgstr ""
 
@@ -672,11 +717,11 @@ msgstr "Итого"
 msgid "Tread"
 msgstr "Проступь"
 
-#: crates/core/src/model.rs:1565
+#: crates/core/src/model.rs:1568
 msgid "Type"
 msgstr "Тип"
 
-#: crates/core/src/render.rs:3752
+#: crates/core/src/render.rs:3788
 msgid "UP"
 msgstr "ВВЕРХ"
 
@@ -684,7 +729,11 @@ msgstr "ВВЕРХ"
 msgid "Unbounded Height"
 msgstr ""
 
-#: crates/core/src/commands.rs:12441
+#: crates/core/src/low_voltage/ods.rs:342
+msgid "Unit"
+msgstr "Ед. изм."
+
+#: crates/core/src/commands.rs:10616
 msgid "Unnamed"
 msgstr "Без имени"
 
@@ -704,7 +753,7 @@ msgstr "Объём"
 msgid "WC"
 msgstr "Унитаз"
 
-#: crates/core/src/commands.rs:396
+#: crates/core/src/commands.rs:356
 msgid "Wall"
 msgstr "Стена"
 
@@ -724,7 +773,7 @@ msgstr "Умывальник"
 msgid "Weight"
 msgstr ""
 
-#: crates/core/src/model.rs:2278
+#: crates/core/src/model.rs:2150
 msgid "West"
 msgstr "Запад"
 
@@ -759,3 +808,4 @@ msgstr ""
 #: crates/core/src/loads.rs:79
 msgid "wc"
 msgstr ""
+
