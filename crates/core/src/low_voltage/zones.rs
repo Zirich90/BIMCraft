@@ -165,6 +165,7 @@ fn detectors(s: &mut Session, p: &Value) -> R {
     let space = hidden_detector_space(c, p, geometry)?;
     let points = detector_grid(c, p, geometry, r, &region, limits, space.as_ref())?;
     let device = Component {
+        adaptive: None,
         family,
         type_name,
         level: r.level,
@@ -177,6 +178,8 @@ fn detectors(s: &mut Session, p: &Value) -> R {
         mount: None,
         detector_space: space.as_ref().map(|space| space.kind),
         connection_sides: Vec::new(),
+        host: None,
+        panel: None,
     };
     let contact = m.component_contact_height(&device, "bottom");
     if let Some(space) = &space {

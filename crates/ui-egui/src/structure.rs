@@ -323,6 +323,9 @@ impl BimApp {
             mount: None,
             detector_space: None,
             connection_sides: Vec::new(),
+            adaptive: None,
+            host: None,
+            panel: None,
         };
         m.component_local_pieces(&component).iter().map(|piece| piece.bottom).min_by(f64::total_cmp).unwrap_or(0.0)
     }

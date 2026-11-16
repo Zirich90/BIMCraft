@@ -11,7 +11,7 @@ fn catalogue_import_conflicts_are_chosen_in_the_dialog_and_cancel_is_safe() {
     row[3] = "500".into();
     std::fs::write(&path, ods::write(&[rows[0].clone(), row]).unwrap()).unwrap();
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     let before = h.state().session.model.clone();
     press(&mut h, "Import Catalogue...");
     crate::dialog::BEGUN.with(|b| b.borrow_mut().pop()).unwrap().send(None).unwrap();
@@ -111,7 +111,7 @@ fn new_ods_types_open_the_catalogue_once_without_listing_unused_builtin_types() 
     press(&mut h, "Close");
     h.state_mut().session.execute("component", &json!({"family":"Fire Alarm Panel","type":"New project panel","at":[0,0]})).unwrap();
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     assert!(h.query_by_label("Unassigned catalogue products:").is_none());
 }
 
@@ -123,7 +123,7 @@ fn catalogue_adds_nonspatial_items_from_plan_and_3d() {
             press(&mut h, "Default 3D View");
         }
         press(&mut h, "Manage");
-        press_ribbon(&mut h, "Links", "Equipment Catalogue");
+        press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
         type_role(&mut h, Role::TextInput, "Product name", "ARM licence");
         type_role(&mut h, Role::TextInput, "System", "СОУЭ");
         type_role(&mut h, Role::SpinButton, "Quantity", "3");
@@ -171,7 +171,7 @@ fn removed_catalogue_types_warn_until_the_product_is_restored() {
     assert!(h.state().status.error);
     assert!(h.state().status.text.contains("Missing catalogue product types: 1"), "{}", h.state().status.text);
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     assert!(h.query_by_label("Removed cable").is_some());
     press(&mut h, "Unlink");
     press(&mut h, "Close");
@@ -226,7 +226,7 @@ fn catalogue_dialog_creates_unlinks_and_reconnects_an_existing_file() {
     let path = temp.path().join("catalogue.ods");
     let mut h = app(BOX);
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Create...");
     let tx = crate::dialog::BEGUN.with(|b| b.borrow_mut().pop()).unwrap();
     tx.send(Some(vec![path.clone()])).unwrap();
@@ -252,7 +252,7 @@ fn catalogue_dialog_creates_unlinks_and_reconnects_an_existing_file() {
     assert!(h.query_by_label("Link Existing...").is_none());
     press(&mut h, "Default 3D View");
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     assert!(h.query_by_label("Link Existing...").is_some(), "the same catalogue is accessible from 3D");
 }
 
@@ -303,7 +303,7 @@ fn changes_in_the_open_model_reach_the_bound_catalogue_on_explicit_sync() {
     let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
     assert!(rows.iter().all(|r| r[2] != "Model cable"));
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Synchronize");
     let rows = ods::read(&std::fs::read(&path).unwrap()).unwrap();
     assert!(!rows.iter().find(|r| r[2] == "Model cable").unwrap()[0].is_empty());
@@ -330,7 +330,7 @@ fn opening_with_a_broken_catalogue_shows_a_visible_warning() {
     }
     assert_eq!(*h.state().session.model, *model);
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Synchronize");
     assert!(h.state().status.error);
     press(&mut h, "Close");
@@ -354,7 +354,7 @@ fn carrier_dialog_checks_highlights_and_saves_project_policy() {
     let carrier = reply.get("id").or_else(|| reply["ids"].get(0)).unwrap().clone();
     h.state_mut().session.execute("wire", &json!({"type":"Large cable","points":[[0,0],[3000,0]],"carrier":carrier})).unwrap();
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Cable carriers");
     press(&mut h, "Check and highlight carriers");
     assert_eq!(h.state().selection.len(), 1);
@@ -373,7 +373,7 @@ fn selected_carrier_compartments_can_be_configured_without_editing_json() {
     let id = h.state().session.model.elements.id(guid).unwrap();
     h.state_mut().selection = vec![id];
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Cable carriers");
     press(&mut h, "Carrier compartments");
     type_into(&mut h, "Compartment name:", "Data");
@@ -389,7 +389,7 @@ fn project_carrier_type_can_be_selected_in_the_catalogue_dialog() {
         .execute("type", &json!({"category":"cablecarrier","name":"Project tray","width":150,"depth":75,"round":false}))
         .unwrap();
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Cable carriers");
     h.get_by_role_and_label(Role::ComboBox, "Project carrier type").click();
     h.run();
@@ -451,7 +451,7 @@ fn carrier_dialog_visual_acceptance() {
             .build_ui_state(|ui, state: &mut BimApp| state.show(ui), state);
         h.run();
         press(&mut h, "Manage");
-        press_ribbon(&mut h, "Links", "Equipment Catalogue");
+        press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
         press(&mut h, "Cable carriers");
         press(&mut h, "SP 76.13330.2016: maximum box fill only");
         press(&mut h, "Apply carrier settings");
@@ -472,7 +472,7 @@ fn carrier_dialog_can_select_the_explicit_box_maximum_profile() {
     use bimcraft_core::carrier_limits::Profile;
     let mut h = app("");
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Cable carriers");
     press(&mut h, "SP 76.13330.2016: maximum box fill only");
     press(&mut h, "Apply carrier settings");
@@ -487,7 +487,7 @@ fn carrier_dialog_edits_measured_type_section_through_command() {
     let id = *h.state().session.model.elements.iter().find(|(_, e)| e.category() == "cablecarrier").unwrap().0;
     h.state_mut().selection = vec![id];
     press(&mut h, "Manage");
-    press_ribbon(&mut h, "Links", "Equipment Catalogue");
+    press_ribbon(&mut h, "Project Location", "Equipment Catalogue");
     press(&mut h, "Cable carriers");
     press(&mut h, "Measured product section");
     h.get_by_role_and_label(Role::ComboBox, "Carrier enclosure").click();

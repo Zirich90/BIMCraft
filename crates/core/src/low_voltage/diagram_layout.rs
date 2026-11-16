@@ -763,7 +763,7 @@ pub(crate) fn draw_devices(
     let mut drawings = Vec::new();
     let mut original_heads = BTreeSet::new();
     for (index, page) in pages.iter().enumerate() {
-        let mut d = Drawing::new(View { scale: 5.0, cx: 210.0, cy: 148.5, width: 2100, height: 1485 });
+        let mut d = Drawing::new(View { scale: 5.0, cx: 210.0, cy: 148.5, width: 2100, height: 1485, angle: 0.0 });
         let mut routes = Vec::new();
         rectangle(&mut d, 10.0, 10.0, 400.0, 277.0);
         text(&mut d, "Структурная схема слаботочных систем", 14.0, 18.0, 3.5, INK);
@@ -915,7 +915,7 @@ pub(crate) fn draw(m: &Model, diagram: &Diagram) -> Result<Vec<Drawing>, String>
     let mut original_heads = BTreeSet::new();
     let (mut work, mut primitives, mut vertices) = (0, 0, 0);
     for (index, page) in pages.iter().enumerate() {
-        let mut d = Drawing::new(View { scale: 5.0, cx: 210.0, cy: 148.5, width: 2100, height: 1485 });
+        let mut d = Drawing::new(View { scale: 5.0, cx: 210.0, cy: 148.5, width: 2100, height: 1485, angle: 0.0 });
         d.notes.extend(diagram.diagnostics.iter().cloned());
         let mut routes = Vec::new();
         rectangle(&mut d, 10.0, 10.0, PAPER.0 as f32 - 20.0, PAPER.1 as f32 - 20.0);

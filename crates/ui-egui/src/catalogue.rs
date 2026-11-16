@@ -528,7 +528,7 @@ impl BimApp {
             self.catalogue.model = Arc::downgrade(&self.session.model);
             return;
         }
-        match self.session.execute("catalogue_sync", &json!({"read_only":!write})) {
+        match self.exec("catalogue_sync", &json!({"read_only":!write})) {
             Ok(reply) => {
                 if let Some(report) = reply.get("carrier_check") {
                     self.carrier_feedback(report);

@@ -526,7 +526,7 @@ pub fn apply_catalogue(model: &mut crate::model::Model, rows: &[Vec<String>]) ->
                 .runs
                 .entry(category.clone())
                 .or_default()
-                .insert(name.clone(), crate::model::RunType { width, depth, round, material: row[6].clone() });
+                .insert(name.clone(), crate::model::RunType { width, depth, round, material: row[6].clone(), profile: None });
         }
         if has_product_columns {
             let product = crate::library::Product {

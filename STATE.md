@@ -1,127 +1,138 @@
-# Состояние проекта (Auto-Managed)
+# Project state
 
-Обновлено 2026-11-16. Источник истины по этапам — «Текущий статус» в
-`docs/low-voltage-roadmap.md`. Прежний снимок WORK_DONE.md (29.10, эпоха
-`Circuit`) удалён как устаревший.
+Updated 2026-11-16. The current-status section of `docs/low-voltage-roadmap.md`
+is the authority for stage acceptance.
 
-## Активная цель
+## Current work
 
-Завершить приёмку этапа 8 по `docs/low-voltage-roadmap.md`: комплект ПД
-(структурная схема по этажам и системам, таблицы приборов линий,
-спецификация, текстовая часть, PDF). Остаток приёмки — сравнение
-оформления с ИОС5 и выпуск по реальному объекту. Затем этап 9: сквозная
-проверка на реальном проекте, производительность, восстановление после
-ошибок. Критерий закрытия — ревью изменений и успешные fmt, Clippy и
-полный прогон тестов через Stop-хук.
+Merge upstream BIMCraft v0.12.0 into `low-voltage-circuits`, validate the combined
+workspace, commit with the user's one-shot Git identity, then publish to
+`Zirich90/BIMCraft` and start the cross-platform release workflow with a new `v*` tag.
+The merged source passes the final Cargo package. Fork publication and the new release
+tag remain pending the committed-change handoff gate.
 
-## Стек и архитектура
+## Base and merge decisions
 
-- Rust workspace: `crates/core` — модель и команды, `crates/ui-egui` —
-  тонкий интерфейс egui/eframe/wgpu, `apps/bimcraft` — десктоп,
-  `apps/bimcraft-cli` — CLI/MCP.
-- Ядро слаботочки изолировано от апстрима в `crates/core/src/low_voltage/`
-  (calc, carrier, catalogue, diagrams, documents, faults, fire_design,
-  lines, ods, odt, systems, wire_geometry, zones и др.), UI —
-  `crates/ui-egui/src/low_voltage_ui.rs`. В файлах апстрима остаются
-  объявления, регистрация и тонкие вызовы.
-- Изменения модели идут через `Session::execute`; ссылки элементов — GUID,
-  пользовательские идентификаторы — ElementId.
-- Правила проекта: `AGENT.MD` (копия в `AGENTS.md`/`CLAUDE.md`), локальные
-  CLAUDE.md крейтов. Проверки — одним пакетом в конце через
-  `python scripts/cargo_stop_hook.py fmt clippy test`.
+- Pre-merge HEAD: `afeec3407d26b29940cf4920f56152ecf98ecb9b`. It contains the
+  low-voltage isolation refactor and six routing fixes, already published to the fork.
+- Upstream base: official `v0.12.0`, peeled commit
+  `355a90d8de43f2619a691ae8552d561e4b962b9d`. All 60 conflicts in 19 files are resolved.
+- The local upstream tag must not be pushed as the fork release: it identifies pure
+  upstream, not the merged project. The fork release tag must identify the merged HEAD.
+- Model `FORMAT` is **28**. Upstream v0.12.0 uses format 20; the fork already used
+  versions through 27. There are no upstream migrations numbered 20 through 27.
+  Fork fields/defaults and upstream migrations are retained. Project-information
+  migration is unconditional and idempotent so fork files of formats 20–27 receive it.
+  `low_voltage::migrate` is currently a no-op. Upstream cannot read format 28 files.
+- `Component` retains fork `provision`, `mount`, `detector_space`, `connection_sides`
+  and upstream `adaptive`, `host`, `panel` fields.
+- Fork placement delegates to upstream `place_component_params(params, z)`, retaining
+  bottom-height/Shift placement while adding rotation and work-plane placement.
+- UI commands, including catalogue synchronization and fallback carrier checking, use
+  `exec`/`exec_batch` for Co-Work dispatch. `run` retains carrier and reload feedback.
+- The ribbon contains 14 tabs, including Low Voltage and Collaborate; there are 13 UI
+  language choices. Equipment Catalogue is in Manage > Project Location.
+- CI retains fork timeouts and target-directory handling. Release jobs build the sample
+  WASM plugin; Windows creates `target/tmp` before the MSVC linker uses it.
 
-## База и ветка
+## Architecture and completed routing work
 
-- Ветка `low-voltage-circuits`, HEAD `c1e72347` (12.11, тег `v0.11.lv`):
-  этапы 6–7 завершены, поверх merge апстрима BIMCraft 0.11 (`28f09e18`).
-- Этапы 1–7 закрыты локально. Этап 6 принят 11.11 после полного прогона
-  и визуальной проверки. Расчёты СПС/СОУЭ, комплектующие и ОКЛ этапа 7
-  подтверждены контрольными примерами: 3216 тестов прошли, 17 пропущены.
-- Проверки этапа 8 прошли: `target/cargo-stop-manual-stage8.log`
-  (`STAGE8_EXIT=0`), визуальные образцы — `target/stage8-visual`.
+Rust workspace: `crates/core` owns the model/commands, `crates/ui-egui` is the
+egui/eframe/wgpu front end, and `apps/bimcraft` / `apps/bimcraft-cli` are desktop and CLI/MCP.
+Low-voltage logic lives in `crates/core/src/low_voltage/`; its tab is in
+`crates/ui-egui/src/low_voltage_ui.rs`. Model changes use `Session::execute`, atomic
+validation and GUID references. Follow `AGENT.MD` and each crate's local instructions.
 
-## В работе (незакоммиченный рефакторинг изоляции)
+The six fixes in `afeec340` are:
+1. Group parallel cables into a shared carrier when its capacity permits; otherwise
+   retain separate carriers.
+2. Join wall-to-ceiling and wall-to-wall mounted runs at their planes' intersection;
+   report unreachable transitions.
+3. Place devices by their bottom height, with Shift selecting the family's normative
+   height (1500 mm bottom height when none is defined).
+4. Keep a cable as one logical route using `Run.route`, a shared mark and aggregate
+   length, with route-wide selection/copy/delete and cascade deletion of its head.
+   Geometric segments remain separate for IFC and carrier calculations.
+5. Split an existing cable at a Wire-tool click to continue or branch without a gap,
+   in both plan and 3D.
+6. Support 3D run height, device-terminal drops/rises and constrained orthogonal
+   surface-snapped routing in both interface profiles.
 
-- Код слаботочки вынут из файлов апстрима (`commands.rs`, `model.rs`,
-  `ods.rs`, `runs.rs`) в новый модуль `crates/core/src/low_voltage/`;
-  удалены `commands/fire_design.rs`, `fire_line.rs`, `fire_zones.rs`,
-  `runs/connections.rs`, `runs/device_exit.rs` (перенесены в модуль).
-- Добавлены `crates/core/src/electrical_tests.rs`, обновлены документы
-  (`low-voltage-roadmap.md`, `areas/low-voltage-documents.md`) и каталоги
-  переводов.
-- Реальный diff: 47 файлов, +9580/−13936. CRLF-шум в остальных ~468
-  файлах откачен к HEAD 16.11; новые файлы модуля нормализованы в LF.
-- Рефакторинг staged (30 A, 43 M, 5 R); untracked остался только `.codex/`
-  (локальный конфиг с Windows-путями, в коммит не берём).
-- Правки по итогам финального прогона 16.11: `fire_standard` снова
-  всегда сериализуется (`#[serde(default)]`, предикат skip удалён);
-  корневой CLAUDE.md восстановлен из HEAD плюс указатель на AGENT.MD
-  (тест agent_docs, бюджет 3000 слов соблюдён); допуск GPU-теста
-  wireframe ослаблен 0,2% → 0,4% с комментарием (RADV, подтверждено
-  идентичным падением на чистом HEAD через worktree).
+## Merge regression corrections
 
-## Отработка замечаний по прокладке слаботочки (16.11)
+- Preserve formula warnings alongside carrier warnings; name steep slab top/bottom
+  faces by their normal's sign for hosting.
+- Update format, PDF-header, family-fingerprint and sketch-message expectations to
+  match the combined implementation. Gross-area fixtures explicitly use centerlines;
+  new fork projects still default to finish-face room areas.
+- The property-boundary sheet test checks invariant text geometry and alpha, allowing
+  only the measured four-level RGB antialiasing variation after viewport reframing.
+- UI test clicks scroll offscreen ribbon tabs into view. Family-category selection is
+  scoped to the dialog body, then scrolled and checked before confirming.
+  Catalogue/link tests use Project Location; sheet tests use the Sheet Composition menu.
+- Manual Call Point uses **MC**; **CP** remains Specify Coordinates.
+- Work-plane-based components show only one Place on Face control; fixture tools keep
+  their face-placement checkbox. A regression covers both tools and family modes.
+  Component face hosting bypasses equipment mounting and fixed-height placement, with
+  regression coverage for zero and nonzero values in the Offset field.
+- Restore Portuguese/Spanish Cable Carrier and low-voltage fixture labels, including
+  category labels. Translation catalogs were regenerated after the shortcut change.
 
-Шесть замечаний закрыты поверх рефакторинга (порядок 3→1→5→2→6→4):
+## Validation (Linux, Rust stable 1.100.0)
 
-1. Параллельные кабели собираются в один КНС в пакетной прокладке
-   (`from_wires`): группировка по огибающей, откат к раздельным лоткам
-   при переполнении сечения.
-2. Переход крепления стена→потолок (и стена→стена): два сегмента с общей
-   вершиной на линии пересечения плоскостей (`corner_point`), каждый на
-   своей поверхности; недосягаемые поверхности — подсказка в статусе.
-3. Высота приборов: настройка «по нижней грани» (`equipment_height_by_bottom`,
-   settings.json) и Shift при установке = нормативная высота семейства
-   (без норматива — низ 1500 мм).
-4. Кабель — единый маршрут: поле `Run.route` (GUID головы), цепочка делит
-   точные вершины, одна марка и суммарная длина в журнале/спецификации,
-   выделение/удаление/копирование маршрутом; удаление головы каскадно
-   убирает сегменты (оба пути delete идентичны). Сегменты остаются
-   элементами — IFC, КНС-вмещение и расчёты не затронуты.
-5. Точка присоединения к кабелю: инструмент Wire кликом по кабелю режет
-   его (`split`) и стартует цепочку от вершины разреза — продолжение и
-   ответвление без зазора (2D и 3D).
-6. Прокладка в 3D, оба режима: высота Options Bar + авто-спуск/подъём к
-   клемме кликнутого прибора (`end_connection`, зеркально старту от
-   прибора) и ортогональ 90° с прилипанием к поверхностям (Constrain).
+- Pre-merge package `tmpbu79n7u7`: fmt, Clippy and tests passed; 3318 passed, 17 ignored.
+- Initial merged package `tmp9uowgp_f`: fmt/Clippy passed; ten core unit failures
+  identified and corrected. Later packages exposed property raster and room-area
+  fixture differences; the complete core suite subsequently passed.
+- The first complete UI run had 1346 passed, 26 failed and 8 ignored. The corrections
+  above address the observed causes; that historical result is not final acceptance.
+- Package `target/cargo-stop/tmpsro653ee.log`: formatting and strict all-target Clippy
+  passed. Core unit tests: 2579 passed, 11 ignored; all core integration tests passed.
+  UI: 1366 passed, 7 failed, 8 ignored. Cargo test exited 101; later binaries/doc tests
+  were not reached. The seven failures cover sheet menus, missing shortcut translations,
+  family-category selection and 3D face hosting.
+- Final package `target/cargo-stop/tmp3g8yjbb6.log`, run through
+  `scripts/cargo_stop_hook.py` after the full correction batch: fmt, strict all-target
+  Clippy and `cargo test --workspace -j 1` passed (Cargo exit 0).
+  Core unit tests: 2579 passed, 11 ignored; UI: 1373 passed, 8 ignored. All remaining
+  workspace integration/unit tests and doc-test targets passed; two SDK doc tests remain
+  ignored. The hook's reporting exit 2 is not a test failure.
+- Cargo reports the pre-existing plugin SDK manifest warning about workspace lint
+  inheritance. This did not fail strict Clippy.
+- `cargo i18n update` and `cargo fmt` applied. No temporary debug tests remain.
+- Working-tree diff whitespace check passes. The full merge's whitespace report also
+  includes upstream TSV empty trailing fields and generated PO ending blank lines;
+  the map TSV's Git blob is identical to upstream and has not been reformatted.
 
-Новые UI-строки — через `msg!()`, `cargo i18n update`/`check` зелёные;
-русский интерфейс падает на английский (каталога ui/ru.po в проекте нет).
+## Release prerequisites and remaining limits
 
-## Проверки (16.11, Linux)
+- Commit only with the explicitly authorized one-shot Zirich90 identity; do not change
+  persistent Git configuration. Complete the current handoff gate before pushing.
+- Release jobs require the fork's `BIMCRAFT_KEY_SECRET` Actions secret. Its presence
+  has not yet been verified. Do not weaken the release test if it is missing.
+- The release workflow covers Windows x64, Linux x86_64/aarch64/riscv64, Flatpak and
+  Arch packages, and universal macOS. Artifact success requires workflow evidence.
+- A suffixed fork tag is ignored by the existing automatic updater. The updater still
+  targets upstream; changing the update channel is outside this merge/release task.
+- Native visual acceptance across all themes/profiles and Windows/macOS installation
+  checks have not been performed on this merged snapshot.
+- Russian UI currently falls back to English because `translations/ui/ru.po` is absent.
+  Other interface translations remain partial; project `ru.po` is 174/231 translated.
+- Stage 8 real-project output/IOS5 comparison and stage 9 end-to-end, performance and
+  recovery acceptance remain open; this merge does not complete those stages.
 
-- Тулчейн установлен: rustup stable 1.100.0 (на хосте не было).
-- Финальный пакет через Stop-хук (`fmt clippy test`, заявка
-  `tmpq8mrmxjb`): все шаги exited 0. Тесты: 3304 прошли, 17 пропущены,
-  отказов нет. Журнал: `target/cargo-stop/tmpq8mrmxjb.log`.
-- Пакет после отработки замечаний (`tmpbu79n7u7`): fmt/clippy/test exited 0,
-  3318 прошли (+14 новых), 17 пропущены, отказов нет.
-  Журнал: `target/cargo-stop/tmpbu79n7u7.log`.
-- Диск очищен: target 87 → 13 ГиБ (копия lv-012, Windows exe/pdb,
-  снимки этапов 6–7, временные каталоги); битые worktree-регистрации
-  от E:/BIMCraft удалены (`git worktree prune`).
+## Shared context
 
-## Окружение и инструменты
+The active workspace is `/mnt/nvme/BIMCraft` on Linux. Windows paths and the separate
+`target/low-voltage-upstream-012` worktree in shared notes describe other snapshots,
+not this format-28 merge. `.memory` points to the shared Obsidian store. Its state and
+blackboard need synchronization with this branch's final results. The graph cache is
+from 2026-11-11 and predates the merge; current source is authoritative. The new face-toggle
+regression and revised placement-mode/category-selection details are absent from the
+report. The validated source SHA-256 values are:
+- `crates/ui-egui/src/orbit.rs`: `a72064c5a34b9d1f76be66fe8b9cc419d0b1507c1c378a116d3016e8491c95b5`
+- `crates/ui-egui/src/tests.rs`: `656a72836292177829d5c4ce9f2d1f4ebb76e619de7bebf09e2b8435bd9709a6`
+- `crates/ui-egui/src/tests/work_plane_based.rs`: `9206a2ad3a936c5c5a5c9caebc9468bc2e41de2d8a25d727d2afe46fbe7590d3`
 
-- Linux, рабочая копия `/mnt/nvme/BIMCraft`. Прежние записи про Windows
-  (E:/BIMCraft, C:/Users/...) относятся к старым сеансам.
-- `.memory` — симлинк на Obsidian-хранилище «AI Memori/BIMCraft».
-  Его `00_STATE.md` и `01_BLACKBOARD.md` устарели (этап 6 «в работе»,
-  старые SHA и сеансы) — требуется синхронизация при ближайшей работе
-  с общей памятью.
-- Ponytail в `.agents/skills/ponytail/`, `skills-lock.json`. AST-граф:
-  `graphify-out/graph.json` (кэш старше правок, обновлять по регламенту
-  AGENT.MD). Делегирование рутины — Qwen/local-coder по регламенту
-  `docs/areas/local-coder.md` после проверки доступности и резерва GPU.
-
-## Следующие шаги (TODO)
-
-- [ ] Коммит рефакторинга и отработки замечаний — по явной команде
-      пользователя (всё staged).
-- [ ] Приёмка этапа 8: сравнение оформления с ИОС5, выпуск по реальному
-      объекту, замер времени и памяти.
-- [ ] Этап 9: сквозная проверка, производительность, восстановление
-      после ошибок; затем несколько зданий, дополнительные системы, РД.
-- [ ] Синхронизировать `.memory/00_STATE.md` и доску с текущим этапом.
-- [ ] Дозаполнить частичные интерфейсные переводы es/pt/zh.
-- [ ] Коммит — только по явной команде пользователя.
+Qwen availability and GPU reserve were not established, so no Qwen task was dispatched
+for this batch.

@@ -5,7 +5,8 @@
 //! the profile, the layout, interface language, ribbon, palettes, the
 //! window's size, the background autosave interval, the colour High Contrast Point Clouds draws scans in, whether plans show the
 //! origin marker and their view's name in the corner, the shortcuts the user made, and the control port
-//! for agents (whether the window opens it, on which port, and whether agents may edit the project or only read it).
+//! for agents (whether the window opens it, on which port, and whether agents may edit the project or only read it), and the
+//! assistant's provider, model and, only if the user asks, key (scrambled, or encrypted under a passphrase: never as typed).
 //! The pages for what is still to come (performance and graphics) show what they will hold, greyed out.
 
 use crate::popup::Modal;
@@ -18,7 +19,10 @@ use std::path::{Path, PathBuf};
 use egui::{Align, Color32, ComboBox, Context, Id as UiId, Layout, RichText, ScrollArea, ThemePreference, Ui, vec2};
 use serde_json::{Value, json};
 
+use bimcraft_assistant::{Provider, Usage, model_ok, seal};
+
 use crate::BimApp;
+use crate::assistant::Secret;
 use crate::dock::{Docking, Palette};
 use crate::lang::{Lang, t, tf};
 use crate::presets::{Preset, Scale, hidden_from_json, presets_from_json};
@@ -114,6 +118,8 @@ pub struct Settings {
     pub autosave_minutes: u32,
     /// Draw the 3D view on the graphics card, when there is one.
     pub gpu_3d: bool,
+    /// Fill what the 3D view's section box cuts.
+    pub cut_fills_3d: bool,
     pub window: Window,
     /// What High Contrast Point Clouds fills a view's scans with.
     pub high_contrast: [u8; 3],
@@ -121,7 +127,8 @@ pub struct Settings {
     pub grid_snapping: bool,
     /// The equipment height typed at placement is its bottom edge over the level, not the offset of its mounting reference.
     pub equipment_height_by_bottom: bool,
-    /// The plans' origin marker, and the view's name in their corner: working aids on the screen.
+    /// The plans' old origin marker (now the Internal Origin, Site's in Visibility/Graphics: kept so a settings file reads
+    /// back as it was written), and the view's name in their corner, a working aid on the screen.
     pub origin_marker: bool,
     pub view_name: bool,
     /// The shortcuts the user made (Keyboard Shortcuts): two-character key to the English name of an action.
@@ -133,9 +140,27 @@ pub struct Settings {
     pub agents_listen: bool,
     pub agents_port: u16,
     pub agents_edit: bool,
+    /// The Assistant's provider and model, and the key if the user asked for it to be kept: scrambled or under a passphrase (`seal`), never as typed.
+    pub assistant_provider: Provider,
+    pub assistant_model: String,
+    pub assistant_sealed: Option<String>,
+    /// Tokens the providers counted, by the project's file (none for one not yet saved): `usage_from` reads them back.
+    pub assistant_usage: BTreeMap<String, Usage>,
+    /// Co-Work: the name the others see, where a host listens, whether it is visible on the network, whether guests may edit.
+    pub cowork: crate::cowork::Prefs,
 }
 
 impl Settings {
+    /// The Assistant's part of the file: the key only as sealed, and the token counts only once there are any.
+    fn assistant_json(&self) -> Value {
+        let mut v = json!({"provider": self.assistant_provider.key(), "model": self.assistant_model, "key_sealed": self.assistant_sealed});
+        if !self.assistant_usage.is_empty() {
+            v["usage"] =
+                self.assistant_usage.iter().map(|(k, u)| (k.clone(), json!([u.input, u.output]))).collect::<serde_json::Map<_, _>>().into();
+        }
+        v
+    }
+
     pub fn to_json(&self) -> Value {
         let theme = match self.theme {
             ThemePreference::Dark => "dark",
@@ -161,6 +186,7 @@ impl Settings {
             "palettes": self.docking.to_json(),
             "autosave_minutes": self.autosave_minutes,
             "gpu_3d": self.gpu_3d,
+            "cut_fills_3d": self.cut_fills_3d,
             "window": self.window.to_json(),
             "high_contrast": self.high_contrast,
             "grid_snapping": self.grid_snapping,
@@ -171,6 +197,9 @@ impl Settings {
             "system_title_bar": self.system_title_bar,
             "catalogue_bindings": self.catalogue_bindings,
             "agents": {"listen": self.agents_listen, "port": self.agents_port, "edit": self.agents_edit},
+            // The key, only when the user asked for it to be kept, and then only sealed.
+            "assistant": self.assistant_json(),
+            "cowork": self.cowork.to_json(),
         })
     }
 
@@ -212,6 +241,7 @@ impl Settings {
             docking: if v["palettes"].is_object() { Docking::from_json(&v["palettes"]) } else { base.docking },
             autosave_minutes: v["autosave_minutes"].as_u64().filter(|n| *n <= 120).map_or(base.autosave_minutes, |n| n as u32),
             gpu_3d: v["gpu_3d"].as_bool().unwrap_or(base.gpu_3d),
+            cut_fills_3d: v["cut_fills_3d"].as_bool().unwrap_or(base.cut_fills_3d),
             window: Window::from_json(&v["window"], base.window),
             high_contrast: colour(&v["high_contrast"]).unwrap_or(base.high_contrast),
             grid_snapping: v["grid_snapping"].as_bool().unwrap_or(base.grid_snapping),
@@ -224,8 +254,28 @@ impl Settings {
             agents_listen: v["agents"]["listen"].as_bool().unwrap_or(base.agents_listen),
             agents_port: v["agents"]["port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(base.agents_port),
             agents_edit: v["agents"]["edit"].as_bool().unwrap_or(base.agents_edit),
+            assistant_provider: v["assistant"]["provider"].as_str().and_then(Provider::from_key).unwrap_or(base.assistant_provider),
+            assistant_model: v["assistant"]["model"].as_str().filter(|m| model_ok(m)).map_or(base.assistant_model, str::to_string),
+            // A text that is no sealed key (a damaged file, a hand's edit, the plain key an earlier build kept) is none.
+            assistant_sealed: match v["assistant"].get("key_sealed") {
+                None => base.assistant_sealed,
+                Some(sealed) => sealed.as_str().filter(|s| seal::well_formed(s)).map(str::to_string),
+            },
+            assistant_usage: usage_from(&v["assistant"]["usage"], base.assistant_usage),
+            cowork: crate::cowork::Prefs::from_json(&v["cowork"], base.cowork),
         }
     }
+}
+
+/// The token counts a settings file holds: an object of project path to [in, out], at most `MAX_PROJECTS` of them (one that is not
+/// that is left out). Not an object leaves `base`'s.
+fn usage_from(v: &Value, base: BTreeMap<String, Usage>) -> BTreeMap<String, Usage> {
+    let Some(map) = v.as_object() else { return base };
+    map.iter()
+        .filter(|(k, _)| k.len() <= 4096)
+        .filter_map(|(k, v)| Some((k.clone(), Usage { input: v.get(0)?.as_u64()?, output: v.get(1)?.as_u64()? })))
+        .take(crate::assistant::MAX_PROJECTS + 1)
+        .collect()
 }
 
 /// The shortcuts a settings file holds: an object of key to action, of which only the entries that Keyboard Shortcuts could have made
@@ -280,11 +330,14 @@ pub enum Page {
     Graphics,
     Files,
     Agents,
+    Assistant,
+    Cowork,
     Updates,
 }
 
 impl Page {
-    pub const ALL: [Page; 6] = [Page::Interface, Page::Performance, Page::Graphics, Page::Files, Page::Agents, Page::Updates];
+    pub const ALL: [Page; 8] =
+        [Page::Interface, Page::Performance, Page::Graphics, Page::Files, Page::Agents, Page::Assistant, Page::Cowork, Page::Updates];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -293,6 +346,8 @@ impl Page {
             Page::Graphics => "Graphics",
             Page::Files => msg!("Files"),
             Page::Agents => msg!("Agents"),
+            Page::Assistant => msg!("Assistant"),
+            Page::Cowork => msg!("Co-Work"),
             Page::Updates => msg!("Updates"),
         }
     }
@@ -328,6 +383,7 @@ impl BimApp {
         self.light_canvas = kept.light_canvas;
         self.autosave.interval_minutes = kept.autosave_minutes;
         self.card.wanted = kept.gpu_3d;
+        self.cut_fills_3d = kept.cut_fills_3d;
         self.window.kept = kept.window;
         self.scan_contrast = kept.high_contrast;
         self.grid_snapping = kept.grid_snapping;
@@ -337,6 +393,21 @@ impl BimApp {
         self.system_title_bar = kept.system_title_bar;
         self.session.catalogue_bindings = kept.catalogue_bindings.clone();
         (self.agents.listen, self.agents.port, self.agents.edit) = (kept.agents_listen, kept.agents_port, kept.agents_edit);
+        self.cowork_prefs = kept.cowork.clone();
+        let a = &mut self.assistant;
+        (a.provider, a.model, a.sealed) = (kept.assistant_provider, kept.assistant_model.clone(), kept.assistant_sealed.clone());
+        a.usage = kept.assistant_usage.clone();
+        // A saved key is opened for the session, unless it is under a passphrase: then it stays locked until the user types it. One this build
+        // cannot open (another kind of build saved it, or the file was changed) is forgotten, and the user types it again.
+        (a.protect, a.key_saved) = (false, false);
+        match a.sealed.as_deref() {
+            Some(sealed) if seal::needs_passphrase(sealed) => (a.remember, a.protect) = (true, true),
+            Some(sealed) => match seal::open(sealed) {
+                Ok(key) => (a.key, a.remember, a.key_saved) = (Secret(key), true, true),
+                Err(_) => (a.sealed, a.remember) = (None, false),
+            },
+            None => a.remember = false,
+        }
         self.settings_kept = Some(kept);
         self.settings_path = Some(path);
     }
@@ -366,6 +437,7 @@ impl BimApp {
             docking: self.docking.clone(),
             autosave_minutes: self.autosave.interval_minutes,
             gpu_3d: self.card.wanted,
+            cut_fills_3d: self.cut_fills_3d,
             window: self.window.kept,
             high_contrast: self.scan_contrast,
             grid_snapping: self.grid_snapping,
@@ -378,6 +450,11 @@ impl BimApp {
             agents_listen: self.agents.listen,
             agents_port: self.agents.port,
             agents_edit: self.agents.edit,
+            assistant_provider: self.assistant.provider,
+            assistant_model: self.assistant.model.clone(),
+            assistant_sealed: self.assistant.sealed.clone(),
+            assistant_usage: self.assistant.usage.clone(),
+            cowork: self.cowork_prefs.clone(),
         }
     }
 
@@ -422,6 +499,8 @@ impl BimApp {
                             Page::Graphics => self.graphics_page(ui),
                             Page::Files => self.files_page(ui),
                             Page::Agents => self.agents_page(ui),
+                            Page::Assistant => self.assistant_page(ui),
+                            Page::Cowork => self.cowork_page(ui),
                             Page::Updates => self.updates_page(ui),
                         });
                     });
@@ -600,10 +679,6 @@ impl BimApp {
             "The height typed at placement puts the equipment's bottom edge there; Shift places it at its normative height instead"
         )));
         heading(ui, msg!("Plans"));
-        ui.checkbox(&mut self.show_origin, t("Show the origin marker in plans")).on_hover_text(t(
-            "A small marker at the project's 0, 0 with the directions of x (east) and y (north). It is drawn on the screen only: \
-             never in a printed drawing, a sheet or an export",
-        ));
         ui.checkbox(&mut self.show_view_name, t("Show the view's name in the corner of plans")).on_hover_text(t(
             "The name of the floor plan or ceiling plan in its bottom left corner. It is drawn on the screen only, and the view's tab \
              names it too",
@@ -642,6 +717,10 @@ impl BimApp {
             (true, None) => crate::lang::tf("Card: {}", &[&self.card.adapter().unwrap_or_default()]),
         };
         muted(ui, text);
+        heading(ui, msg!("3D view"));
+        ui.checkbox(&mut self.cut_fills_3d, t("Fill what the section box cuts")).on_hover_text(t(
+            "Each face of the box shows what it cuts in its cut pattern. Off, the faces are left hollow and moving the box is faster",
+        ));
         later(ui, |ui| {
             let (mut undo, mut quality, mut smooth, mut background) = (100, 0, true, false);
             ui.horizontal(|ui| {
@@ -730,12 +809,7 @@ impl BimApp {
             t("Opens the control port now and whenever BIMCraft starts: an agent connects with bimcraft-cli mcp --connect. Only this \
              machine can reach it, and only with the token in bridge.json beside your favorites");
         if ui.checkbox(&mut on, t("Let agents work on this project")).on_hover_text(tip).changed() {
-            self.agents.listen = on;
-            if on {
-                self.open_control();
-            } else {
-                self.close_control();
-            }
+            self.set_agents(on);
         }
         ui.horizontal(|ui| {
             let l = ui.label(t("Port"));
@@ -773,7 +847,7 @@ impl BimApp {
 }
 
 /// A group's heading on a page.
-fn heading(ui: &mut Ui, text: &str) {
+pub(crate) fn heading(ui: &mut Ui, text: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(t(text)).strong());
 }

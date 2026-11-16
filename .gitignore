@@ -14,3 +14,5 @@ target/
 
 # Local agent config (Windows paths, per-machine)
 .codex/
+# Headless UI visual-verification exports.
+/crates/ui-egui/target/

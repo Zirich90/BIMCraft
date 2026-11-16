@@ -406,7 +406,7 @@ fn stage8_specification_pdf_paginates_without_changing_the_model() {
     assert!(report["pages"].as_u64().unwrap() > 1);
     assert_eq!(report["rows"].as_array().unwrap().len(), 80);
     let bytes = std::fs::read(&path).unwrap();
-    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(bytes.starts_with(b"%PDF-1.7"));
     assert_eq!(std::sync::Arc::as_ptr(&s.model), std::sync::Arc::as_ptr(&before));
     assert!(s.script_dry_run(&format!("electrical_specification {}", json!({"path":path}))).is_err());
     assert_eq!(std::fs::read(path).unwrap(), bytes);
@@ -461,7 +461,7 @@ fn stage8_diagram_groups_types_per_floor_and_line_with_one_head() {
     let exported = run(&mut s, "electrical_line_diagram", json!({"path":path,"mode":"grouped"}));
     assert_eq!(exported["diagram"], *diagram);
     let bytes = std::fs::read(&path).unwrap();
-    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(bytes.starts_with(b"%PDF-1.7"));
     assert!(s.script_dry_run(&format!("electrical_line_diagram {}", json!({"path":path}))).is_err());
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     assert_eq!(s.model, before);
@@ -1608,7 +1608,7 @@ fn typed_low_voltage_release_keeps_system_sections_and_rolls_back_bad_output() {
     let report = run(&mut s, "electrical_design_pdf", json!({"path":pdf,"code":"IOS5","title":"Fire and security systems"}));
     assert_eq!(report["pages"], 5);
     let bytes = std::fs::read(&pdf).unwrap();
-    assert!(bytes.starts_with(b"%PDF-1.4"));
+    assert!(bytes.starts_with(b"%PDF-1.7"));
     assert!(String::from_utf8_lossy(&bytes).contains("/Count 5"));
     fails(&mut s, "electrical_design_pdf", json!({"path":pdf,"code":"IOS5","title":"Fire","sheets":[first]}));
     assert_eq!(std::fs::read(pdf).unwrap(), bytes);

@@ -9,9 +9,9 @@ Generate another size with `highrise {"storeys": 40}` (1–80).
 
 ```sh
 cargo run --release -p bimcraft -- --highrise
-cargo run --release -p bimcraft-cli -- run --highrise --save dist/highrise.bimcraft
+cargo run --release -p bimcraft-cli -- run --highrise --save dist/highrise.bimc
 # Equivalently, use the small version-controlled script:
-cargo run --release -p bimcraft-cli -- run --script samples/highrise.txt --save dist/highrise.bimcraft
+cargo run --release -p bimcraft-cli -- run --script samples/highrise.txt --save dist/highrise.bimc
 ```
 
 ## Repeatable measurements
@@ -398,4 +398,4 @@ No matched Revit benchmark was run. Outperforming it requires the same represent
 operation, view quality, resolution, hardware, warm/cold state and correctness checks in both apps.
 
 The CPU worker implementation uses [Rayon's indexed parallel iterators and disjoint slice chunks](https://docs.rs/rayon/latest/rayon/).
-Rayon and rayon-core are MIT OR Apache-2.0 and require Rust 1.80, below the core's Rust 1.90 minimum.
+Rayon and rayon-core are MIT OR Apache-2.0 and require Rust 1.80, below the core's Rust 1.95 minimum.
