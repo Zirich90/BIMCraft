@@ -1,4 +1,4 @@
-use super::{MAX_COORD, MAX_POINTS, R, Session, Value, bad, choice, element_id, json, num, only};
+use super::{MAX_COORD, MAX_POINTS, R, Session, Value, bad, choice, element_id, flag, json, num, only};
 
 pub(super) fn carrier_fill(s: &mut Session, p: &Value) -> R {
     use crate::carrier_fill::{ClearSection, Enclosure, Profile};
