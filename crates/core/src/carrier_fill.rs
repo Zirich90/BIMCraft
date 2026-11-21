@@ -46,7 +46,7 @@ pub(crate) enum Profile {
 }
 
 impl Profile {
-    pub(crate) fn capacity(self, clear_area: f64, count: usize) -> Result<(f64, f64), String> {
+    pub(crate) fn capacity(&self, clear_area: f64, count: usize) -> Result<(f64, f64), String> {
         if !clear_area.is_finite() || clear_area <= 0.0 {
             return Err("carrier clear area must be finite and positive".into());
         }
@@ -70,4 +70,58 @@ impl Profile {
         };
         Ok((limit, clear_area * limit))
     }
+}
+
+/// Find the most loaded interval relative to its own limit. A cable ending
+/// where another begins does not share a cross-section with it.
+pub(crate) fn routed_fill(
+    m: &crate::model::Model,
+    carrier: crate::ids::Guid,
+    profile: &Profile,
+    inside: f64,
+) -> Result<(usize, f64, [f64; 2]), String> {
+    let mut events = vec![(0.0_f64, 0_isize, 0.0_f64), (1.0, 0, 0.0)];
+    for id in m.lookup().referrers(&carrier) {
+        let Some(e @ crate::model::Element::Cable(r)) = m.elements.get(id) else { continue };
+        let Some(span) = r.carrier_span.filter(|span| span.carrier == carrier) else { continue };
+        if events.len() >= 2 + 2 * crate::model::MAX_POINTS {
+            return Err("too many cable spans in one carrier".into());
+        }
+        let ty = m.run_type(e).ok_or_else(|| format!("cable {id} has no cable type"))?;
+        if !ty.round {
+            return Err(format!("cable {id} needs a round type with its outside diameter"));
+        }
+        let area = std::f64::consts::PI * ty.width * ty.width / 4.0;
+        events.push((span.start.min(span.end), 1, area));
+        events.push((span.start.max(span.end), -1, -area));
+    }
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut events = events.into_iter().peekable();
+    let (mut count, mut area, mut correction) = (0_isize, 0.0_f64, 0.0_f64);
+    let mut worst = (0, 0.0, [0.0, 1.0]);
+    let mut worst_ratio = 0.0;
+    while let Some((start, delta_count, delta_area)) = events.next() {
+        count += delta_count;
+        let sum = area + delta_area;
+        // Preserve a small cable's area after a much larger cable leaves the interval.
+        correction += if area.abs() >= delta_area.abs() { (area - sum) + delta_area } else { (delta_area - sum) + area };
+        area = sum;
+        let Some(&(end, _, _)) = events.peek() else { break };
+        if end <= start {
+            continue;
+        }
+        let count = usize::try_from(count).map_err(|_| "invalid cable span order")?;
+        if count == 0 {
+            area = 0.0;
+            correction = 0.0;
+        }
+        let occupied = (area + correction).max(0.0);
+        let (_, capacity) = profile.capacity(inside, count)?;
+        let ratio = occupied / capacity;
+        if ratio > worst_ratio {
+            worst = (count, occupied, [start, end]);
+            worst_ratio = ratio;
+        }
+    }
+    Ok(worst)
 }

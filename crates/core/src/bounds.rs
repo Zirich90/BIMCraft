@@ -42,11 +42,13 @@ pub(crate) struct Key {
     shape: Shape,
     /// A component's own adaptive frames, hashed: its box follows its points, as the other component caches key on them.
     adaptive: Option<u64>,
+    /// Attached cables also depend on the current positions of their ports or carrier span.
+    cable_ends: [Option<[u64; 3]>; 2],
 }
 
 impl Key {
     pub(crate) fn of(m: &Model, id: Id) -> Self {
-        let mut key = Self { own: m.elements.revision(id), levels: [None; 2], shape: Shape::Other, adaptive: None };
+        let mut key = Self { own: m.elements.revision(id), levels: [None; 2], shape: Shape::Other, adaptive: None, cable_ends: [None; 2] };
         let Some(e) = m.elements.get(id) else { return key };
         if let Some(c) = e.column() {
             key.levels = [m.elements.revision(c.level), c.top_level.and_then(|id| m.elements.revision(id))];
@@ -57,6 +59,7 @@ impl Key {
             });
         } else if let Some(r) = e.run() {
             key.levels[0] = m.elements.revision(r.level);
+            key.cable_ends = r.attached_ends(m).map(|at| at.map(|point| point.map(f64::to_bits)));
             key.shape = m.run_type(e).map_or(Shape::Missing, |t| Shape::Run {
                 dimensions: [t.width.to_bits(), t.depth.to_bits()],
                 round: t.round,
@@ -328,6 +331,8 @@ mod tests {
                                 end,
                                 offset: 100.0,
                                 end_offset,
+                                ports: [None, None],
+                                carrier_span: None,
                                 justify,
                                 join: true,
                                 system: String::new(),

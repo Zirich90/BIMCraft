@@ -172,7 +172,7 @@ pub const MAX_SLOPE: f64 = 75.0;
 /// (`library`), and what names a library entry holds its GUID. 1: elements have GUIDs, ids six digits, and what points at
 /// an element holds its GUID. None (0): a file from before.
 /// 20 (0.12's, which every change since 19 shares; the Family Editor's unreleased builds wrote 20 to 32 too, and a file of
-/// theirs stamped 20 opens as one of 0.12's, 21 and up as newer): rooms have types (`types.room`), which may name a floor type and a ceiling type, and a room holds the floor and the
+/// theirs stamped 20 opens as one of 0.12's): rooms have types (`types.room`), which may name a floor type and a ceiling type, and a room holds the floor and the
 /// ceiling made for it (`floor`, `ceiling`); a build that reads up to 19 would lose the links and leave the finishes behind. And
 /// project parameters may be of kinds 19 doesn't know (`integer`, `area`, `volume`, `angle`), a type's (`scope`, `type_values`),
 /// from a `.bimparams` dictionary (`dictionaries`), grouped under a heading of the project's own, and the project's information
@@ -235,7 +235,9 @@ pub const MAX_SLOPE: f64 = 75.0;
 /// And a grid has a type (`type`), and a project holds grid types (`grid_types`, library entries of kind `grid-type`); a grid of
 /// 20 has none, and reading it as 21 gives it the type the standards name; a build that reads up to 20 would leave both out as
 /// fields it doesn't know and draw every grid in the one line it had, not say "saved by a newer BIMCraft".
-pub const FORMAT: u32 = 21;
+/// 22 adds data cable attachments to placed family ports and cable spans on carriers.
+/// Runs read from 21 keep their own axes and have no port or carrier links.
+pub const FORMAT: u32 = 22;
 /// How far past the model a level reaches without an extent of its own, mm.
 pub const LEVEL_PAST: f64 = 1000.0;
 
@@ -1976,6 +1978,11 @@ pub struct Run {
     pub offset: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_offset: Option<f64>,
+    /// Each attached end of a data cable names the instance and its family connector.
+    #[serde(default, skip_serializing_if = "crate::runs::no_ports")]
+    pub ports: [Option<crate::runs::CablePort>; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_span: Option<crate::runs::CarrierSpan>,
     #[serde(default)]
     pub justify: Justify,
     /// Whether it joins its neighbours at its ends (Revit's Allow Join): on unless turned off, so its ends mitre against
@@ -2690,7 +2697,11 @@ macro_rules! visit_refs {
                 f(& $($m)? v.sheet);
                 f(& $($m)? v.view);
             }
-            run_arm!(r) => f(& $($m)? r.level),
+            run_arm!(r) => {
+                f(& $($m)? r.level);
+                for port in (& $($m)? r.ports).into_iter().flatten() { f(& $($m)? port.component); }
+                if let Some(span) = & $($m)? r.carrier_span { f(& $($m)? span.carrier); }
+            }
             Element::Component(c) => {
                 f(& $($m)? c.level);
                 if let Some(Hosted { host: HostRef::Plane(g) | HostRef::Face { element: g, .. }, .. }) = & $($m)? c.host { f(g) }
@@ -7587,7 +7598,8 @@ impl Model {
     /// ramp's start. None for what has no place in a plan to point at.
     pub fn anchor(&self, id: impl Key) -> Option<P2> {
         let middle = |a: P2, b: P2| Some((a + b) * 0.5);
-        match self.elements.get(id)? {
+        let e = self.elements.get(id)?;
+        match e {
             Element::Door(o) | Element::Window(o) => self.wall(o.host).map(|w| walls::Axis::of(w).at(o.offset, 0.0)),
             Element::Wall(w) => {
                 let axis = walls::Axis::of(w);
@@ -7597,7 +7609,7 @@ impl Model {
             Element::Component(c) => Some(c.at),
             Element::Room(r) => Some(r.point),
             Element::PropertyLine(pl) => Some(geom::centroid(&pl.points)),
-            run_arm!(r) => middle(r.start, r.end),
+            run_arm!(r) => self.run_geom(e).map_or_else(|| middle(r.start, r.end), |g| middle(P2(g.a[0], g.a[1]), P2(g.b[0], g.b[1]))),
             Element::Stair(s) => Some(s.start),
             Element::Ramp(r) => Some(r.start),
             Element::Floor(Floor { boundary, .. }) | Element::Ceiling(Ceiling { boundary, .. }) | Element::Roof(Roof { boundary, .. }) => {
@@ -10238,6 +10250,33 @@ impl Model {
                     coord(&format!("{who} end_offset"), o)?;
                 }
                 text(&who, "system", &r.system)?;
+                if let Some(span) = r.carrier_span {
+                    if category != "cable" || r.justify != Justify::Centre || !crate::runs::no_ports(&r.ports) {
+                        return Err(format!("{who}: a carrier span needs a centre-justified data cable with free ends"));
+                    }
+                    if !span.fractions_in_range() {
+                        return Err(format!("{who}: carrier span fractions must be between 0 and 1"));
+                    }
+                    let [a, b] = span.axis(self).ok_or_else(|| format!("{who}: select an existing conduit or cable tray"))?;
+                    for [x, y, z] in [a, b] {
+                        point(&who, P2(x, y))?;
+                        coord(&who, z)?;
+                    }
+                    crate::runs::check(&who, category, &crate::runs::Geom::unattached(self, r, t))?;
+                }
+                if !crate::runs::no_ports(&r.ports) {
+                    if category != "cable" || r.justify != Justify::Centre {
+                        return Err(format!("{who}: only a centre-justified data cable takes data ports"));
+                    }
+                    for port in r.ports.iter().flatten() {
+                        let [x, y, z] = port.position(self).ok_or_else(|| {
+                            format!("{who}: component {} has no placed data port {}", self.shown(port.component), port.port)
+                        })?;
+                        point(&who, P2(x, y))?;
+                        coord(&who, z)?;
+                    }
+                    crate::runs::check(&who, category, &crate::runs::Geom::unattached(self, r, t))?;
+                }
                 crate::runs::check(&who, category, &crate::runs::Geom::of(self, r, t))?;
             }
             Element::Stair(st) => {

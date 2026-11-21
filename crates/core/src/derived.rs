@@ -122,6 +122,9 @@ fn banding(elements: &Elements, e: &Element) -> Option<(Group, f64, f64)> {
         return Some((group, base, base));
     }
     let r = e.run()?;
+    if r.carrier_span.is_some() || !crate::runs::no_ports(&r.ports) {
+        return None;
+    }
     let base = elevation_in(elements, r.level);
     let (z0, z1) = (base + r.offset, base + r.end_offset.unwrap_or(r.offset));
     let plan = r.start.dist(r.end);

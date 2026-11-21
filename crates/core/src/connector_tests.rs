@@ -32,6 +32,71 @@ fn near(a: &Value, b: [f64; 3]) -> bool {
     a.as_array().is_some_and(|v| v.len() == 3 && v.iter().zip(b).all(|(x, y)| x.as_f64().is_some_and(|x| (x - y).abs() < 1e-6)))
 }
 
+#[test]
+fn cable_ends_reference_the_instance_and_its_data_port() {
+    let mut s = Session::new();
+    run(
+        &mut s,
+        "family",
+        json!({"name":"Detector","types":{"A":{}},
+        "connectors":[{"name":"Loop","kind":"data","at":[100,20,50]},
+            {"name":"Supply","kind":"power","system":"power-balanced","voltage":127,"load_va":12}]}),
+    );
+    let left = made(&mut s, json!({"family":"Detector","at":[1000,1000]}));
+    let right = made(&mut s, json!({"family":"Detector","at":[4000,1000]}));
+    let board = crate::circuit_tests::board(&mut s);
+    let circuit = crate::circuit_tests::make(&mut s, json!({"devices":[left,right],"panel":board}));
+    let power = element_json(&s.model, circuit);
+    assert_eq!(power["installed_va"], json!(24.0));
+    let port = connectors(&s, left)[0]["guid"].clone();
+    assert_eq!(connectors(&s, right)[0]["guid"], port);
+    let cable = run(&mut s, "cabling", json!({"points":[[1100,1020],[4100,1020]],"offset":50}))["ids"][0].as_u64().unwrap();
+    let mut legacy: Value = serde_json::from_str(&s.model.to_json().unwrap()).unwrap();
+    legacy["format"] = json!(20);
+    let (legacy, left_out) = Model::read(&legacy.to_string()).unwrap();
+    assert!(left_out.is_empty());
+    assert_eq!(legacy.elements.get(cable), s.model.elements.get(cable));
+    let endpoints = json!([{"component":left,"port":port},{"component":right,"port":port}]);
+    run(&mut s, "cable_ports", json!({"id":cable,"ends":endpoints}));
+    let mut bounds = crate::bounds::BoundsCache::default();
+    let before = bounds.get(&s.model, cable);
+    fails(&mut s, "move", json!({"id":right,"by":[-3000,0]}));
+    let points = run(&mut s, "cable_ports", json!({"id":cable}));
+    assert!(near(&points["ends"][0]["at"], [1100.0, 1020.0, 50.0]));
+    assert!(near(&points["ends"][1]["at"], [4100.0, 1020.0, 50.0]));
+    run(&mut s, "rotate", json!({"ids":[right],"about":[4000,1000],"angle":90}));
+    assert_ne!(bounds.get(&s.model, cable), before);
+    let points = run(&mut s, "cable_ports", json!({"id":cable}));
+    assert!(near(&points["ends"][0]["at"], [1100.0, 1020.0, 50.0]));
+    assert!(near(&points["ends"][1]["at"], [3980.0, 1100.0, 50.0]));
+    let g = s.model.run_geom(s.model.elements.get(cable).unwrap()).unwrap();
+    assert_eq!(g.a, [1100.0, 1020.0, 50.0]);
+    assert!(near(&json!(g.b), [3980.0, 1100.0, 50.0]));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("detectors.bimc");
+    run(&mut s, "save", json!({"path":path}));
+    run(&mut s, "open", json!({"path":path}));
+    assert_eq!(run(&mut s, "cable_ports", json!({"id":cable})), points);
+    assert_eq!(element_json(&s.model, circuit), power);
+    let mut other = Session::new();
+    let brought = run(&mut other, "insert", json!({"path":path,"ids":[cable]}));
+    let brought_cable = brought["ids"][cable.to_string()].as_u64().unwrap();
+    let ends = run(&mut other, "cable_ports", json!({"id":brought_cable}));
+    assert_eq!(ends["ends"], points["ends"]);
+    let wrong = s.model.guid(right);
+    fails(&mut s, "cable_ports", json!({"id":cable,"ends":[{"component":left,"port":wrong},null]}));
+    let copied = run(&mut s, "copy", json!({"ids":[cable,left],"by":[0,2000]}))["ids"][0].as_u64().unwrap();
+    let copy = run(&mut s, "cable_ports", json!({"id":copied}));
+    assert_ne!(copy["ends"][0]["component"], points["ends"][0]["component"]);
+    assert_eq!(copy["ends"][0]["port"], port);
+    assert!(near(&copy["ends"][0]["at"], [1100.0, 3020.0, 50.0]));
+    assert!(copy["ends"][1].is_null());
+    run(&mut s, "delete", json!({"id":right}));
+    assert!(run(&mut s, "cable_ports", json!({"id":cable}))["ends"][1].is_null());
+    let detached = s.model.run_geom(s.model.elements.get(cable).unwrap()).unwrap();
+    assert_eq!(detached, g);
+}
+
 /// A trap with its waste out through the floor and an inlet from the wall, sized by its type.
 fn trap(s: &mut Session) {
     run(
@@ -240,4 +305,171 @@ fn a_fitting_has_a_connector_at_each_end_of_its_diameter_and_takes_its_pipes_dom
     let e = fails(&mut s, "family", json!({"name": "Bad", "category": "plumbing", "types": {"A": {}}, "connectors": [open]}));
     assert!(e.contains("domain") && e.contains("fitting"), "{e}");
     run(&mut s, "family", json!({"name": "Union", "category": "pipefitting", "types": {"A": {}}, "connectors": [open]}));
+}
+
+#[test]
+fn cable_span_follows_its_carrier_and_survives_detachment() {
+    let mut s = Session::new();
+    let carrier =
+        run(&mut s, "conduit", json!({"points":[[1000,1000],[3000,1000]],"offset":100,"end_offset":300}))["ids"][0].as_u64().unwrap();
+    let cable = run(&mut s, "cabling", json!({"points":[[1500,1600],[2500,1600]]}))["ids"][0].as_u64().unwrap();
+    let original = s.model.guid(carrier);
+    fails(&mut s, "cable_carrier", json!({"id":cable,"span":{"carrier":cable,"start":0,"end":1}}));
+    fails(&mut s, "cable_carrier", json!({"id":cable,"span":{"carrier":carrier,"start":0.5,"end":0.5}}));
+    run(&mut s, "cable_carrier", json!({"id":cable,"span":{"carrier":carrier,"start":0.25,"end":0.75}}));
+    let span = run(&mut s, "cable_carrier", json!({"id":cable}));
+    assert_eq!(span["span"]["carrier"], json!(original));
+    assert!(near(&span["axis"][0], [1500.0, 1000.0, 150.0]));
+    assert!(near(&span["axis"][1], [2500.0, 1000.0, 250.0]));
+    let mut bounds = crate::bounds::BoundsCache::default();
+    let before = bounds.get(&s.model, cable);
+    run(&mut s, "move", json!({"ids":[carrier],"by":[0,500]}));
+    assert_ne!(bounds.get(&s.model, cable), before);
+    let moved = run(&mut s, "cable_carrier", json!({"id":cable}));
+    assert!(near(&moved["axis"][0], [1500.0, 1500.0, 150.0]));
+    assert!(near(&moved["axis"][1], [2500.0, 1500.0, 250.0]));
+    fails(&mut s, "move", json!({"ids":[cable],"by":[0,200]}));
+    let independent = run(&mut s, "copy", json!({"ids":[cable],"by":[0,2000]}))["ids"][0].as_u64().unwrap();
+    let copied = run(&mut s, "cable_carrier", json!({"id":independent}));
+    assert!(copied["span"].is_null());
+    assert!(near(&copied["axis"][0], [1500.0, 3500.0, 150.0]));
+    let pair = run(&mut s, "copy", json!({"ids":[carrier,cable],"by":[0,3000]}));
+    let carrier_copy = pair["ids"][0].as_u64().unwrap();
+    let cable_copy = pair["ids"][1].as_u64().unwrap();
+    let copied = run(&mut s, "cable_carrier", json!({"id":cable_copy}));
+    assert_eq!(copied["span"]["carrier"], json!(s.model.guid(carrier_copy)));
+    assert!(near(&copied["axis"][0], [1500.0, 4500.0, 150.0]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("route.bimc");
+    run(&mut s, "save", json!({"path":path}));
+    let mut reopened = Session::new();
+    run(&mut reopened, "open", json!({"path":path}));
+    assert_eq!(run(&mut reopened, "cable_carrier", json!({"id":cable})), moved);
+    let mut other = Session::new();
+    let brought = run(&mut other, "insert", json!({"path":path,"ids":[cable]}));
+    let brought_cable = brought["ids"][cable.to_string()].as_u64().unwrap();
+    let brought = run(&mut other, "cable_carrier", json!({"id":brought_cable}));
+    assert_eq!(brought["span"], moved["span"]);
+    assert_eq!(brought["axis"], moved["axis"]);
+    run(&mut reopened, "delete", json!({"ids":[carrier]}));
+    let detached = run(&mut reopened, "cable_carrier", json!({"id":cable}));
+    assert!(detached["span"].is_null());
+    assert_eq!(detached["axis"], moved["axis"]);
+}
+
+#[test]
+fn cable_route_places_ordered_spans_atomically() {
+    let mut s = Session::new();
+    let first =
+        run(&mut s, "conduit", json!({"points":[[1000,1000],[3000,1000]],"offset":100,"end_offset":200}))["ids"][0].as_u64().unwrap();
+    let next = run(&mut s, "cable_tray", json!({"points":[[3000,3000],[3000,1000]],"offset":200}))["ids"][0].as_u64().unwrap();
+    let spans = json!([{"carrier":first,"start":0.5,"end":1},{"carrier":next,"start":1,"end":0.5}]);
+    let mut gap = spans.clone();
+    gap[1]["start"] = json!(0.9);
+    assert!(fails(&mut s, "cable_route", json!({"spans":gap})).contains("meet"));
+
+    let route = run(&mut s, "cable_route", json!({"spans":spans,"system":"Data"}));
+    let ids = route["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 2);
+    let a = run(&mut s, "cable_carrier", json!({"id":ids[0]}));
+    let b = run(&mut s, "cable_carrier", json!({"id":ids[1]}));
+    assert!(near(&a["axis"][0], [2000.0, 1000.0, 150.0]));
+    assert_eq!(a["axis"][1], b["axis"][0]);
+    assert!(near(&b["axis"][1], [3000.0, 2000.0, 200.0]));
+    assert!((route["length"].as_f64().unwrap() - (1000.0_f64.hypot(50.0) + 1000.0)).abs() < 1e-6);
+    let check = json!({"ids":ids});
+    assert_eq!(run(&mut s, "cable_route_check", check.clone())["connected"], true);
+    run(&mut s, "modify", json!({"id":next,"offset":300}));
+    let broken = run(&mut s, "cable_route_check", check);
+    assert_eq!(broken["connected"], false);
+    assert_eq!(broken["gaps"], json!([{"from":ids[0],"to":ids[1],"distance":100.0}]));
+}
+
+#[test]
+fn cable_route_adds_leads_to_placed_data_ports() {
+    let mut s = Session::new();
+    run(&mut s, "family", json!({"name":"Detector","types":{"A":{}},"connectors":[{"name":"Data","kind":"data","at":[0,0,50]}]}));
+    let left = made(&mut s, json!({"family":"Detector","at":[500,1000]}));
+    let right = made(&mut s, json!({"family":"Detector","at":[3500,1000]}));
+    let port = connectors(&s, left)[0]["guid"].clone();
+    let carrier = run(&mut s, "conduit", json!({"points":[[1000,1000],[3000,1000]],"offset":50}))["ids"][0].as_u64().unwrap();
+    let route = run(
+        &mut s,
+        "cable_route",
+        json!({
+            "spans":[{"carrier":carrier,"start":0,"end":1}],
+            "ends":[{"component":left,"port":port},{"component":right,"port":port}]
+        }),
+    );
+    let ids = route["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(route["length"], 3000.0);
+    assert_eq!(run(&mut s, "cable_route_check", json!({"ids":ids}))["connected"], true);
+    assert!(near(&run(&mut s, "cable_ports", json!({"id":ids[0]}))["ends"][0]["at"], [500.0, 1000.0, 50.0]));
+    assert!(near(&run(&mut s, "cable_ports", json!({"id":ids[2]}))["ends"][1]["at"], [3500.0, 1000.0, 50.0]));
+}
+
+#[test]
+fn shrinking_a_carrier_revalidates_its_cable_span() {
+    let mut s = Session::new();
+    let carrier = run(&mut s, "conduit", json!({"points":[[1000,1000],[3000,1000]]}))["ids"][0].as_u64().unwrap();
+    let cable = run(&mut s, "cabling", json!({"points":[[1500,1600],[2500,1600]]}))["ids"][0].as_u64().unwrap();
+    run(&mut s, "cable_carrier", json!({"id":cable,"span":{"carrier":carrier,"start":0.0,"end":0.01}}));
+
+    run(&mut s, "modify", json!({"id":carrier,"end":[2000,1000]}));
+    let before = run(&mut s, "cable_carrier", json!({"id":cable}));
+    assert!((before["length"].as_f64().unwrap() - 10.0).abs() < 1e-6);
+    let error = fails(&mut s, "modify", json!({"id":carrier,"end":[1050,1000]}));
+    assert!(error.contains("too short"), "{error}");
+    assert_eq!(run(&mut s, "cable_carrier", json!({"id":cable})), before);
+}
+
+#[test]
+fn carrier_fill_uses_the_cables_present_at_each_section() {
+    let mut s = Session::new();
+    run(&mut s, "type", json!({"category":"conduit","name":"Measured","width":32,"round":true,"clear_section":{"diameter":20}}));
+    run(&mut s, "type", json!({"category":"cable","name":"Data","width":8,"round":true}));
+    let carrier = run(&mut s, "conduit", json!({"points":[[1000,1000],[3000,1000]],"type":"Measured"}))["ids"][0].as_u64().unwrap();
+    let add_cable = |s: &mut Session, start, end| {
+        let cable = run(s, "cabling", json!({"points":[[1500,1600],[2500,1600]],"type":"Data"}))["ids"][0].as_u64().unwrap();
+        run(s, "cable_carrier", json!({"id":cable,"span":{"carrier":carrier,"start":start,"end":end}}));
+        cable
+    };
+    let params = json!({"id":carrier,"profile":"nbr5410_2004","routed":true});
+    assert!(run(&mut s, "carrier_fill", params.clone())["ok"].as_bool().unwrap());
+    add_cable(&mut s, 0.0, 0.5);
+    add_cable(&mut s, 1.0, 0.5);
+    let separate = run(&mut s, "carrier_fill", params.clone());
+    assert_eq!(separate["count"], 1);
+    assert_eq!(separate["ok"], true);
+    let overlap = add_cable(&mut s, 0.25, 0.75);
+    let filled = run(&mut s, "carrier_fill", params.clone());
+    assert_eq!(filled["count"], 2);
+    assert_eq!(filled["limit_percent"], 31.0);
+    assert_eq!(filled["ok"], false);
+    run(&mut s, "cable_carrier", json!({"id":overlap,"span":null}));
+    assert_eq!(run(&mut s, "carrier_fill", params)["ok"], true);
+    fails(&mut s, "carrier_fill", json!({"id":carrier,"profile":"nbr5410_2004","routed":true,"areas":[25]}));
+}
+
+#[test]
+fn a_format_21_project_keeps_its_conduit_tray_and_unattached_cable() {
+    use crate::model::Model;
+
+    let mut s = Session::new();
+    let ids = ["conduit", "cable_tray", "cabling"]
+        .map(|command| run(&mut s, command, json!({"points":[[1000,1000],[3000,1000]]}))["ids"][0].as_u64().unwrap());
+    let mut file: Value = serde_json::from_str(&s.model.to_json().unwrap()).unwrap();
+    file["format"] = json!(21);
+    let (opened, left_out) = Model::read(&file.to_string()).unwrap();
+    assert!(left_out.is_empty(), "{left_out:?}");
+    for id in ids {
+        let before = s.model.elements.get(id).unwrap();
+        let after = opened.elements.get(id).unwrap();
+        assert_eq!(opened.guid(id), s.model.guid(id));
+        assert_eq!(before.category(), after.category());
+        assert_eq!(opened.run_geom(after), s.model.run_geom(before));
+    }
+    opened.check().unwrap();
 }

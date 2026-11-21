@@ -86,6 +86,8 @@ pub(crate) fn import(cx: &mut Import, f: &Facts, g: &Gathered) {
                 end: point(b[0], b[1]),
                 offset,
                 end_offset: (end != offset).then_some(end),
+                ports: [None, None],
+                carrier_span: None,
                 justify: Justify::Centre,
                 join: true,
                 system: String::new(),

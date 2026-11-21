@@ -41,6 +41,7 @@ use crate::workplane::{Surface, WorkPlane};
 use crate::{pdf, render, schedule, sheet, snap, stairs, view3d};
 
 mod bars;
+mod cable_routes;
 mod carrier;
 mod quantities;
 mod work_plane;
@@ -1130,6 +1131,34 @@ other_files(
          (cabeamento estruturado, NBR 14565) for each segment of the points, as `pipe` lays them: round, `width` the cable's outside \
          diameter; `system` names the link or the network it belongs to",
         cabling,
+    ),
+    edit(
+        "cable_ports",
+        ui_msg!("Cable Ports"),
+        &[],
+        "{id, ends?: [null|{component, port}, null|{component, port}]} read or replace a data cable's start and end ports. \
+         Omit ends to read. Each port is the GUID of a placed data connector on the named component. Null detaches that end",
+        cable_routes::cable_ports,
+    ),
+    edit(
+        "cable_carrier",
+        ui_msg!("Cable Carrier"),
+        &[],
+        "{id, span?: null|{carrier, start, end}} read or change a data cable segment's carrier span. Carrier is a conduit or cable tray id or GUID. Start and end are distinct fractions of its axis from 0 to 1. Null frees the cable at its current position. Omit span to read",
+        cable_routes::cable_carrier,
+    ),
+    edit(
+        "cable_route",
+        ui_msg!("Cable Route"),
+        &[],
+        "{spans:[{carrier,start,end},…], ends?:[null|{component,port},null|{component,port}], type?, level?, system?} place an ordered cable route in one undo step. Consecutive spans must meet. Optional straight leads connect placed data ports to the route. Returns ordered IDs and total length in mm",
+        cable_routes::cable_route,
+    ),
+    other(
+        "cable_route_check",
+        "Check Cable Route",
+        "{ids:[data cable id|GUID,…]} check joints between ordered segments, including ducts, trays or separate leads to ports. Returns total length in mm and gaps between consecutive ends",
+        cable_routes::cable_route_check,
     ),
     edit(
         "stair",
@@ -3590,7 +3619,7 @@ other_files(
     other(
         "carrier_fill",
         "Check Measured Carrier Fill",
-        "{id:conduit or cable tray id|GUID, profile:nbr5410_2004|ru_sp76_2016_max_fill, areas:[mm²,…], inside_diameter?:mm, enclosure?:blind_box|lidded_box, inside_width?:mm, inside_depth?:mm} check maximum fill from the type's clear_section or from explicit measurements. Give one positive area including the insulation and sheath per cable or conductor. NBR takes a round conduit. SP 76 takes a rectangular box with an enclosure. The result includes count, capacity and whether it fits",
+        "{id:conduit or cable tray id|GUID, profile:nbr5410_2004|ru_sp76_2016_max_fill, areas?:[mm²,…], routed?:bool, inside_diameter?:mm, enclosure?:blind_box|lidded_box, inside_width?:mm, inside_depth?:mm} check maximum fill from the type's clear_section or from explicit measurements. Give one positive area including the insulation and sheath per cable or conductor, or set routed:true to check the most loaded interval of the attached data cables. NBR takes a round conduit. SP 76 takes a rectangular box with an enclosure. The result includes count, capacity and whether it fits",
         carrier::carrier_fill,
     ),
 ];
@@ -14098,6 +14127,8 @@ pub fn runs_of(m: &Model, p: &Value, category: &str) -> Result<Vec<Element>, Str
                     end: *b,
                     offset,
                     end_offset,
+                    ports: [None, None],
+                    carrier_span: None,
                     justify,
                     join: true,
                     system: system.clone(),
@@ -18910,6 +18941,13 @@ fn modify(s: &mut Session, p: &Value) -> R {
         for (k, val) in fields {
             let val = match k.as_str() {
                 "id" | "ids" => continue,
+                "ports" if matches!(e, Element::Cable(_)) => return Err(bad(c, "use cable_ports to attach or detach a cable end")),
+                "carrier_span" if matches!(e, Element::Cable(_)) => {
+                    return Err(bad(c, "use cable_carrier to attach or detach a cable span"));
+                }
+                "start" | "end" | "offset" | "end_offset" | "level" if matches!(e, Element::Cable(r) if r.carrier_span.is_some()) => {
+                    return Err(bad(c, "change the carrier or detach the cable span before changing its position"));
+                }
                 // A component's Offset from Host: its host's offset on a plane, else its height over its level. Its Work Plane
                 // is what it is on, said, changed with `edit_work_plane`.
                 "offset_from_host" if matches!(e, Element::Component(_)) => {
@@ -19201,7 +19239,14 @@ pub(crate) fn transform(c: &str, m: &Model, mut e: Element, id: Id, mo: &Motion,
         Element::Viewport(v) => v.at = f(v.at),
         Element::Column(col) | Element::StructuralColumn(col) | Element::Footing(col) => (col.at, col.angle) = turned(f, col.at, col.angle),
         // A run keeps its heights at its ends; its section is the same either way round.
-        crate::model::run_arm!(r) => (r.start, r.end) = (f(r.start), f(r.end)),
+        crate::model::run_arm!(r) => {
+            if (r.carrier_span.is_some() || !crate::runs::no_ports(&r.ports))
+                && let Some(g) = m.elements.get(id).and_then(|e| m.run_geom(e))
+            {
+                r.keep_centreline(g, m.elevation(r.level));
+            }
+            (r.start, r.end) = (f(r.start), f(r.end));
+        }
         // A mirror image is the family's, flipped. A tilt is taken before `angle`, which the mirror reflects across its own
         // line, so what is left of it is a reflection across the family's x and z: its directions' y the other way.
         Element::Component(cp) => {
@@ -19568,7 +19613,24 @@ fn relocate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion, end: Option<bool>
             // Moving one end of a run or a grid: the other end stays where it was, as a wall's does.
             mut e => {
                 if let (Some(at_start), Some(me), Some(old)) = (end, e.run_mut(), m.run_of(id)) {
-                    if at_start { me.end = old.end } else { me.start = old.start }
+                    let shown = m.elements.get(id).and_then(|e| m.run_geom(e));
+                    let (start, finish) = shown
+                        .filter(|_| !crate::runs::no_ports(&old.ports))
+                        .map_or((old.start, old.end), |g| (P2(g.a[0], g.a[1]), P2(g.b[0], g.b[1])));
+                    if at_start { me.end = finish } else { me.start = start }
+                }
+                if let Some(r) = e.run()
+                    && r.carrier_span.is_some_and(|span| end.is_some() || !moving_guids.contains(&span.carrier))
+                {
+                    return Err(bad(c, "move a cable's carrier, or detach the cable span first"));
+                }
+                if let Some(r) = e.run()
+                    && [0, 1].into_iter().any(|i| {
+                        end.is_none_or(|start| usize::from(!start) == i)
+                            && r.ports[i].is_some_and(|port| !moving_guids.contains(&port.component))
+                    })
+                {
+                    return Err(bad(c, "move a cable's attached component, or disconnect that end first"));
                 }
                 if let (Some(at_start), Element::Grid(me), Some(Element::Grid(old))) = (end, &mut e, m.elements.get(id)) {
                     if at_start { me.end = old.end } else { me.start = old.start }
@@ -20113,6 +20175,18 @@ fn duplicate(c: &str, s: &mut Session, ids: &[Id], mo: &Motion) -> R {
         };
         for at in ties {
             *at = at.map(|a| hosts.get(&a).copied().unwrap_or(a));
+        }
+        if let Some(Element::Cable(r)) = m.elements.get_mut(id) {
+            r.carrier_span = r.carrier_span.and_then(|mut span| {
+                span.carrier = *hosts.get(&span.carrier)?;
+                Some(span)
+            });
+            for at in &mut r.ports {
+                *at = at.and_then(|mut p| {
+                    p.component = *hosts.get(&p.component)?;
+                    Some(p)
+                });
+            }
         }
     }
     for (from, mut e) in notes {
@@ -21661,6 +21735,7 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
                 || e.and_then(crate::underlay::of_element).is_some_and(|u| gone.contains(&u.view))
         })
         .collect();
+    let cables = cable_routes::detached_cables(m, gone.iter().flat_map(|g| lookup.referrers(g)).collect(), &gone);
     let m = s.model_mut();
     m.pinned.retain(|g| !gone.contains(g));
     for id in &gone {
@@ -21681,6 +21756,9 @@ fn delete_indexed(s: &mut Session, p: &Value) -> R {
     }
     for (id, d) in kept {
         m.elements.insert(id, Element::Dimension(d));
+    }
+    for (id, r) in cables {
+        m.elements.insert(id, Element::Cable(r));
     }
     for id in ties {
         match m.elements.get_mut(id) {
@@ -21812,6 +21890,7 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
         }
     }
     let deleted: Vec<Id> = m.elements.with_guids().filter(|(_, g, _)| gone.contains(g)).map(|(id, ..)| id).collect();
+    let cables = cable_routes::detached_cables(m, m.elements.keys().copied().collect(), &gone);
     let m = s.model_mut();
     m.pinned.retain(|g| !gone.contains(g));
     // A 3D view whose work plane's level goes sketches on the lowest level again.
@@ -21830,6 +21909,9 @@ fn delete_from_scratch(s: &mut Session, p: &Value) -> R {
     }
     for (id, x) in emptied {
         m.elements.insert(id, Element::Circuit(x));
+    }
+    for (id, r) in cables {
+        m.elements.insert(id, Element::Cable(r));
     }
     // What was made from a mass that goes is ordinary from then on.
     massing::forget_from_scratch(m, &gone);
