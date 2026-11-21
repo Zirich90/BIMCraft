@@ -5569,6 +5569,14 @@ impl Model {
         if self.grid_types.is_empty() {
             self.grid_types = crate::grids::types(self.language);
         }
+        if self.format < 21 {
+            let defaults = lines::patterns(self.language);
+            for name in self.grid_types.values().filter_map(|grid| grid.line_pattern.as_ref()) {
+                if let Some(pattern) = defaults.get(name) {
+                    self.line_patterns.entry(name.clone()).or_insert_with(|| pattern.clone());
+                }
+            }
+        }
         let wanted = crate::grids::default_type(&self.grid_types, self.language).cloned().unwrap_or_default();
         for e in self.elements.values_mut() {
             if let Element::Grid(g) = e
