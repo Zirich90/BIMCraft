@@ -109,3 +109,56 @@ fn ods_catalogue_invalid_guid_rolls_back_the_entire_import() {
     assert!(s.execute("catalogue_import", &json!({"path":path})).is_err());
     assert_eq!(s.model, before);
 }
+
+#[test]
+fn ods_catalogue_round_trips_clear_sections_and_reads_legacy_workbooks() {
+    let mut s = Session::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("measured.ods");
+    let conduit = json!({"category":"conduit","name":"Measured conduit","width":40,"round":true});
+    let tray = json!({"category":"cabletray","name":"Measured box","width":100,"depth":50});
+    s.execute("type", &conduit).unwrap();
+    s.execute("type", &tray).unwrap();
+    s.execute("catalogue_export", &json!({"path":path})).unwrap();
+    let mut legacy_rows = crate::ods::read(&std::fs::read(&path).unwrap()).unwrap();
+    for row in &mut legacy_rows {
+        row.truncate(7);
+    }
+    let legacy = dir.path().join("legacy.ods");
+    std::fs::write(&legacy, crate::ods::write(&legacy_rows).unwrap()).unwrap();
+
+    let mut measured_conduit = conduit.clone();
+    measured_conduit["clear_section"] = json!({"diameter":32});
+    let mut measured_tray = tray.clone();
+    measured_tray["clear_section"] = json!({"width":90,"depth":42,"enclosure":"lidded_box"});
+    s.execute("type", &measured_conduit).unwrap();
+    s.execute("type", &measured_tray).unwrap();
+    let measured_types = s.model.types.runs.clone();
+    s.execute("catalogue_import", &json!({"path":legacy})).unwrap();
+    assert_eq!(s.model.types.runs, measured_types);
+    s.execute("catalogue_export", &json!({"path":path})).unwrap();
+
+    let mut plain_conduit = conduit;
+    plain_conduit["clear_section"] = serde_json::Value::Null;
+    let mut plain_tray = tray;
+    plain_tray["clear_section"] = serde_json::Value::Null;
+    s.execute("type", &plain_conduit).unwrap();
+    s.execute("type", &plain_tray).unwrap();
+    s.execute("catalogue_import", &json!({"path":path})).unwrap();
+    assert_eq!(s.model.types.runs, measured_types);
+
+    let mut rows = crate::ods::read(&std::fs::read(&path).unwrap()).unwrap();
+    let conduit_row = rows.iter_mut().find(|row| row.get(2).is_some_and(|name| name == "Measured conduit")).unwrap();
+    conduit_row[7] = "41".into();
+    std::fs::write(&path, crate::ods::write(&rows).unwrap()).unwrap();
+    let before = s.model.clone();
+    assert!(s.execute("catalogue_import", &json!({"path":path})).is_err());
+    assert_eq!(s.model, before);
+
+    let conduit_row = rows.iter_mut().find(|row| row.get(2).is_some_and(|name| name == "Measured conduit")).unwrap();
+    conduit_row.truncate(7);
+    std::fs::write(&path, crate::ods::write(&rows).unwrap()).unwrap();
+    s.execute("catalogue_import", &json!({"path":path})).unwrap();
+    assert!(s.model.types.runs["conduit"]["Measured conduit"].clear_section.is_none());
+    assert_eq!(s.model.types.runs["cabletray"]["Measured box"], measured_types["cabletray"]["Measured box"]);
+}
