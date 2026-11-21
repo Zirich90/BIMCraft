@@ -111,6 +111,9 @@ fn main() -> ExitCode {
         }
     };
     let mut session = Session::new();
+    if let Some(path) = &settings {
+        session.catalogue_bindings = bimcraft_ui_egui::settings::catalogue_bindings_in(path);
+    }
     session.dwg = dwg_reader();
     dwg_writer(&mut session);
     // A blank project starts in the interface's language: its levels named in it.
@@ -146,7 +149,11 @@ fn main() -> ExitCode {
             }
             file => {
                 later = None;
-                let done = session.execute("open", &json!({ "path": file })).map(|_| ());
+                let done = session.execute("open", &json!({ "path": file })).map(|reply| {
+                    if let Some(warning) = reply["catalogue_warning"].as_str() {
+                        eprintln!("bimcraft: {warning}");
+                    }
+                });
                 if done.is_ok() {
                     opened.push(PathBuf::from(file));
                 }

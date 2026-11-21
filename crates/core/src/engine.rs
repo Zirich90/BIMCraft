@@ -1,6 +1,7 @@
 //! The session every front end drives: one model, its undo history and the command registry.
 //! Every user-visible action is a [`Command`]; the CLI, scripts and MCP all reach the same ones.
 
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -170,6 +171,8 @@ pub struct Session {
     pub model: Arc<Model>,
     /// Where the model was opened from or last saved to.
     pub path: Option<PathBuf>,
+    /// Approved ODS paths, indexed by the canonical project path. Kept in the user's settings.
+    pub catalogue_bindings: BTreeMap<PathBuf, PathBuf>,
     /// The phase, and the design option (`set: option`), what a command makes is made in; none: the
     /// project's first phase, and no option. Not the model's: set with `phase` and `option`.
     pub phase: Option<String>,
@@ -277,6 +280,7 @@ impl Session {
         Session {
             model: Arc::new(Model::new("Project")),
             path: None,
+            catalogue_bindings: BTreeMap::new(),
             phase: None,
             option: None,
             undo: Vec::new(),
@@ -840,6 +844,7 @@ impl Session {
     /// `open`) left the history it began, so what came after it stays the steps it was.
     pub fn transaction<T>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
         let before = Arc::clone(&self.model);
+        let catalogue_bindings = self.catalogue_bindings.clone();
         let checked = self.verified.as_ref().is_some_and(|v| Arc::ptr_eq(v, &before));
         let (path, phase, option) = (self.path.clone(), self.phase.clone(), self.option.clone());
         let (mut undo, redo, resets) = (std::mem::take(&mut self.undo), std::mem::take(&mut self.redo), self.resets);
@@ -848,6 +853,7 @@ impl Session {
         match result {
             Err(e) => {
                 (self.model, self.path, self.phase, self.option) = (before, path, phase, option);
+                self.catalogue_bindings = catalogue_bindings;
                 (self.undo, self.redo) = (undo, redo);
                 Err(e)
             }

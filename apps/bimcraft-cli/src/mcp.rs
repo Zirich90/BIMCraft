@@ -50,7 +50,7 @@ never save, delete or run one, nor change a button.";
 // One for the server's whole life: the session's size costs nothing to keep in place.
 #[allow(clippy::large_enum_variant)]
 enum Backend {
-    Own(Session),
+    Own(Box<Session>),
     Window(Window),
 }
 
@@ -205,7 +205,7 @@ impl Server {
         crate::dwg_writer(&mut session);
         let plugins = crate::load_plugins(&mut session);
         let seen = plugins.log().len();
-        Server { backend: Backend::Own(session), plugins: Some(plugins), seen, pyaddins: Store::default_store() }
+        Server { backend: Backend::Own(Box::new(session)), plugins: Some(plugins), seen, pyaddins: Store::default_store() }
     }
 
     /// A server whose tools work on the project `window` has open.

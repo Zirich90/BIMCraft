@@ -146,6 +146,7 @@ pub fn parse(line: &str, token: &str) -> Result<Request, Error> {
 /// Refuses a command that would replace the project, by whatever name (an id or a shortcut, in any case).
 fn refuse(command: &str) -> Result<(), String> {
     match find(command) {
+        Some(c) if c.id == "catalogue_link" => Err("The user approves catalogue paths in the window's Insert tab".into()),
         Some(c) if REFUSED.contains(&c.id) => Err(format!(
             "`{}` would replace the project the window has open, which is the user's: an agent never starts, opens or recovers \
              a project in a window; the user does, with File > New and File > Open",

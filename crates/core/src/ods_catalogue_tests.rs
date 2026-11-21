@@ -4,6 +4,53 @@ use crate::engine::Session;
 use crate::library::Kind;
 
 #[test]
+fn catalogue_binding_uses_session_approval_and_open_only_reads() {
+    let files = tempfile::tempdir().unwrap();
+    let project = files.path().join("project.bim");
+    let workbook = files.path().join("approved.ods");
+    let mut s = Session::new();
+    let conduit = |width| json!({"category":"conduit","name":"Approved","width":width,"depth":width});
+    s.execute("type", &conduit(20)).unwrap();
+    s.execute("save", &json!({"path":project})).unwrap();
+    s.execute("type", &conduit(30)).unwrap();
+    s.execute("catalogue_export", &json!({"path":workbook})).unwrap();
+    let request = crate::bridge::Request::Execute { command: "catalogue_link".into(), params: json!({"path":workbook}), read_only: false };
+    assert!(crate::bridge::run(&mut s, &request, crate::bridge::Access::Edit).is_err());
+    s.execute("catalogue_link", &json!({"path":workbook})).unwrap();
+    let original = std::fs::read(&workbook).unwrap();
+
+    let mut project_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&project).unwrap()).unwrap();
+    project_json["catalogue_path"] = json!(workbook);
+    std::fs::write(&project, project_json.to_string()).unwrap();
+    let mut untrusted = Session::new();
+    let opened = untrusted.execute("open", &json!({"path":project})).unwrap();
+    assert_eq!(opened["left_out"], json!(["/catalogue_path"]));
+    assert_eq!(untrusted.model.types.runs["conduit"]["Approved"].width, 20.0);
+    assert!(untrusted.execute("catalogue_sync", &json!({})).is_err());
+
+    s.execute("open", &json!({"path":project})).unwrap();
+    assert_eq!(s.model.types.runs["conduit"]["Approved"].width, 30.0);
+    assert_eq!(std::fs::read(&workbook).unwrap(), original);
+    assert!(s.script_dry_run("catalogue_sync {}").is_err());
+    s.no_files = true;
+    assert!(s.execute("catalogue_sync", &json!({})).is_err());
+    s.no_files = false;
+    s.read_only = Some("test");
+    assert!(s.execute("catalogue_link", &json!({"path":null})).is_err());
+    assert!(s.execute("catalogue_sync", &json!({})).is_err());
+    assert_eq!(std::fs::read(&workbook).unwrap(), original);
+    s.read_only = None;
+    assert!(s.script_atomic("catalogue_link {\"path\":null}\nunknown_command").is_err());
+    assert!(s.execute("catalogue_sync", &json!({})).is_ok());
+
+    std::fs::write(&workbook, b"broken").unwrap();
+    let opened = s.execute("open", &json!({"path":project})).unwrap();
+    assert!(opened["catalogue_warning"].is_string());
+    assert_eq!(s.model.types.runs["conduit"]["Approved"].width, 20.0);
+    assert_eq!(std::fs::read(&workbook).unwrap(), b"broken");
+}
+
+#[test]
 fn ods_catalogue_round_trips_upstream_carrier_types() {
     let mut s = Session::new();
     let temp = tempfile::tempdir().unwrap();
