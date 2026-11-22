@@ -2,6 +2,7 @@
 //! exact framing continues to use the original extreme points. Unknown geometry must
 //! be retained by callers, never interpreted as empty or outside a query.
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 use crate::ids::{Id, Revision};
 use crate::model::Model;
@@ -40,14 +41,15 @@ pub(crate) struct Key {
     own: Option<Revision>,
     levels: [Option<Revision>; 2],
     shape: Shape,
-    /// A component's own adaptive frames, hashed: its box follows its points, as the other component caches key on them.
-    adaptive: Option<u64>,
+    /// The component's adaptive frames or the cable's live attachment points.
+    geometry_dependency: Option<u64>,
 }
 
 impl Key {
     pub(crate) fn of(m: &Model, id: Id) -> Self {
-        let mut key = Self { own: m.elements.revision(id), levels: [None; 2], shape: Shape::Other, adaptive: None };
+        let mut key = Self { own: m.elements.revision(id), levels: [None; 2], shape: Shape::Other, geometry_dependency: None };
         let Some(e) = m.elements.get(id) else { return key };
+        let hasher = BuildHasherDefault::<DefaultHasher>::default();
         if let Some(c) = e.column() {
             key.levels = [m.elements.revision(c.level), c.top_level.and_then(|id| m.elements.revision(id))];
             key.shape = m.column_type(e).map_or(Shape::Missing, |t| Shape::Column {
@@ -57,6 +59,9 @@ impl Key {
             });
         } else if let Some(r) = e.run() {
             key.levels[0] = m.elements.revision(r.level);
+            let ends = r.attached_ends(m);
+            key.geometry_dependency =
+                ends.iter().any(Option::is_some).then(|| hasher.hash_one(ends.map(|at| at.map(|p| p.map(f64::to_bits)))));
             key.shape = m.run_type(e).map_or(Shape::Missing, |t| Shape::Run {
                 dimensions: [t.width.to_bits(), t.depth.to_bits()],
                 round: t.round,
@@ -64,12 +69,7 @@ impl Key {
             });
         } else if let crate::model::Element::Component(c) = e {
             key.levels[0] = m.elements.revision(c.level);
-            key.adaptive = c.adaptive.as_ref().map(|a| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                serde_json::to_string(a).unwrap_or_default().hash(&mut h);
-                h.finish()
-            });
+            key.geometry_dependency = c.adaptive.as_ref().map(|a| hasher.hash_one(serde_json::to_string(a).unwrap_or_default()));
         }
         key
     }
@@ -328,6 +328,8 @@ mod tests {
                                 end,
                                 offset: 100.0,
                                 end_offset,
+                                ports: [None, None],
+                                carrier_span: None,
                                 justify,
                                 join: true,
                                 system: String::new(),

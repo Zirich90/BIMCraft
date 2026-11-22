@@ -3205,6 +3205,8 @@ pub(crate) fn from_step(file: File, name: &str, seed: u64, budget: &Budget) -> R
             end: micron(r.flat(found.end)),
             offset: z0,
             end_offset: ((z1 - z0).abs() > 1e-6).then_some(z1),
+            ports: [None, None],
+            carrier_span: None,
             justify,
             join: true,
             system,

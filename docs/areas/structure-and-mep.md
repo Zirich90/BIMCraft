@@ -89,7 +89,11 @@ tells apart; an air terminal, an earthing electrode and an inspection box are co
 import reads it from there. Data (NBR 14565): `cable` (CB, `cabling`), a run like a wire, so a file's `IfcCableSegment` is a wire unless its
 `Category` says cable; data and voice outlets (`IfcOutlet` `DATAOUTLET`, `TELEPHONEOUTLET`; one of no type reads as the power outlet,
 `Category::from_ifc` taking the first of equals), a patch panel (`IfcCommunicationsAppliance`) and a rack (a proxy of object type `Rack`);
-the Cable Tray tool is the Electrical tab's, on the Data tab too. A fixture or a
+the Cable Tray tool is the Electrical tab's, on the Data tab too. `cable_ports` attaches either end of a centre-justified
+data cable to a component's placed data connector. It takes the component's id or GUID and the connector's part GUID.
+An attached end follows its component. Disconnecting an end or deleting its component leaves the end at its last position.
+Copies connect to the copied components that came along. Format 20 keeps these attachments in project files. IFC keeps
+the resulting geometry. A fixture or a
 device is a component of a family whose `family::Category` says what it is (a sanitary fixture, a floor drain, a pipe fitting, a pipe
 accessory…); `Category::ifc` is its IFC class, predefined type and, where IFC has no class (lightning protection), the object type a
 proxy carries, and `Category::from_ifc` reads the same table back, so a category is one row, in `family.rs`. A family's `kind`
@@ -326,5 +330,31 @@ or `type {"category":"cabletray","name":"Lidded 100 x 50","width":100,"depth":50
 With a complete section on the type, omit the measurement parameters from
 `carrier_fill`. Supplying the full measurement set overrides the stored values
 for one check. Use `clear_section: null` to remove the saved measurements.
+
+`cable_carrier {"id":100012,"span":{"carrier":100011,"start":0.25,"end":0.75}}`
+places a centre-justified data cable segment along the centreline of an existing
+conduit or cable tray. Fractions run from the carrier's start (0) to its end (1)
+and can be reversed. The cable follows the carrier in plan and elevation.
+Use separate segments for connections to equipment ports and for sections
+that run through carriers. A cable copied with its carrier follows the copy.
+Deleting the carrier or setting `span: null` frees the cable at its current
+position. Omit `span` to read the current axis, length and carrier GUID.
+
+`cable_route` places an ordered list of these spans in one undo step. For
+example, `{"spans":[{"carrier":100011,"start":0.25,"end":1},{"carrier":100012,"start":1,"end":0.5}]}`
+goes around a turn when the two carrier ends meet in 3D. The result is the
+ordered list of cable segment IDs and their total centreline length in mm.
+After placement each segment follows its own carrier. Pass the ordered IDs to
+`cable_route_check` to find gaps after moving carriers. The check uses the
+current 3D centreline, so the list can also include separate leads to ports.
+Supply `ends` to `cable_route` to create those leads in the same operation.
+Each entry is null or a component and its placed data connector GUID. A lead
+must be longer than the model tolerance. Its port end follows the component
+and its carrier-side end stays at the original joint.
+
+Set `routed: true` in `carrier_fill` to measure the attached data cables from
+their round types' outside diameters. The result includes the fractions of the
+most loaded interval relative to its applicable limit. Cables that touch only
+at an interval boundary are counted separately. Use `areas` for a manual check.
 Existing projects can keep using explicit measurements.
 Use `conduit` (CN) and `cable_tray` (CT) to place the elements.

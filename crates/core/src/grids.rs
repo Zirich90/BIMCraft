@@ -155,6 +155,20 @@ mod tests {
     use crate::lines::SOLID;
 
     #[test]
+    fn opening_a_project_from_before_grid_types_adds_their_line_patterns() {
+        let model = crate::model::Model::new("Old project");
+        let mut file = serde_json::to_value(model).unwrap();
+        file["format"] = serde_json::json!(20);
+        file.as_object_mut().unwrap().remove("grid_types");
+        file["line_patterns"].as_object_mut().unwrap().retain(|name, _| !name.starts_with("Grid - "));
+        let (opened, left_out) = crate::model::Model::read(&file.to_string()).unwrap();
+        assert!(left_out.is_empty(), "{left_out:?}");
+        let pattern = &opened.line_patterns[ISO_PATTERN];
+        assert_eq!(pattern, &crate::lines::default_patterns()[ISO_PATTERN]);
+        opened.check().unwrap();
+    }
+
+    #[test]
     fn a_grid_type_checks_its_pattern_pen_and_lettering() {
         let patterns = crate::lines::default_patterns();
         let mut all = types(Language::English);

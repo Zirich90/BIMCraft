@@ -48,10 +48,10 @@ pub(crate) fn element_lines(m: &Model, e: &Element) -> Vec<Line> {
             out
         }
         crate::model::run_arm!(r) => {
-            let mut out = m.run_geom(e).map_or_else(Vec::new, |g| {
-                if g.vertical() && g.round { axes(r.start, 0.0, g.width / 2.0) } else { path(&g.footprint(), true) }
-            });
-            out.push((r.start, r.end));
+            let Some(g) = m.run_geom(e) else { return vec![(r.start, r.end)] };
+            let [start, end] = [g.a, g.b].map(|[x, y, _]| P2(x, y));
+            let mut out = if g.vertical() && g.round { axes(start, 0.0, g.width / 2.0) } else { path(&g.footprint(), true) };
+            out.push((start, end));
             out
         }
         Element::Component(c) => {

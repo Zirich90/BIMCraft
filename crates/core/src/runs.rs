@@ -87,10 +87,80 @@ pub struct Geom {
     pub round: bool,
 }
 
+/// A family port belongs to every instance of the family. The component identifies which instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CablePort {
+    pub component: crate::ids::Guid,
+    pub port: crate::ids::Guid,
+}
+
+impl CablePort {
+    pub(crate) fn position(&self, m: &Model) -> Option<P3> {
+        let Element::Component(c) = m.elements.get(self.component)? else { return None };
+        m.component_connectors(c)
+            .into_iter()
+            .find(|(k, _, _)| k.guid == self.port && k.kind == crate::family::ConnectorKind::Data)
+            .and_then(|(_, at, _)| at)
+    }
+}
+
+pub(crate) fn no_ports(ports: &[Option<CablePort>; 2]) -> bool {
+    ports == &[None, None]
+}
+
+/// A cable span along a conduit or cable tray, measured from its start as fractions of its axis.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarrierSpan {
+    pub carrier: crate::ids::Guid,
+    pub start: f64,
+    pub end: f64,
+}
+
+impl CarrierSpan {
+    pub(crate) fn fractions_in_range(self) -> bool {
+        [self.start, self.end].into_iter().all(|t| (0.0..=1.0).contains(&t))
+    }
+
+    pub(crate) fn axis(self, m: &Model) -> Option<[P3; 2]> {
+        let e @ (Element::Conduit(r) | Element::CableTray(r)) = m.elements.get(self.carrier)? else { return None };
+        let g = Geom::unattached(m, r, m.run_type(e)?);
+        Some([self.start, self.end].map(|t| add(g.a, mul(sub(g.b, g.a), t))))
+    }
+}
+
+impl Run {
+    pub(crate) fn attached_ends(&self, m: &Model) -> [Option<P3>; 2] {
+        if let Some(axis) = self.carrier_span.and_then(|span| span.axis(m)) {
+            return axis.map(Some);
+        }
+        self.ports.map(|p| p.and_then(|p| p.position(m)))
+    }
+
+    /// Keep the currently displayed position as the fallback if a port is disconnected.
+    pub(crate) fn keep_centreline(&mut self, g: Geom, base: f64) {
+        self.start = P2(g.a[0], g.a[1]);
+        self.end = P2(g.b[0], g.b[1]);
+        self.offset = g.a[2] - base;
+        self.end_offset = Some(g.b[2] - base).filter(|z| *z != self.offset);
+    }
+}
+
 impl Geom {
     /// `r` of type `t`: its heights are those of its `justify` line, so its centre line is half the section's depth (square
     /// to the line) under it for a top, over it for a bottom.
     pub fn of(m: &Model, r: &Run, t: &RunType) -> Geom {
+        let mut g = Self::unattached(m, r, t);
+        for (point, at) in [&mut g.a, &mut g.b].into_iter().zip(r.attached_ends(m)) {
+            if let Some(at) = at {
+                *point = at;
+            }
+        }
+        g
+    }
+
+    pub(crate) fn unattached(m: &Model, r: &Run, t: &RunType) -> Geom {
         let base = m.elevation(r.level);
         let (z0, z1) = (base + r.offset, base + r.end_offset.unwrap_or(r.offset));
         let depth = if t.round { t.width } else { t.depth };
@@ -249,7 +319,10 @@ fn overlapped(a: (f64, f64), b: (f64, f64)) -> bool {
 /// Whether a run lies flat along the plan — from the run itself, what [`joinable`] says of its worked-out
 /// geometry: upright it would be a column's stance and `end_offset` would make it slope.
 pub(crate) fn flat(r: &Run) -> bool {
-    r.start.dist(r.end) > TOL && (r.end_offset.unwrap_or(r.offset) - r.offset).abs() <= TOL
+    r.carrier_span.is_none()
+        && no_ports(&r.ports)
+        && r.start.dist(r.end) > TOL
+        && (r.end_offset.unwrap_or(r.offset) - r.offset).abs() <= TOL
 }
 
 /// Whether `g` lies flat along the plan: upright it is a column's section, and with an `end_offset` its heights
@@ -709,6 +782,8 @@ mod tests {
             end: b,
             offset,
             end_offset,
+            ports: [None, None],
+            carrier_span: None,
             justify,
             join: true,
             system: String::new(),
