@@ -71,6 +71,14 @@ The project saves no workbook path. Opening uses only an approved binding and ne
 refused in read-only sessions and dry runs. The workbook is limited to 32 MiB
 and 20,000 rows, including the headings.
 
+### Measured clear sections
+
+A round conduit can have a `ClearDiameter_mm`. A rectangular cable tray can
+have `ClearWidth_mm` and `ClearDepth_mm`, and optionally `Enclosure` set to
+`blind_box` or `lidded_box`. The dimensions describe the measured usable opening.
+Blank section cells remove the measurements when these columns are present.
+Workbooks with the original seven headings preserve measurements in the project.
+
 ### Approved ODS bindings
 
 For a saved project, use Insert > ODS Catalogue > Link ODS Catalogue to approve an

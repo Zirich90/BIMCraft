@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use quick_xml::{Reader, events::Event};
 use zip::ZipArchive;
 
+use crate::carrier_fill::{ClearSection, Enclosure};
 use crate::xlsx::{Cell, Part, escape, sheet_name, zip};
 
 const MIMETYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
@@ -231,7 +232,10 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Vec<String>>, String> {
                         let heading = rows.first().and_then(|header: &Vec<String>| header.get(row.len())).map(String::as_str);
                         let value = match (heading, scalar.as_ref()) {
                             (
-                                Some("Width_mm" | "Depth_mm" | "Height_mm" | "Mass_kg" | "ClearWidth_mm" | "ClearDepth_mm"),
+                                Some(
+                                    "Width_mm" | "Depth_mm" | "Height_mm" | "Mass_kg" | "ClearDiameter_mm" | "ClearWidth_mm"
+                                    | "ClearDepth_mm",
+                                ),
                                 Some(("float", value)),
                             )
                             | (Some("Round"), Some(("boolean", value))) => value,
@@ -315,9 +319,10 @@ fn repeated(e: &quick_xml::events::BytesStart<'_>, name: &[u8], max: usize) -> R
 
 const CATEGORIES: [&str; 4] = ["conduit", "cabletray", "wire", "cable"];
 const HEADINGS: [&str; 7] = ["GUID", "Category", "Name", "Width_mm", "Depth_mm", "Round", "Material"];
+const SECTION_HEADINGS: [&str; 4] = ["ClearDiameter_mm", "ClearWidth_mm", "ClearDepth_mm", "Enclosure"];
 
 pub(crate) fn catalogue_rows(model: &crate::model::Model) -> Result<Vec<Vec<String>>, String> {
-    let mut rows = vec![HEADINGS.map(String::from).to_vec()];
+    let mut rows = vec![HEADINGS.into_iter().chain(SECTION_HEADINGS).map(String::from).collect()];
     for category in CATEGORIES {
         let kind = crate::library::Kind::Type(category.into());
         for (name, ty) in model.types.runs.get(category).into_iter().flatten() {
@@ -325,7 +330,7 @@ pub(crate) fn catalogue_rows(model: &crate::model::Model) -> Result<Vec<Vec<Stri
                 return Err("ODS catalogue has too many rows".into());
             }
             let guid = model.library.guid(&kind, name).ok_or_else(|| format!("catalogue type `{name}` has no library GUID"))?;
-            rows.push(vec![
+            let mut row = vec![
                 guid.to_string(),
                 category.into(),
                 name.clone(),
@@ -333,14 +338,29 @@ pub(crate) fn catalogue_rows(model: &crate::model::Model) -> Result<Vec<Vec<Stri
                 ty.depth.to_string(),
                 ty.round.to_string(),
                 ty.material.clone(),
-            ]);
+            ];
+            match ty.clear_section {
+                Some(ClearSection::Round { diameter }) => row.push(diameter.to_string()),
+                Some(ClearSection::Rectangular { width, depth, enclosure }) => {
+                    let enclosure = match enclosure {
+                        Some(Enclosure::BlindBox) => "blind_box",
+                        Some(Enclosure::LiddedBox) => "lidded_box",
+                        None => "",
+                    };
+                    row.extend([String::new(), width.to_string(), depth.to_string(), enclosure.into()]);
+                }
+                None => {}
+            }
+            rows.push(row);
         }
     }
     Ok(rows)
 }
 
 pub(crate) fn apply_catalogue(model: &mut crate::model::Model, rows: &[Vec<String>]) -> Result<usize, String> {
-    if rows.first().is_none_or(|r| r.iter().map(String::as_str).ne(HEADINGS)) {
+    let header = rows.first().ok_or("ODS catalogue has no headings")?;
+    let measured = header.iter().map(String::as_str).eq(HEADINGS.into_iter().chain(SECTION_HEADINGS));
+    if !measured && header.iter().map(String::as_str).ne(HEADINGS) {
         return Err("ODS catalogue headings do not match the exported schema".into());
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -353,8 +373,8 @@ pub(crate) fn apply_catalogue(model: &mut crate::model::Model, rows: &[Vec<Strin
         let [guid, category, name, width, depth, round, rest @ ..] = row.as_slice() else {
             return Err(format!("ODS row {line} needs GUID, category, name, width, depth and round columns"));
         };
-        if rest.len() > 1 || !CATEGORIES.contains(&category.as_str()) || name.trim().is_empty() {
-            return Err(format!("ODS row {line} needs a supported category, a type name and at most seven columns"));
+        if row.len() > header.len() || !CATEGORIES.contains(&category.as_str()) || name.trim().is_empty() {
+            return Err(format!("ODS row {line} needs a supported category, a type name and at most {} columns", header.len()));
         }
         if !seen.insert((category, name)) {
             return Err(format!("ODS catalogue repeats type `{name}` in `{category}`"));
@@ -390,6 +410,24 @@ pub(crate) fn apply_catalogue(model: &mut crate::model::Model, rows: &[Vec<Strin
         ty.depth = depth;
         ty.round = round;
         ty.material = material;
+        if measured {
+            let [diameter, width, depth, enclosure] = [7, 8, 9, 10].map(|i| row.get(i).map_or("", String::as_str));
+            ty.clear_section = match (diameter, width, depth, enclosure) {
+                ("", "", "", "") => None,
+                (diameter, "", "", "") => Some(ClearSection::Round { diameter: dimension(diameter)? }),
+                ("", width, depth, enclosure) => Some(ClearSection::Rectangular {
+                    width: dimension(width)?,
+                    depth: dimension(depth)?,
+                    enclosure: match enclosure {
+                        "" => None,
+                        "blind_box" => Some(Enclosure::BlindBox),
+                        "lidded_box" => Some(Enclosure::LiddedBox),
+                        _ => return Err(format!("ODS row {line} Enclosure must be blind_box or lidded_box")),
+                    },
+                }),
+                _ => return Err(format!("ODS row {line} needs either a clear diameter or a clear width and depth")),
+            };
+        }
         count += 1;
     }
     Ok(count)
