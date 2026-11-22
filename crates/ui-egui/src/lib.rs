@@ -66,6 +66,7 @@ mod minimap;
 mod motion;
 mod notes;
 mod objectstyles;
+mod ods_catalogue;
 mod opening;
 mod orbit;
 pub mod pacing;
@@ -4491,6 +4492,9 @@ impl BimApp {
                 tf("{} opened without {} fields this version doesn't know; saving it leaves them out.", &[&name, &count.to_string()]);
             self.status = Status { text, error: false };
         }
+        if let Some(error) = reply["catalogue_warning"].as_str() {
+            self.status = Status { text: error.to_owned(), error: true };
+        }
     }
 
     /// The sample house, the model `bimcraft --sample` builds, as a project with no file: Save asks where to put it. Built
@@ -5666,6 +5670,7 @@ impl BimApp {
             if big_button(ui, Icon::Component, "Import 3D Model", false, tip).clicked() {
                 self.import_mesh_dialog(ui.ctx());
             }
+            self.ods_catalogue_menu(ui);
         });
     }
 

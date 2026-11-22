@@ -171,6 +171,40 @@ fn a_settings_file_with_thousands_of_shortcuts_keeps_a_bounded_few() {
     assert!(!found.is_empty());
 }
 
+#[test]
+fn approved_catalogue_paths_round_trip_in_desktop_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join("settings.json");
+    let mut settings = default_settings();
+    settings.catalogue_bindings.insert(dir.path().join("saved.bimc"), dir.path().join("catalogue.ods"));
+    std::fs::write(&settings_path, settings.to_json().to_string()).unwrap();
+    let mut h = app("");
+    h.state_mut().use_settings(settings_path.clone());
+    assert_eq!(h.state().session.catalogue_bindings, settings.catalogue_bindings);
+    assert_eq!(crate::settings::catalogue_bindings_in(&settings_path), settings.catalogue_bindings);
+}
+
+#[test]
+fn catalogue_menu_in_the_three_desktop_looks() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project.bimc");
+    for (name, dark, light_canvas) in [("light", false, false), ("dark", true, false), ("dark-ui-light-canvas", true, true)] {
+        let mut h = app("");
+        h.ctx.set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
+        h.state_mut().light_canvas = light_canvas;
+        h.state_mut().session.execute("save", &json!({"path":project})).unwrap();
+        h.run();
+        press(&mut h, "Insert");
+        press(&mut h, "ODS Catalogue");
+        for label in ["Link ODS Catalogue", "Read Linked ODS Catalogue", "Unlink ODS Catalogue"] {
+            h.get_by_label(label);
+        }
+        if let Some(folder) = std::env::var_os("BIMCRAFT_CATALOGUE_UI_DUMP") {
+            h.render().unwrap().save(std::path::Path::new(&folder).join(format!("catalogue-{name}.png"))).unwrap();
+        }
+    }
+}
+
 fn default_settings() -> Settings {
     let mut h = app("");
     h.state_mut().use_settings(tempfile::tempdir().unwrap().path().join("settings.json"));

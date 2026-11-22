@@ -47,6 +47,15 @@ pub fn language_in(path: &Path) -> Option<Lang> {
     read(path)?["language"].as_str().and_then(Lang::from_code)
 }
 
+/// Approvals must be loaded before the desktop opens a project from its arguments.
+pub fn catalogue_bindings_in(path: &Path) -> BTreeMap<PathBuf, PathBuf> {
+    read(path).map_or_else(BTreeMap::new, |value| catalogue_bindings(&value))
+}
+
+fn catalogue_bindings(value: &Value) -> BTreeMap<PathBuf, PathBuf> {
+    value.get("catalogue_bindings").and_then(|map| serde_json::from_value(map.clone()).ok()).unwrap_or_default()
+}
+
 /// How the window was left: its size in points and whether it was maximized.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Window {
@@ -144,6 +153,7 @@ pub struct Settings {
     pub assistant_usage: BTreeMap<String, Usage>,
     /// Co-Work: the name the others see, where a host listens, whether it is visible on the network, whether guests may edit.
     pub cowork: crate::cowork::Prefs,
+    pub catalogue_bindings: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Settings {
@@ -195,6 +205,7 @@ impl Settings {
             // The key, only when the user asked for it to be kept, and then only sealed.
             "assistant": self.assistant_json(),
             "cowork": self.cowork.to_json(),
+            "catalogue_bindings": self.catalogue_bindings,
         })
     }
 
@@ -211,6 +222,7 @@ impl Settings {
         let own = |key: &str, base: Option<[u8; 3]>| if v.get(key).is_some() { colour(&v[key]) } else { base };
         Settings {
             theme,
+            catalogue_bindings: catalogue_bindings(v),
             light_canvas: theme == ThemePreference::Dark && v["light_canvas"].as_bool().unwrap_or(base.light_canvas),
             compact: match v["layout"].as_str() {
                 Some("compact") => true,
@@ -370,6 +382,7 @@ impl BimApp {
     pub fn use_settings(&mut self, path: PathBuf) {
         let now = self.settings_now(ThemePreference::System);
         let kept = read(&path).map_or(now.clone(), |v| Settings::from_json(&v, now));
+        self.session.catalogue_bindings.clone_from(&kept.catalogue_bindings);
         (self.lang, self.ribbon_min, self.docking) = (kept.language, kept.ribbon_minimized, kept.docking.clone());
         (self.compact, self.profile, self.scale) = (kept.compact, kept.profile, kept.scale);
         (self.scheme, self.accent) = (kept.scheme, kept.accent);
@@ -420,6 +433,7 @@ impl BimApp {
     fn settings_now(&self, theme: ThemePreference) -> Settings {
         Settings {
             theme,
+            catalogue_bindings: self.session.catalogue_bindings.clone(),
             light_canvas: self.light_canvas,
             compact: self.compact,
             profile: self.profile,

@@ -3601,6 +3601,21 @@ other_files(
         catalogue::catalogue_import,
         Files::Read,
     ),
+    other_files(
+        "catalogue_link",
+        "Link ODS Catalogue",
+        "{path:existing ODS|null} approve an existing catalogue for the currently saved project, or unlink it with null. The approval belongs to this user's session and settings",
+        catalogue::catalogue_link,
+        Files::Read,
+    ),
+    edit_files(
+        "catalogue_sync",
+        "Read Linked ODS Catalogue",
+        &[],
+        "{read_only?:true} apply the first sheet of the approved ODS catalogue. This never writes the workbook",
+        catalogue::catalogue_sync,
+        Files::Read,
+    ),
 ];
 
 // ---------- parameters ----------
@@ -4938,11 +4953,35 @@ fn open_file(s: &mut Session, p: &Value) -> R {
     m.sync_library();
     m.check().map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
     budget.check().map_err(|e| bad(c, format!("{}: {e}", path.display())))?;
+    let catalogue_error =
+        (!template).then(|| std::fs::canonicalize(&path).ok()).flatten().and_then(|key| s.catalogue_bindings.get(&key)).and_then(
+            |workbook| {
+                if let Err(error) = budget.check() {
+                    return Some(error);
+                }
+                let mut updated = m.clone();
+                let result = catalogue::read_catalogue(&mut updated, &path, workbook).and_then(|_| {
+                    updated.sync_library();
+                    updated.check()?;
+                    budget.check()
+                });
+                match result {
+                    Ok(()) => {
+                        m = updated;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            },
+        );
     let name = m.name.clone();
     s.reset(m, (!template).then(|| path.clone()));
     let mut reply = json!({"path": path, "name": name});
     if template {
         reply["template"] = json!(true);
+    }
+    if let Some(error) = catalogue_error {
+        reply["catalogue_warning"] = json!(error);
     }
     // A formula saying a name its family lacks, which this BIMCraft refuses a command making: the file opens, saying so.
     let warnings: Vec<String> =

@@ -67,7 +67,23 @@ for a new type. Width and depth are millimetres, Round is true or false, and
 Material names a material in the project. The entire import rolls back if a
 row fails validation.
 
-This exchange is explicit. The project saves no workbook path and opening it
-never reads or writes a workbook. Use regular .ods files. Both commands are
+The project saves no workbook path. Opening uses only an approved binding and never writes a workbook. Use regular .ods files. Both commands are
 refused in read-only sessions and dry runs. The workbook is limited to 32 MiB
 and 20,000 rows, including the headings.
+
+### Approved ODS bindings
+
+For a saved project, use Insert > ODS Catalogue > Link ODS Catalogue to approve an
+existing workbook. The approval is kept in the user's desktop settings. Opening
+the project reads the approved workbook and reports an invalid or missing
+workbook while still opening the saved project. Read Linked ODS Catalogue
+applies changes in one undo step. Unlink ODS Catalogue clears the approval.
+Linked rows need the GUID of a type in that project. To create types from rows
+with blank GUIDs, import them explicitly and export a workbook with their GUIDs.
+
+In a local CLI session, `catalogue_link {"path":"types.ods"}` approves the workbook
+for the current saved project and `catalogue_sync {}` reads it. Use
+`catalogue_link {"path":null}` to unlink. Write a workbook explicitly with
+`catalogue_export`. The binding and sync commands are refused in dry runs,
+Co-Work guest sessions, and read-only agent sessions. Window agents can read
+an approved catalogue into an editable project.
